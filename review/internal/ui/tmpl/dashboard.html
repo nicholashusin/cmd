@@ -1,0 +1,72 @@
+{{define "title"}}Dashboard - Code Review{{end}}
+
+{{define "breadcrumbs"}}
+  <span class="sep">/</span>
+{{end}}
+
+{{define "content"}}
+  {{if not .Repos}}
+    <div style="text-align: center; padding: 48px; color: var(--muted);">
+      <h2>No Tracked Repositories</h2>
+      <p style="margin-top: 8px;">Run <code>review</code> inside a Jujutsu or Git repository to track it.</p>
+    </div>
+  {{end}}
+
+  {{range .Repos}}
+    {{$repo := .}}
+    <div class="repo-section">
+      <div class="repo-header {{if .Available}}clickable-row{{end}}"
+           {{if .Available}}data-href="/r/{{.Record.Slug}}" onclick="handleFileRowClick(event, this)"{{end}}>
+        <div class="repo-title">
+          <h2><a href="/r/{{.Record.Slug}}">{{.Record.Slug}}</a></h2>
+          <span class="repo-path">{{.Record.RootPath}}</span>
+          {{if not .Available}}
+            <span class="badge" style="color: #cf222e; border-color: #cf222e;">missing on disk</span>
+          {{end}}
+        </div>
+        <div>
+          <button class="btn btn-sm btn-danger" onclick="forgetRepo('{{.Record.Slug}}')">Forget</button>
+        </div>
+      </div>
+
+      {{if .GraphRows}}
+        <ul class="commit-graph">
+          {{range .GraphRows}}
+            <li class="commit-row"
+                data-href="/r/{{$repo.Record.Slug}}/c/{{.Change.Key}}"
+                onclick="handleFileRowClick(event, this)">
+              <span class="graph-cell">{{.SVG}}</span>
+              <div class="commit-info">
+                <a href="/r/{{$repo.Record.Slug}}/c/{{.Change.Key}}" class="commit-subject">{{.Change.Subject}}</a>
+                {{$sum := index $repo.Summaries .Change.Key}}
+                {{if and $sum $sum.LGTM}}
+                  <span class="badge badge-status-lgtm">LGTM</span>
+                {{else}}
+                  <span class="badge badge-status-active">Active</span>
+                {{end}}
+                {{if and $sum (gt $sum.SnapshotCount 0)}}
+                  <span class="badge">Snapshot {{$sum.LatestSnapshot.Num}}</span>
+                {{else}}
+                  <span class="badge badge-pending">Snapshot pending</span>
+                {{end}}
+                {{if and $sum (gt $sum.OpenThreads 0)}}
+                  <span class="badge badge-count-unresolved">{{$sum.OpenThreads}} unresolved</span>
+                {{end}}
+                {{if and $sum (gt $sum.DraftCount 0)}}
+                  <span class="badge badge-draft">{{$sum.DraftCount}} draft</span>
+                {{end}}
+              </div>
+              <div class="commit-meta">
+                <span>{{.Change.Author}}</span>
+              </div>
+            </li>
+          {{end}}
+        </ul>
+      {{else}}
+        <div style="padding: 16px; color: var(--muted); font-size: 13px;">
+          No pending commits in this repository.
+        </div>
+      {{end}}
+    </div>
+  {{end}}
+{{end}}

@@ -1,0 +1,63 @@
+{{define "title"}}{{.Record.Slug}} - Code Review{{end}}
+
+{{define "breadcrumbs"}}
+  <span class="sep">/</span>
+  <span>{{.Record.Slug}}</span>
+{{end}}
+
+{{define "actions"}}
+  <button class="btn btn-sm btn-blue" onclick="publishDrafts('{{.Record.Slug}}', '')">Publish All Drafts</button>
+{{end}}
+
+{{define "content"}}
+  <div class="repo-section">
+    <div class="repo-header">
+      <div class="repo-title">
+        <h2>{{.Record.Slug}}</h2>
+        <span class="repo-path">{{.Record.RootPath}}</span>
+      </div>
+      <div>
+        <button class="btn btn-sm btn-danger" onclick="forgetRepo('{{.Record.Slug}}')">Forget Repo</button>
+      </div>
+    </div>
+
+    {{if .GraphRows}}
+      <ul class="commit-graph">
+        {{range .GraphRows}}
+          <li class="commit-row"
+              data-href="/r/{{$.Record.Slug}}/c/{{.Change.Key}}"
+              onclick="handleFileRowClick(event, this)">
+            <span class="graph-cell">{{.SVG}}</span>
+            <div class="commit-info">
+              <a href="/r/{{$.Record.Slug}}/c/{{.Change.Key}}" class="commit-subject">{{.Change.Subject}}</a>
+              {{$sum := index $.Summaries .Change.Key}}
+              {{if and $sum $sum.LGTM}}
+                <span class="badge badge-status-lgtm">LGTM</span>
+              {{else}}
+                <span class="badge badge-status-active">Active</span>
+              {{end}}
+              {{if and $sum (gt $sum.SnapshotCount 0)}}
+                <span class="badge">Snapshot {{$sum.LatestSnapshot.Num}}</span>
+              {{else}}
+                <span class="badge badge-pending">Snapshot pending</span>
+              {{end}}
+              {{if and $sum (gt $sum.OpenThreads 0)}}
+                <span class="badge badge-count-unresolved">{{$sum.OpenThreads}} unresolved</span>
+              {{end}}
+              {{if and $sum (gt $sum.DraftCount 0)}}
+                <span class="badge badge-draft">{{$sum.DraftCount}} draft</span>
+              {{end}}
+            </div>
+            <div class="commit-meta">
+              <span>{{.Change.Author}}</span>
+            </div>
+          </li>
+        {{end}}
+      </ul>
+    {{else}}
+      <div style="padding: 16px; color: var(--muted); font-size: 13px;">
+        No pending commits in this repository.
+      </div>
+    {{end}}
+  </div>
+{{end}}

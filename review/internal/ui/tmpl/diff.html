@@ -1,0 +1,40 @@
+{{define "title"}}{{.FilePath}} - {{.Record.Slug}}{{end}}
+
+{{define "breadcrumbs"}}
+  <span class="sep">/</span>
+  <a href="/r/{{.Record.Slug}}">{{.Record.Slug}}</a>
+  <span class="sep">/</span>
+  <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}?base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}" id="upLink">{{.View.Change.Key}}</a>
+  <span class="sep">/</span>
+  {{if .DiffData.StatusCode}}<span class="file-status status-{{.DiffData.StatusCode}}" title="{{.DiffData.StatusTitle}}">{{.DiffData.StatusCode}}</span>{{end}}
+  <span class="breadcrumb-file" title="{{.FilePath}}">{{.FilePath}}</span>
+  {{if .External}}<span class="badge" style="margin-left: 6px;">external</span>{{else if not .InDiff}}<span class="badge" style="margin-left: 6px;">unchanged</span>{{end}}
+{{end}}
+
+{{define "actions"}}
+  {{if .PrevFile}}
+    <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}/f/{{TrimSlash .PrevFile}}?base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{.CtxParam}}" id="prevFileLink" class="btn btn-sm" title="Previous File ([)">&larr; [</a>
+  {{end}}
+  {{if .NextFile}}
+    <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}/f/{{TrimSlash .NextFile}}?base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{.CtxParam}}" id="nextFileLink" class="btn btn-sm" title="Next File (])">] &rarr;</a>
+  {{end}}
+  {{if .InDiff}}
+  <button id="toggleReviewedBtn" class="btn btn-sm {{if .FileReviewed}}btn-active{{end}}"
+    onclick="toggleFileReviewed('{{.Record.Slug}}', '{{.View.Change.Key}}', '{{.View.TargetRev}}', '{{.FilePath}}', {{not .FileReviewed}})">
+    {{if .FileReviewed}}Reviewed ✓{{else}}Mark Reviewed (m){{end}}
+  </button>
+  <a href="?base={{.BaseParam}}&target={{.TargetParam}}&mode={{if eq .DiffMode "unified"}}split{{else}}unified{{end}}&ctx={{.CtxParam}}" class="btn btn-sm">
+    {{if eq .DiffMode "unified"}}Split View{{else}}Unified View{{end}}
+  </a>
+  <a href="?base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{if eq .CtxParam "all"}}3{{else}}all{{end}}" class="btn btn-sm">
+    {{if eq .CtxParam "all"}}Context View{{else}}Full file{{end}}
+  </a>
+  {{end}}
+  <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}?diffs=all&base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{.CtxParam}}" class="btn btn-sm" title="View all file diffs together">
+    All Diffs
+  </a>
+{{end}}
+
+{{define "content"}}
+  {{template "diff_block" .DiffData}}
+{{end}}

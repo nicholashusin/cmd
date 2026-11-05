@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en"{{if or (eq .ThemePref "light") (eq .ThemePref "dark")}} data-theme="{{.ThemePref}}"{{end}}{{if eq .SyntaxPref "off"}} data-syntax="off"{{end}}{{if eq .ScopeSidePref "L"}} data-scope-side="L"{{end}} data-state-sig="{{.StateSig}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{block "title" .}}Code Review{{end}}</title>
+  <script>
+    (function() {
+      try {
+        var t = localStorage.getItem('review_theme');
+        if (t === 'light' || t === 'dark') {
+          document.documentElement.setAttribute('data-theme', t);
+        }
+        var syn = localStorage.getItem('review_syntax');
+        if (syn === 'off') {
+          document.documentElement.setAttribute('data-syntax', 'off');
+        } else if (syn === 'on') {
+          document.documentElement.removeAttribute('data-syntax');
+        }
+        var ss = localStorage.getItem('review_scope_side');
+        if (ss === 'L') {
+          document.documentElement.setAttribute('data-scope-side', 'L');
+        } else if (ss === 'R') {
+          document.documentElement.removeAttribute('data-scope-side');
+        }
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{.StaticVersion}}">
+  <link rel="stylesheet" href="/static/style.css?v={{.StaticVersion}}">
+</head>
+<body>
+  <div id="updateBanner" class="update-banner" onclick="window.location.reload()">
+    Repo updated — click to refresh
+  </div>
+
+  <header class="app-header{{if eq .HeaderStatus "lgtm"}} header-status-lgtm{{else if eq .HeaderStatus "active"}} header-status-active{{end}}">
+    <div class="brand-section">
+      <a href="/" class="brand-link" id="brandLink">
+        <span>review</span>
+      </a>
+      <div class="breadcrumbs">
+        {{block "breadcrumbs" .}}{{end}}
+      </div>
+      <button type="button" id="copyLinkBtn" class="copy-link-btn" data-copy-host="{{.CopyHost}}" onclick="copyPageLink(this)" title="Copy link to page" aria-label="Copy link to page">
+        <svg class="icon-link" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6.5 9.5a3.5 3.5 0 0 0 5 0l2-2a3.5 3.5 0 0 0-5-5l-1 1"/>
+          <path d="M9.5 6.5a3.5 3.5 0 0 0-5 0l-2 2a3.5 3.5 0 0 0 5 5l1-1"/>
+        </svg>
+        <svg class="icon-check" viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="display: none;">
+          <polyline points="3 8.5 6.5 12 13 4.5"/>
+        </svg>
+      </button>
+    </div>
+    <div id="appHeaderScopeGroup" class="diff-header-scope-group" style="display: none;">
+      <button type="button" id="appHeaderScopeSideLeft" class="diff-header-scope-side-btn diff-scope-side-left" onclick="handleToggleStickyScopeSide(event, this)" title="Based on left diff — click to base on right diff" aria-label="Switch enclosing declaration to right diff"><svg class="diff-scope-side-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11.8V6a1.5 1.5 0 0 1 1.5-1.5h6.7"/><polyline points="8.8 2.2 11.5 4.5 8.8 6.8"/></svg></button>
+      <button type="button" id="appHeaderScope" class="diff-header-scope" style="display: none;" onclick="handleStickyScopeClick(event, this)" title="Jump to enclosing declaration"></button>
+      <button type="button" id="appHeaderScopeSideRight" class="diff-header-scope-side-btn diff-scope-side-right" onclick="handleToggleStickyScopeSide(event, this)" title="Based on right diff — click to base on left diff" aria-label="Switch enclosing declaration to left diff"><svg class="diff-scope-side-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 11.8V6A1.5 1.5 0 0 0 9.5 4.5H2.8"/><polyline points="5.2 2.2 2.5 4.5 5.2 6.8"/></svg></button>
+    </div>
+    <div class="header-actions">
+      <div class="header-page-actions">{{block "actions" .}}{{end}}</div>
+      <div class="header-util-actions">
+        <button id="syntaxToggleBtn" class="btn btn-sm" onclick="toggleSyntax()" title="Toggle Syntax Highlighting">Syntax: On</button>
+        <button id="themeToggleBtn" class="btn btn-sm" onclick="toggleTheme()" title="Toggle Theme">◐</button>
+        <button class="btn btn-sm" onclick="toggleShortcutsModal()" title="Keyboard Shortcuts (?)">?</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    {{block "content" .}}{{end}}
+  </main>
+
+  <div id="shortcutsModal" class="modal-overlay" style="display: none;" onclick="if(event.target === this) toggleShortcutsModal()">
+    <div class="modal-card">
+      <div class="modal-header">
+        <span>Keyboard Shortcuts</span>
+        <button class="btn btn-sm" onclick="toggleShortcutsModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <table class="shortcut-table">
+          <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Next / previous line in diff</td></tr>
+          <tr><td><kbd>n</kbd> / <kbd>p</kbd></td><td>Next / previous diff chunk</td></tr>
+          <tr><td><kbd>N</kbd> / <kbd>P</kbd></td><td>Next / previous comment thread</td></tr>
+          <tr><td><kbd>e</kbd> / <kbd>E</kbd></td><td>Expand / collapse all comments</td></tr>
+          <tr><td><kbd>c</kbd></td><td>Comment on selected line or range</td></tr>
+          <tr><td><kbd>u</kbd></td><td>Navigate up to change / repo</td></tr>
+          <tr><td><kbd>]</kbd> / <kbd>[</kbd></td><td>Next / previous file</td></tr>
+          <tr><td><kbd>m</kbd></td><td>Toggle current file reviewed</td></tr>
+          <tr><td><kbd>M</kbd></td><td>Mark reviewed and next unreviewed file</td></tr>
+          <tr><td><kbd>G</kbd></td><td>Take snapshot of change</td></tr>
+          <tr><td><kbd>a</kbd></td><td>Publish all drafts for change</td></tr>
+          <tr><td><kbd>/</kbd></td><td>Focus intra-change search</td></tr>
+          <tr><td><kbd>Cmd</kbd>+<kbd>Enter</kbd></td><td>Submit active comment form</td></tr>
+          <tr><td><kbd>Esc</kbd></td><td>Close active comment, popup, or modal</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>Esc</kbd> / <kbd>Shift</kbd>+right-click</td><td>Close focused popup or all popups</td></tr>
+          <tr><td><kbd>?</kbd></td><td>Show this shortcuts help</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v={{.StaticVersion}}"></script>
+</body>
+</html>

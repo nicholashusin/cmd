@@ -1,0 +1,257 @@
+{{define "title"}}{{.View.Change.Subject}} - {{.Record.Slug}}{{end}}
+
+{{define "breadcrumbs"}}
+  <span class="sep">/</span>
+  <a href="/r/{{.Record.Slug}}" id="upLink">{{.Record.Slug}}</a>
+  <span class="sep">/</span>
+  <span>{{.View.Change.Key}}</span>
+{{end}}
+
+{{define "actions"}}
+  <button id="snapshotBtn" class="btn btn-sm" onclick="takeSnapshot('{{.Record.Slug}}', '{{.View.Change.Key}}')">Snapshot (G)</button>
+  <button id="publishBtn" class="btn btn-sm btn-blue" onclick="publishDrafts('{{.Record.Slug}}', '{{.View.Change.Key}}')">Publish Drafts (a)</button>
+  {{if .IsLGTM}}
+    <button id="lgtmBtn" class="btn btn-sm btn-blue" onclick="toggleChangeRevMark('{{.Record.Slug}}', '{{.View.Change.Key}}', '{{.View.TargetRev}}', 'lgtm', false)">Revert LGTM</button>
+  {{else}}
+    <button id="lgtmBtn" class="btn btn-sm btn-green" onclick="toggleChangeRevMark('{{.Record.Slug}}', '{{.View.Change.Key}}', '{{.View.TargetRev}}', 'lgtm', true)">LGTM</button>
+  {{end}}
+{{end}}
+
+{{define "content"}}
+  <div class="change-overview" data-left-rev="{{.View.BaseRev}}" data-right-rev="{{.View.TargetRev}}">
+    <!-- Change Header Bar -->
+    <div class="change-header-bar" style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px;">
+      <div>
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px; flex-wrap: wrap;">
+          <h1 style="font-size: 18px; margin: 0; font-weight: 600;">{{.View.Change.Subject}}</h1>
+          {{if .IsLGTM}}
+            <span id="commitStatusBadge" class="badge badge-status-lgtm">LGTM</span>
+          {{else}}
+            <span id="commitStatusBadge" class="badge badge-status-active">Active</span>
+          {{end}}
+          {{if .View.SnapshotPending}}
+            <span class="badge badge-pending">Snapshot pending</span>
+          {{else}}
+            <span class="badge">{{.View.TargetDesc}}</span>
+          {{end}}
+          <span id="changeCommentCounts" class="comment-counts" data-repo="{{.Record.Slug}}" data-change="{{.View.Change.Key}}" data-base="{{.BaseParam}}" data-target="{{.TargetParam}}">{{template "comment_counts" .View.ChangeCounts}}</span>
+        </div>
+        <div style="font-size: 12px; color: var(--muted); display: flex; gap: 12px;">
+          <span>Author: <strong>{{.View.Change.Author}}</strong></span>
+          <span>Commit: <code>{{ShortRev .View.TargetRev}}</code></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Two-Column Metadata: Commit Message Card (Left) + Relation Chain Card (Right) -->
+    <div class="change-meta-grid">
+      <!-- Left: Dedicated Commit Message Card -->
+      <div class="files-card commit-msg-card" style="margin: 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--card-bg);">
+        <div class="files-header" style="padding: 8px 12px; background: var(--header-bg); border-bottom: 1px solid var(--border);">
+          <span style="font-weight: 600; font-size: 13px;">Commit Message</span>
+        </div>
+        <div style="padding: 12px; background: var(--bg);">
+          <pre class="commit-msg-box" style="margin: 0; font-family: var(--font-mono); font-size: 12px; line-height: 19px; white-space: pre-wrap; word-break: break-word; color: var(--text);">{{if .View.TargetMessage}}{{FormatCommitMessage .View.TargetMessage}}{{else}}{{FormatCommitMessage .View.Change.Message}}{{end}}</pre>
+        </div>
+      </div>
+
+      <!-- Right: Relation Chain Card -->
+      <div class="files-card relation-chain-card" style="margin: 0; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--card-bg);">
+        <div class="files-header" style="padding: 8px 12px; background: var(--header-bg); border-bottom: 1px solid var(--border);">
+          <span style="font-weight: 600; font-size: 13px;">Relation Chain</span>
+        </div>
+        <div style="background: var(--bg);">
+          {{if and .View.RelationChain (gt (len .View.RelationChain) 1)}}
+            <ul class="commit-graph relation-graph" style="margin: 0; padding: 0; list-style: none;">
+              {{range .View.RelationChain}}
+                <li class="commit-row {{if .IsCurrent}}current-change-row{{end}}"
+                    data-href="/r/{{$.Record.Slug}}/c/{{.Change.Key}}{{if .IsCurrent}}?base={{$.BaseParam}}&target={{$.TargetParam}}&diffs={{$.DiffsMode}}&mode={{$.DiffMode}}&ctx={{$.CtxParam}}{{else}}?diffs={{$.DiffsMode}}&mode={{$.DiffMode}}&ctx={{$.CtxParam}}{{end}}"
+                    onclick="handleFileRowClick(event, this)"
+                    style="display: flex; align-items: stretch; min-height: 36px; border-bottom: 1px solid var(--border-muted); {{if .IsCurrent}}background: var(--surface-alt); font-weight: 600;{{end}}">
+                  <span class="graph-cell">{{.SVG}}</span>
+                  <div class="commit-info" style="display: flex; align-items: center; gap: 6px; padding: 4px 8px; flex: 1; min-width: 0;">
+                    <a href="/r/{{$.Record.Slug}}/c/{{.Change.Key}}{{if .IsCurrent}}?base={{$.BaseParam}}&target={{$.TargetParam}}&diffs={{$.DiffsMode}}&mode={{$.DiffMode}}&ctx={{$.CtxParam}}{{else}}?diffs={{$.DiffsMode}}&mode={{$.DiffMode}}&ctx={{$.CtxParam}}{{end}}"
+                       class="commit-subject" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-size: 12px; {{if .IsCurrent}}color: var(--text);{{end}}">
+                      {{.Change.Subject}}
+                    </a>
+                    {{if .LGTM}}<span class="badge badge-status-lgtm" style="font-size: 10px; padding: 0 5px;">LGTM</span>{{else}}<span class="badge badge-status-active" style="font-size: 10px; padding: 0 5px;">Active</span>{{end}}
+                    {{if gt .OpenCount 0}}<span class="badge badge-count-unresolved" style="font-size: 10px; padding: 1px 4px;">{{.OpenCount}}</span>{{end}}
+                  </div>
+                </li>
+              {{end}}
+            </ul>
+          {{else}}
+            <div style="padding: 20px 12px; color: var(--muted); font-size: 12px; text-align: center;">
+              Not related to other pending changes
+            </div>
+          {{end}}
+        </div>
+      </div>
+    </div>
+
+    <!-- Snapshot & Diff Toolbar -->
+    <div class="change-toolbar">
+      <div class="selectors" style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+        <form id="diffForm" method="GET" action="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}" style="display: flex; gap: 8px; align-items: center;">
+          <input type="hidden" name="diffs" value="{{.DiffsMode}}">
+          <input type="hidden" name="mode" value="{{.DiffMode}}">
+          <input type="hidden" name="ctx" value="{{.CtxParam}}">
+          <label>Base:
+            <select name="base" onchange="this.form.submit()">
+              <option value="parent" {{if eq .View.BaseSnapNum 0}}selected{{end}}>Parent</option>
+              {{range .View.Snapshots}}
+                <option value="snap:{{.Num}}" {{if eq $.View.BaseSnapNum .Num}}selected{{end}}>Snapshot {{.Num}}</option>
+              {{end}}
+            </select>
+          </label>
+
+          <label>Target:
+            <select name="target" onchange="this.form.submit()">
+              <option value="live" {{if eq .View.TargetSnapNum 0}}selected{{end}}>Live Snapshot{{if .View.SnapshotPending}} (pending){{end}}</option>
+              {{range ReverseSnapshots .View.Snapshots}}
+                <option value="snap:{{.Num}}" {{if eq $.View.TargetSnapNum .Num}}selected{{end}}>Snapshot {{.Num}}</option>
+              {{end}}
+            </select>
+          </label>
+        </form>
+
+        <div class="btn-group" style="display: inline-flex; border: 1px solid var(--border); border-radius: 4px; overflow: hidden;">
+          <a href="?diffs=all&base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{.CtxParam}}"
+             class="btn btn-sm {{if eq .DiffsMode "all"}}btn-active{{end}}"
+             title="View diffs of all files in one go">All Diffs</a>
+          <a href="?diffs=list&base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{.CtxParam}}"
+             class="btn btn-sm {{if eq .DiffsMode "list"}}btn-active{{end}}"
+             title="View file list only">File List</a>
+        </div>
+
+        {{if and (eq .DiffsMode "all") .DiffFiles}}
+          <button type="button" id="toggleAllFilesBtn" class="btn btn-sm" onclick="toggleAllFiles()">Expand All</button>
+          <a href="?diffs=all&base={{.BaseParam}}&target={{.TargetParam}}&mode={{if eq .DiffMode "unified"}}split{{else}}unified{{end}}&ctx={{.CtxParam}}" class="btn btn-sm">
+            {{if eq .DiffMode "unified"}}Split View{{else}}Unified View{{end}}
+          </a>
+          <a href="?diffs=all&base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{if eq .CtxParam "all"}}3{{else}}all{{end}}" class="btn btn-sm">
+            {{if eq .CtxParam "all"}}Context View{{else}}Full file{{end}}
+          </a>
+        {{end}}
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <form method="GET" action="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}" class="search-container">
+          <input type="hidden" name="base" value="{{.BaseParam}}">
+          <input type="hidden" name="target" value="{{.TargetParam}}">
+          <input type="hidden" name="diffs" value="{{.DiffsMode}}">
+          <input type="hidden" name="mode" value="{{.DiffMode}}">
+          {{if .CtxParam}}<input type="hidden" name="ctx" value="{{.CtxParam}}">{{end}}
+          <input id="changeSearchInput" type="text" name="q" value="{{.Query}}" placeholder="Search in change... (/)">
+        </form>
+      </div>
+    </div>
+
+    {{if .SearchResults}}
+      <div class="search-results">
+        <h3 style="font-size: 14px; margin-bottom: 8px;">Search results for "{{.Query}}":</h3>
+        {{range .SearchResults}}
+          {{$filePath := .Path}}
+          <div class="search-file-group">
+            <div class="path">{{.Path}}</div>
+            {{range .Matches}}
+              <div class="search-match-line">
+                <a href="/r/{{$.Record.Slug}}/c/{{$.View.Change.Key}}/f/{{TrimSlash $filePath}}?base={{$.BaseParam}}&target={{$.TargetParam}}&mode={{$.DiffMode}}#L{{.Line}}">Line {{.Line}}:</a>
+                <span>{{.Snippet}}</span>
+              </div>
+            {{end}}
+          </div>
+        {{end}}
+      </div>
+    {{end}}
+
+    <!-- Files Summary Card (shown only in File List mode) -->
+    {{if ne .DiffsMode "all"}}
+    <div class="files-card file-summary-card">
+      <div class="files-header">
+        <span>Files ({{len .View.Files}})</span>
+        <div style="font-size: 12px; font-weight: normal; color: var(--muted);">
+          <span>Base: {{.View.BaseDesc}}</span> &rarr; <span>Target: {{.View.TargetDesc}}</span>
+        </div>
+      </div>
+      <div>
+        {{if .View.Files}}
+          {{range $i, $f := .View.Files}}
+            <div class="file-row"
+                 data-href="/r/{{$.Record.Slug}}/c/{{$.View.Change.Key}}/f/{{TrimSlash .Path}}?base={{$.BaseParam}}&target={{$.TargetParam}}&mode={{$.DiffMode}}&ctx={{$.CtxParam}}"
+                 onclick="handleFileRowClick(event, this)">
+              <a href="/r/{{$.Record.Slug}}/c/{{$.View.Change.Key}}/f/{{TrimSlash .Path}}?base={{$.BaseParam}}&target={{$.TargetParam}}&mode={{$.DiffMode}}&ctx={{$.CtxParam}}" class="file-link">
+                <span class="file-reviewed-icon" data-reviewed-icon="{{TrimSlash .Path}}" style="{{if not .Reviewed}}display: none;{{end}}">✓</span>
+                {{if .StatusCode}}<span class="file-status status-{{.StatusCode}}" title="{{.StatusTitle}}">{{.StatusCode}}</span>{{end}}
+                <span>{{.Path}}</span>
+              </a>
+              <div class="file-stats">
+                {{if gt .AddedLines 0}}<span class="lines-add">+{{.AddedLines}}</span>{{end}}
+                {{if gt .DeletedLines 0}}<span class="lines-del">&minus;{{.DeletedLines}}</span>{{end}}
+                <span class="comment-counts" data-file-counts="{{TrimSlash .Path}}">{{template "comment_counts" .CommentCounts}}</span>
+                <button type="button" class="btn btn-sm file-mark-reviewed-btn {{if .Reviewed}}btn-active{{end}}"
+                        data-reviewed-btn="{{TrimSlash .Path}}"
+                        onclick="toggleFileReviewedInPlace(this, '{{$.Record.Slug}}', '{{$.View.Change.Key}}', '{{$.View.TargetRev}}', '{{.Path}}')">
+                  {{if .Reviewed}}Mark Unreviewed{{else}}Mark Reviewed{{end}}
+                </button>
+              </div>
+            </div>
+          {{end}}
+        {{else}}
+          <div class="empty-diff-msg">No diffs found!</div>
+        {{end}}
+      </div>
+    </div>
+    {{end}}
+
+    <!-- Stacked All-Files Diffs -->
+    {{if eq .DiffsMode "all"}}
+      {{if .DiffFiles}}
+        <div class="diff-all-files" data-repo="{{$.Record.Slug}}" data-change="{{$.View.Change.Key}}">
+          {{range $i, $df := .DiffFiles}}
+            <div class="diff-file-section collapsed" id="file-sec-{{$i}}" data-file-path="{{TrimSlash $df.FilePath}}">
+              <div class="diff-file-header" onclick="handleFileHeaderClick(event, {{$i}})">
+                <div class="diff-file-header-meta">
+                  <button type="button" class="btn btn-sm file-collapse-btn" onclick="toggleFileSection({{$i}})" title="Collapse / Expand file diff">▸</button>
+                  <span class="file-reviewed-icon file-reviewed-icon-{{$i}}" data-reviewed-icon="{{TrimSlash $df.FilePath}}" style="{{if not $df.FileReviewed}}display: none;{{end}}">✓</span>
+                  {{if $df.StatusCode}}<span class="file-status status-{{$df.StatusCode}}" title="{{$df.StatusTitle}}">{{$df.StatusCode}}</span>{{end}}
+                  <span class="diff-file-label">
+                    <span class="diff-file-name" title="{{$df.FilePath}}">{{$df.FilePath}}</span>
+                    {{if or (gt $df.Added 0) (gt $df.Deleted 0)}}
+                      <span class="diff-file-stats">
+                        {{if gt $df.Added 0}}<span class="lines-add">+{{$df.Added}}</span>{{end}}
+                        {{if gt $df.Deleted 0}}<span class="lines-del">&minus;{{$df.Deleted}}</span>{{end}}
+                      </span>
+                    {{end}}
+                  </span>
+                  <span class="comment-counts" data-file-counts="{{TrimSlash $df.FilePath}}">{{template "comment_counts" $df.CommentCounts}}</span>
+                </div>
+                <div class="diff-header-scope-group" style="display: none;">
+                  <button type="button" class="diff-header-scope-side-btn diff-scope-side-left" onclick="handleToggleStickyScopeSide(event, this)" title="Based on left diff — click to base on right diff" aria-label="Switch enclosing declaration to right diff"><svg class="diff-scope-side-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 11.8V6a1.5 1.5 0 0 1 1.5-1.5h6.7"/><polyline points="8.8 2.2 11.5 4.5 8.8 6.8"/></svg></button>
+                  <button type="button" class="diff-header-scope" style="display: none;" onclick="handleStickyScopeClick(event, this)" title="Jump to enclosing declaration"></button>
+                  <button type="button" class="diff-header-scope-side-btn diff-scope-side-right" onclick="handleToggleStickyScopeSide(event, this)" title="Based on right diff — click to base on left diff" aria-label="Switch enclosing declaration to left diff"><svg class="diff-scope-side-icon" width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 11.8V6A1.5 1.5 0 0 0 9.5 4.5H2.8"/><polyline points="5.2 2.2 2.5 4.5 5.2 6.8"/></svg></button>
+                </div>
+                <div class="diff-file-header-actions" style="display: flex; align-items: center; gap: 8px; flex-shrink: 0;">
+                  <button type="button" class="btn btn-sm file-reviewed-btn-{{$i}} {{if $df.FileReviewed}}btn-active{{end}}"
+                          data-reviewed-btn="{{TrimSlash $df.FilePath}}"
+                          onclick="toggleFileReviewedInPlace(this, '{{$df.RepoSlug}}', '{{$df.ChangeKey}}', '{{$df.RightRev}}', '{{$df.FilePath}}', {{$i}})">
+                    {{if $df.FileReviewed}}Reviewed ✓{{else}}Mark Reviewed{{end}}
+                  </button>
+                  <a href="/r/{{$df.RepoSlug}}/c/{{$df.ChangeKey}}/f/{{TrimSlash $df.FilePath}}?base={{$.BaseParam}}&target={{$.TargetParam}}&mode={{$df.DiffMode}}&ctx={{$df.CtxParam}}" class="btn btn-sm">Single file &rarr;</a>
+                </div>
+              </div>
+              <div class="diff-file-body" id="file-body-{{$i}}" style="display: none;"
+                   {{if $df.Lazy}}data-lazy-url="/api/diff/file?repo={{urlquery $df.RepoSlug}}&change={{urlquery $df.ChangeKey}}&path={{urlquery (TrimSlash $df.FilePath)}}&index={{$i}}&base={{urlquery $.BaseParam}}&target={{urlquery $.TargetParam}}&mode={{urlquery $df.DiffMode}}&ctx={{urlquery $df.CtxParam}}"{{end}}>
+                {{if not $df.Lazy}}{{template "diff_block" $df}}{{end}}
+              </div>
+            </div>
+          {{end}}
+        </div>
+      {{else}}
+        <div class="files-card empty-diff-card">
+          <div class="empty-diff-msg">No diffs found!</div>
+        </div>
+      {{end}}
+    {{end}}
+  </div>
+{{end}}
