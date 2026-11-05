@@ -1,0 +1,404 @@
+{{define "comment_counts"}}
+  {{- if gt .Unresolved 0}}<span class="badge badge-count-unresolved">{{.Unresolved}} unresolved</span>{{end -}}
+  {{- if gt .Resolved 0}}<span class="badge badge-count-resolved">{{.Resolved}} resolved</span>{{end -}}
+  {{- if gt .Draft 0}}<span class="badge badge-draft">{{.Draft}} draft</span>{{end -}}
+{{end}}
+
+{{define "thread_card"}}
+{{- if .Messages}}
+{{$lastIdx := LastIndex .Messages}}
+{{$first := index .Messages 0}}
+{{$firstCollapsed := or (gt $lastIdx 0) (and .Resolved (not $first.Draft))}}
+<div id="thread-{{.ID}}" class="thread-card {{if not .Resolved}}thread-unresolved{{end}} {{if .Stale}}thread-stale{{end}}{{if $firstCollapsed}} first-msg-collapsed{{end}}"
+     data-resolved="{{if .Resolved}}true{{else}}false{{end}}"
+     {{if .HasRange}}data-has-range="true" data-range-side="{{.DisplaySide}}" data-start-line="{{.CurrentStart}}" data-end-line="{{.CurrentEnd}}" data-start-col="{{.StartCol}}" data-end-col="{{.EndCol}}"{{end}}>
+  <div class="thread-header" data-msg-id="{{$first.ID}}" data-collapsed="{{if $firstCollapsed}}true{{else}}false{{end}}" onclick="handleCommentHeaderClick(event, {{$first.ID}})">
+    <div class="thread-meta">
+      <strong class="thread-author">{{$first.Author}}</strong>
+      {{if $first.Draft}}<span class="badge badge-draft badge-xs">draft</span>{{end}}
+      <span class="thread-loc">
+        {{- if eq .StartLine 0}}file{{else if gt .CurrentStart 0}}L{{.CurrentStart}}{{if ne .CurrentStart .CurrentEnd}}–{{.CurrentEnd}}{{end}}{{else}}L{{.StartLine}}{{if ne .StartLine .EndLine}}–{{.EndLine}}{{end}}{{end -}}
+      </span>
+      {{if .Resolved}}<span class="badge badge-reviewed badge-xs">resolved</span>{{end}}
+      {{if .Stale}}<span class="badge badge-xs" style="background:#e06c75;color:#fff;">stale @ {{ShortRev .Rev}}:{{.StartLine}}</span>{{end}}
+    </div>
+    <span class="comment-collapsed-preview">{{CollapsePreview $first.Body}}</span>
+    {{if $first.Draft}}
+      <div class="thread-actions">
+        <button type="button" class="thread-btn" onclick="openEditMessageForm({{$first.ID}})">Edit</button>
+        <button type="button" class="thread-btn thread-btn-danger" onclick="deleteMessage({{$first.ID}})">Delete</button>
+      </div>
+    {{end}}
+    <button type="button" class="comment-collapse-btn" aria-expanded="{{if $firstCollapsed}}false{{else}}true{{end}}" aria-label="{{if $firstCollapsed}}Expand comment{{else}}Collapse comment{{end}}" title="{{if $firstCollapsed}}Expand comment{{else}}Collapse comment{{end}}"><svg class="comment-collapse-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 10 8 6 12 10"/></svg></button>
+  </div>
+  {{if and .Stale .AnchorText}}
+    <div class="thread-anchor-quote">{{.AnchorText}}</div>
+  {{end}}
+  {{range $i, $m := .Messages}}
+    {{$collapsed := or (lt $i $lastIdx) (and $.Resolved (not $m.Draft))}}
+    <div class="message-body{{if gt $i 0}} message-reply{{end}}{{if $collapsed}} msg-collapsed{{end}}" id="msg-{{$m.ID}}" data-msg-id="{{$m.ID}}">
+      {{if gt $i 0}}
+        <div class="reply-header" data-msg-id="{{$m.ID}}" data-collapsed="{{if $collapsed}}true{{else}}false{{end}}" onclick="handleCommentHeaderClick(event, {{$m.ID}})">
+          <div class="thread-meta">
+            <strong class="thread-author">{{$m.Author}}</strong>
+            {{if $m.Draft}}<span class="badge badge-draft badge-xs">draft</span>{{end}}
+          </div>
+          <span class="comment-collapsed-preview">{{CollapsePreview $m.Body}}</span>
+          {{if $m.Draft}}
+            <div class="thread-actions">
+              <button type="button" class="thread-btn" onclick="openEditMessageForm({{$m.ID}})">Edit</button>
+              <button type="button" class="thread-btn thread-btn-danger" onclick="deleteMessage({{$m.ID}})">Delete</button>
+            </div>
+          {{end}}
+          <button type="button" class="comment-collapse-btn" aria-expanded="{{if $collapsed}}false{{else}}true{{end}}" aria-label="{{if $collapsed}}Expand comment{{else}}Collapse comment{{end}}" title="{{if $collapsed}}Expand comment{{else}}Collapse comment{{end}}"><svg class="comment-collapse-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 10 8 6 12 10"/></svg></button>
+        </div>
+      {{end}}
+      <div class="msg-content markdown-body" id="msg-content-{{$m.ID}}">{{Markdown $m.Body}}</div>
+      {{if $m.Draft}}
+        <div class="msg-edit-form" id="msg-edit-{{$m.ID}}" data-orig-body="{{$m.Body}}" style="display: none;">
+          <form onsubmit="submitEditMessage(event, {{$m.ID}})">
+            <textarea id="edit-ta-{{$m.ID}}" rows="2" oninput="handleEditMsgInput(this, {{$m.ID}})" placeholder="Edit comment... (Cmd/Ctrl+Enter)" required>{{$m.Body}}</textarea>
+            <div class="comment-footer">
+              <div class="comment-footer-left">
+                <label class="resolved-toggle"><input type="checkbox" name="resolved" {{if $.Resolved}}checked{{end}} onchange="handleEditResolvedChange(this, {{$m.ID}})"> Resolved</label>
+                <span class="comment-hint">Cmd/Ctrl+Enter</span>
+              </div>
+              <div class="comment-actions">
+                <button type="button" class="thread-btn" onclick="closeEditMessageForm({{$m.ID}}, true)">Cancel</button>
+                <button type="submit" class="thread-btn thread-btn-primary">Save</button>
+              </div>
+            </div>
+          </form>
+        </div>
+      {{end}}
+    </div>
+  {{end}}
+  <div class="thread-footer">
+    <button type="button" class="thread-btn" onclick="toggleReplyForm({{.ID}})">Reply</button>
+    {{if .Resolved}}
+      <button type="button" class="thread-btn" onclick="resolveThread({{.ID}}, false)">Reopen</button>
+    {{else}}
+      <button type="button" class="thread-btn" onclick="resolveThread({{.ID}}, true)">Resolve</button>
+    {{end}}
+  </div>
+  <div class="comment-form reply-form" id="reply-form-{{.ID}}" style="display: none;">
+    <form onsubmit="replyThread(event, {{.ID}})">
+      <textarea rows="2" oninput="handleReplyInput(this, {{.ID}})" placeholder="Reply... (Cmd/Ctrl+Enter)" required></textarea>
+      <div class="comment-footer">
+        <div class="comment-footer-left">
+          <label class="resolved-toggle"><input type="checkbox" name="resolved" {{if .Resolved}}checked{{end}} onchange="handleReplyResolvedChange(this, {{.ID}})"> Resolved</label>
+          <span class="comment-hint">Cmd/Ctrl+Enter</span>
+        </div>
+        <div class="comment-actions">
+          <button type="button" class="thread-btn" onclick="toggleReplyForm({{.ID}}, true)">Cancel</button>
+          <button type="submit" class="thread-btn thread-btn-primary">Reply</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+{{end -}}
+{{end}}
+
+{{define "diff_block"}}
+<div class="diff-container" id="diff-container-{{.FileIndex}}"
+     data-repo="{{.RepoSlug}}"
+     data-change="{{.ChangeKey}}"
+     data-file-path="{{TrimSlash .FilePath}}"
+     data-left-rev="{{.LeftRev}}"
+     data-right-rev="{{.RightRev}}"
+     data-diff-mode="{{.DiffMode}}"{{if .NextUnreviewedFile}}
+     data-next-unreviewed="{{TrimSlash .NextUnreviewedFile}}"{{end}}{{if .ReadOnly}}
+     data-readonly="true"{{end}}{{if .ExtPkg}}
+     data-ext-pkg="{{.ExtPkg}}"
+     data-ext-file="{{.ExtFile}}"{{end}}{{if .OriginPath}}
+     data-origin-path="{{TrimSlash .OriginPath}}"{{end}}{{if .ScopesJSON}}
+     data-scopes="{{.ScopesJSON}}"
+     data-scopes-side="{{.ScopesSide}}"{{end}}{{if .ScopesRJSON}}
+     data-scopes-r="{{.ScopesRJSON}}"{{end}}{{if .ScopesLJSON}}
+     data-scopes-l="{{.ScopesLJSON}}"{{end}}>
+
+  {{if .IsAllRebased}}
+    <div style="background: var(--diff-rebase-bg); color: var(--diff-rebase-text); border: 1px solid var(--border); padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 13px;">
+      This file's changes were entirely introduced by rebasing over upstream changes.
+    </div>
+  {{end}}
+
+  {{if .IsBinary}}
+    <div style="padding: 24px; text-align: center; color: var(--muted); font-size: 14px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 12px;">
+      Binary file changed — cannot render textual diff.
+    </div>
+  {{else if .IsTooLarge}}
+    <div style="padding: 24px; text-align: center; color: var(--muted); font-size: 14px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 12px;">
+      Large diff (exceeds 25,000 lines) — <a href="/r/{{.RepoSlug}}/c/{{.ChangeKey}}/f/{{TrimSlash .FilePath}}?base={{.BaseParam}}&target={{.TargetParam}}">open single-file view</a> to inspect.
+    </div>
+  {{else}}
+    {{if .FileThreads}}
+      <div class="file-threads-container" style="padding: 6px 8px; border-bottom: 1px solid var(--border-muted);">
+        {{range .FileThreads}}
+          {{template "thread_card" .}}
+        {{end}}
+      </div>
+    {{end}}
+
+    {{if eq .DiffMode "unified"}}
+      <table class="diff-table diff-table-unified{{if .SingleColumn}} diff-table-single{{end}}">
+        <colgroup>
+          <col class="col-num" style="width: 48px;">
+          {{if not .SingleColumn}}<col class="col-num" style="width: 48px;">{{end}}
+          <col class="col-code">
+        </colgroup>
+        <tbody>
+          {{range .Rows}}
+            {{if eq .Type 4}}
+              <tr class="row-skip {{if .AtTop}}skip-at-top{{end}} {{if .AtBottom}}skip-at-bottom{{end}} {{if or (le .SkipCount 10) (and .AtTop .AtBottom)}}skip-no-tabs{{end}}"
+                  data-skip-group="{{.SkipGroup}}"
+                  data-left-start="{{.LeftStart}}" data-left-end="{{.LeftEnd}}"
+                  data-right-start="{{.RightStart}}" data-right-end="{{.RightEnd}}">
+                <td class="line-num skip-gutter"></td>
+                {{if not $.SingleColumn}}<td class="line-num skip-gutter"></td>{{end}}
+                <td class="skip-code-cell">
+                  <div class="skip-controls">
+                    <div class="skip-widget">
+                      <button type="button" class="skip-btn skip-all" onclick="expandContextAll(this)" title="Expand all {{.SkipCount}} common lines"><span>+<span class="skip-count">{{.SkipCount}}</span> common lines</span></button>
+                      {{if and (gt .SkipCount 10) (or (not .AtTop) (not .AtBottom))}}
+                        <div class="skip-tabs">
+                          {{if not .AtTop}}
+                            <button type="button" class="skip-btn skip-tab skip-tab-up" onclick="expandContextStep(this, 'down', 10)" title="Expand 10 lines downward">+10</button>
+                          {{end}}
+                          {{if not .AtBottom}}
+                            <button type="button" class="skip-btn skip-tab skip-tab-down" onclick="expandContextStep(this, 'up', 10)" title="Expand 10 lines upward">+10</button>
+                          {{end}}
+                        </div>
+                      {{end}}
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            {{else}}
+              {{if and (eq .Type 3) .MovedL .MovedL.BlockStart}}
+                <tr class="move-header-row">
+                  {{if $.SingleColumn}}
+                    <td class="line-num thread-gutter cell-moved-num"></td>
+                    <td class="move-header-cell">
+                      <span class="move-header-actions">
+                        <a href="/r/{{$.RepoSlug}}/c/{{$.ChangeKey}}/f/{{if .MovedL.PeerPath}}{{TrimSlash .MovedL.PeerPath}}{{else}}{{TrimSlash $.FilePath}}{{end}}?{{if $.BaseParam}}base={{$.BaseParam}}&{{end}}{{if $.TargetParam}}target={{$.TargetParam}}&{{end}}side=R&mode={{$.DiffMode}}{{if gt .MovedL.PeerEnd .MovedL.PeerStart}}&end={{.MovedL.PeerEnd}}{{end}}#L{{.MovedL.PeerStart}}" class="move-badge" data-peer-path="{{.MovedL.PeerPath}}" data-peer-start="{{.MovedL.PeerStart}}" data-peer-end="{{.MovedL.PeerEnd}}" data-peer-side="R" onclick="handleJumpToMovePeer(event, this)">
+                          → Moved to {{if .MovedL.PeerPath}}{{.MovedL.PeerPath}}:{{end}}L{{.MovedL.PeerStart}}{{if ne .MovedL.PeerStart .MovedL.PeerEnd}}–{{.MovedL.PeerEnd}}{{end}}{{if .MovedL.BlockModified}} (modified){{end}}
+                        </a>
+                        <button type="button" class="move-popup-btn" data-peer-path="{{.MovedL.PeerPath}}" data-peer-start="{{.MovedL.PeerStart}}" data-peer-end="{{.MovedL.PeerEnd}}" data-peer-side="R"{{if .MovedL.BlockModified}} data-move-modified="true"{{end}} onclick="handleOpenMovePeerPopup(event, this)" title="Open moved destination in popup window" aria-label="Open moved destination in popup window">
+                          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.6"/><line x1="1.5" y1="5" x2="12.5" y2="5"/></svg>
+                        </button>
+                      </span>
+                    </td>
+                  {{else}}
+                    <td class="line-num thread-gutter cell-moved-num"></td>
+                    <td class="line-num thread-gutter"></td>
+                    <td class="move-header-cell">
+                      <span class="move-header-actions">
+                        <a href="/r/{{$.RepoSlug}}/c/{{$.ChangeKey}}/f/{{if .MovedL.PeerPath}}{{TrimSlash .MovedL.PeerPath}}{{else}}{{TrimSlash $.FilePath}}{{end}}?{{if $.BaseParam}}base={{$.BaseParam}}&{{end}}{{if $.TargetParam}}target={{$.TargetParam}}&{{end}}side=R&mode={{$.DiffMode}}{{if gt .MovedL.PeerEnd .MovedL.PeerStart}}&end={{.MovedL.PeerEnd}}{{end}}#L{{.MovedL.PeerStart}}" class="move-badge" data-peer-path="{{.MovedL.PeerPath}}" data-peer-start="{{.MovedL.PeerStart}}" data-peer-end="{{.MovedL.PeerEnd}}" data-peer-side="R" onclick="handleJumpToMovePeer(event, this)">
+                          → Moved to {{if .MovedL.PeerPath}}{{.MovedL.PeerPath}}:{{end}}L{{.MovedL.PeerStart}}{{if ne .MovedL.PeerStart .MovedL.PeerEnd}}–{{.MovedL.PeerEnd}}{{end}}{{if .MovedL.BlockModified}} (modified){{end}}
+                        </a>
+                        <button type="button" class="move-popup-btn" data-peer-path="{{.MovedL.PeerPath}}" data-peer-start="{{.MovedL.PeerStart}}" data-peer-end="{{.MovedL.PeerEnd}}" data-peer-side="R"{{if .MovedL.BlockModified}} data-move-modified="true"{{end}} onclick="handleOpenMovePeerPopup(event, this)" title="Open moved destination in popup window" aria-label="Open moved destination in popup window">
+                          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.6"/><line x1="1.5" y1="5" x2="12.5" y2="5"/></svg>
+                        </button>
+                      </span>
+                    </td>
+                  {{end}}
+                </tr>
+              {{else if and (eq .Type 2) .MovedR .MovedR.BlockStart}}
+                <tr class="move-header-row">
+                  {{if $.SingleColumn}}
+                    <td class="line-num thread-gutter cell-moved-num"></td>
+                    <td class="move-header-cell">
+                      <span class="move-header-actions">
+                        <a href="/r/{{$.RepoSlug}}/c/{{$.ChangeKey}}/f/{{if .MovedR.PeerPath}}{{TrimSlash .MovedR.PeerPath}}{{else}}{{TrimSlash $.FilePath}}{{end}}?{{if $.BaseParam}}base={{$.BaseParam}}&{{end}}{{if $.TargetParam}}target={{$.TargetParam}}&{{end}}side=L&mode={{$.DiffMode}}{{if gt .MovedR.PeerEnd .MovedR.PeerStart}}&end={{.MovedR.PeerEnd}}{{end}}#L{{.MovedR.PeerStart}}" class="move-badge" data-peer-path="{{.MovedR.PeerPath}}" data-peer-start="{{.MovedR.PeerStart}}" data-peer-end="{{.MovedR.PeerEnd}}" data-peer-side="L" onclick="handleJumpToMovePeer(event, this)">
+                          ← Moved from {{if .MovedR.PeerPath}}{{.MovedR.PeerPath}}:{{end}}L{{.MovedR.PeerStart}}{{if ne .MovedR.PeerStart .MovedR.PeerEnd}}–{{.MovedR.PeerEnd}}{{end}}{{if .MovedR.BlockModified}} (modified){{end}}
+                        </a>
+                        <button type="button" class="move-popup-btn" data-peer-path="{{.MovedR.PeerPath}}" data-peer-start="{{.MovedR.PeerStart}}" data-peer-end="{{.MovedR.PeerEnd}}" data-peer-side="L"{{if .MovedR.BlockModified}} data-move-modified="true"{{end}} onclick="handleOpenMovePeerPopup(event, this)" title="Open moved source in popup window" aria-label="Open moved source in popup window">
+                          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.6"/><line x1="1.5" y1="5" x2="12.5" y2="5"/></svg>
+                        </button>
+                      </span>
+                    </td>
+                  {{else}}
+                    <td class="line-num thread-gutter"></td>
+                    <td class="line-num thread-gutter cell-moved-num"></td>
+                    <td class="move-header-cell">
+                      <span class="move-header-actions">
+                        <a href="/r/{{$.RepoSlug}}/c/{{$.ChangeKey}}/f/{{if .MovedR.PeerPath}}{{TrimSlash .MovedR.PeerPath}}{{else}}{{TrimSlash $.FilePath}}{{end}}?{{if $.BaseParam}}base={{$.BaseParam}}&{{end}}{{if $.TargetParam}}target={{$.TargetParam}}&{{end}}side=L&mode={{$.DiffMode}}{{if gt .MovedR.PeerEnd .MovedR.PeerStart}}&end={{.MovedR.PeerEnd}}{{end}}#L{{.MovedR.PeerStart}}" class="move-badge" data-peer-path="{{.MovedR.PeerPath}}" data-peer-start="{{.MovedR.PeerStart}}" data-peer-end="{{.MovedR.PeerEnd}}" data-peer-side="L" onclick="handleJumpToMovePeer(event, this)">
+                          ← Moved from {{if .MovedR.PeerPath}}{{.MovedR.PeerPath}}:{{end}}L{{.MovedR.PeerStart}}{{if ne .MovedR.PeerStart .MovedR.PeerEnd}}–{{.MovedR.PeerEnd}}{{end}}{{if .MovedR.BlockModified}} (modified){{end}}
+                        </a>
+                        <button type="button" class="move-popup-btn" data-peer-path="{{.MovedR.PeerPath}}" data-peer-start="{{.MovedR.PeerStart}}" data-peer-end="{{.MovedR.PeerEnd}}" data-peer-side="L"{{if .MovedR.BlockModified}} data-move-modified="true"{{end}} onclick="handleOpenMovePeerPopup(event, this)" title="Open moved source in popup window" aria-label="Open moved source in popup window">
+                          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.6"/><line x1="1.5" y1="5" x2="12.5" y2="5"/></svg>
+                        </button>
+                      </span>
+                    </td>
+                  {{end}}
+                </tr>
+              {{end}}
+              <tr class="diff-row {{if eq .Type 1}}row-change-add{{else if eq .Type 2}}row-add{{else if eq .Type 3}}row-del{{else}}row-equal{{end}} {{if or (and (eq .Type 3) .RebasedL) (and (eq .Type 2) .RebasedR) (and (eq .Type 1) .RebasedL .RebasedR)}}row-rebased{{end}}"
+                  data-skip-group="{{.SkipGroup}}"
+                  data-line-l="{{if gt .LeftLine 0}}{{.LeftLine}}{{end}}"
+                  data-line-r="{{if gt .RightLine 0}}{{.RightLine}}{{end}}">
+                {{if $.SingleColumn}}
+                  {{if $.ReadOnly}}
+                    <td class="line-num thread-gutter {{if and (eq .Type 2) .MovedR (not .MovedR.Modified)}}cell-moved-num{{else if and (eq .Type 3) .MovedL (not .MovedL.Modified)}}cell-moved-num{{end}}">{{if gt .RightLine 0}}{{.RightLine}}{{else if gt .LeftLine 0}}{{.LeftLine}}{{end}}</td>
+                  {{else}}
+                    <td class="line-num {{if and (eq .Type 2) .MovedR (not .MovedR.Modified)}}cell-moved-num{{else if and (eq .Type 3) .MovedL (not .MovedL.Modified)}}cell-moved-num{{end}}" data-gutter-side="{{if $.ExtSide}}{{$.ExtSide}}{{else}}R{{end}}" onclick="openCommentForm(this.parentNode, {{if gt .RightLine 0}}{{.RightLine}}{{else}}{{.LeftLine}}{{end}}, '{{if $.ExtSide}}{{$.ExtSide}}{{else}}R{{end}}')">{{if gt .RightLine 0}}{{.RightLine}}{{else if gt .LeftLine 0}}{{.LeftLine}}{{end}}</td>
+                  {{end}}
+                {{else}}
+                  <td class="line-num {{if and (eq .Type 3) .MovedL (not .MovedL.Modified)}}cell-moved-num{{else if eq .Type 3}}cell-del-num{{end}}" data-gutter-side="L" onclick="openCommentForm(this.parentNode, {{.LeftLine}}, 'L')">{{if gt .LeftLine 0}}{{.LeftLine}}{{end}}</td>
+                  <td class="line-num {{if and (eq .Type 2) .MovedR (not .MovedR.Modified)}}cell-moved-num{{else if eq .Type 2}}cell-add-num{{end}}" data-gutter-side="R" onclick="openCommentForm(this.parentNode, {{.RightLine}}, 'R')">{{if gt .RightLine 0}}{{.RightLine}}{{end}}</td>
+                {{end}}
+                <td class="line-code-unified {{if eq .Type 3}}{{if and .MovedL (not .MovedL.Modified)}}cell-moved{{else if and .MovedL .MovedL.Modified}}cell-del cell-moved-modified{{else}}cell-del{{end}}{{else if eq .Type 2}}{{if and .MovedR (not .MovedR.Modified)}}cell-moved{{else if and .MovedR .MovedR.Modified}}cell-add cell-moved-modified{{else}}cell-add{{end}}{{end}}" data-side="{{if $.ExtSide}}{{$.ExtSide}}{{else if eq .Type 3}}L{{else}}R{{end}}">{{if or (eq .Type 3) (eq $.ExtSide "L") (and (gt .LeftLine 0) (eq .RightLine 0))}}{{.RenderLeftHTML}}{{else}}{{.RenderRightHTML}}{{end}}</td>
+              </tr>
+
+              {{if gt .LeftLine 0}}
+                {{$lThreads := index $.LeftThreads .LeftLine}}
+                {{range $lThreads}}
+                  <tr class="thread-row">
+                    <td class="line-num thread-gutter"></td>
+                    {{if not $.SingleColumn}}<td class="line-num thread-gutter"></td>{{end}}
+                    <td class="thread-cell">{{template "thread_card" .}}</td>
+                  </tr>
+                {{end}}
+              {{end}}
+
+              {{if gt .RightLine 0}}
+                {{$rThreads := index $.RightThreads .RightLine}}
+                {{range $rThreads}}
+                  <tr class="thread-row">
+                    <td class="line-num thread-gutter"></td>
+                    {{if not $.SingleColumn}}<td class="line-num thread-gutter"></td>{{end}}
+                    <td class="thread-cell">{{template "thread_card" .}}</td>
+                  </tr>
+                {{end}}
+              {{end}}
+            {{end}}
+          {{end}}
+        </tbody>
+      </table>
+    {{else}}
+      <table class="diff-table diff-table-split">
+        <colgroup>
+          <col class="col-num" style="width: 48px;">
+          <col class="col-code" style="width: calc(50% - 48px);">
+          <col class="col-num" style="width: 48px;">
+          <col class="col-code" style="width: calc(50% - 48px);">
+        </colgroup>
+        <tbody>
+          {{range .Rows}}
+            {{if eq .Type 4}}
+              <tr class="row-skip {{if .AtTop}}skip-at-top{{end}} {{if .AtBottom}}skip-at-bottom{{end}} {{if or (le .SkipCount 10) (and .AtTop .AtBottom)}}skip-no-tabs{{end}}"
+                  data-skip-group="{{.SkipGroup}}"
+                  data-left-start="{{.LeftStart}}" data-left-end="{{.LeftEnd}}"
+                  data-right-start="{{.RightStart}}" data-right-end="{{.RightEnd}}">
+                <td class="line-num skip-gutter"></td>
+                <td class="skip-code-cell"></td>
+                <td class="line-num skip-gutter">
+                  <div class="skip-controls">
+                    <div class="skip-widget">
+                      <button type="button" class="skip-btn skip-all" onclick="expandContextAll(this)" title="Expand all {{.SkipCount}} common lines"><span>+<span class="skip-count">{{.SkipCount}}</span> common lines</span></button>
+                      {{if and (gt .SkipCount 10) (or (not .AtTop) (not .AtBottom))}}
+                        <div class="skip-tabs">
+                          {{if not .AtTop}}
+                            <button type="button" class="skip-btn skip-tab skip-tab-up" onclick="expandContextStep(this, 'down', 10)" title="Expand 10 lines downward">+10</button>
+                          {{end}}
+                          {{if not .AtBottom}}
+                            <button type="button" class="skip-btn skip-tab skip-tab-down" onclick="expandContextStep(this, 'up', 10)" title="Expand 10 lines upward">+10</button>
+                          {{end}}
+                        </div>
+                      {{end}}
+                    </div>
+                  </div>
+                </td>
+                <td class="skip-code-cell"></td>
+              </tr>
+            {{else}}
+              {{if or (and .MovedL .MovedL.BlockStart) (and .MovedR .MovedR.BlockStart)}}
+                <tr class="move-header-row">
+                  {{if and .MovedL .MovedL.BlockStart}}
+                    <td class="line-num thread-gutter cell-moved-num"></td>
+                    <td class="move-header-cell">
+                      <span class="move-header-actions">
+                        <a href="/r/{{$.RepoSlug}}/c/{{$.ChangeKey}}/f/{{if .MovedL.PeerPath}}{{TrimSlash .MovedL.PeerPath}}{{else}}{{TrimSlash $.FilePath}}{{end}}?{{if $.BaseParam}}base={{$.BaseParam}}&{{end}}{{if $.TargetParam}}target={{$.TargetParam}}&{{end}}side=R&mode={{$.DiffMode}}{{if gt .MovedL.PeerEnd .MovedL.PeerStart}}&end={{.MovedL.PeerEnd}}{{end}}#L{{.MovedL.PeerStart}}" class="move-badge" data-peer-path="{{.MovedL.PeerPath}}" data-peer-start="{{.MovedL.PeerStart}}" data-peer-end="{{.MovedL.PeerEnd}}" data-peer-side="R" onclick="handleJumpToMovePeer(event, this)">
+                          → Moved to {{if .MovedL.PeerPath}}{{.MovedL.PeerPath}}:{{end}}L{{.MovedL.PeerStart}}{{if ne .MovedL.PeerStart .MovedL.PeerEnd}}–{{.MovedL.PeerEnd}}{{end}}{{if .MovedL.BlockModified}} (modified){{end}}
+                        </a>
+                        <button type="button" class="move-popup-btn" data-peer-path="{{.MovedL.PeerPath}}" data-peer-start="{{.MovedL.PeerStart}}" data-peer-end="{{.MovedL.PeerEnd}}" data-peer-side="R"{{if .MovedL.BlockModified}} data-move-modified="true"{{end}} onclick="handleOpenMovePeerPopup(event, this)" title="Open moved destination in popup window" aria-label="Open moved destination in popup window">
+                          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.6"/><line x1="1.5" y1="5" x2="12.5" y2="5"/></svg>
+                        </button>
+                      </span>
+                    </td>
+                  {{else}}
+                    <td class="line-num thread-gutter {{if eq .Type 2}}cell-empty{{else if and .MovedL (not .MovedL.Modified)}}cell-moved-num{{else if eq .Type 1}}cell-del-num{{end}}"></td>
+                    <td class="line-code {{if eq .Type 2}}cell-empty{{else if and .MovedL (not .MovedL.Modified)}}cell-moved{{else if and .MovedL .MovedL.Modified}}cell-del cell-moved-modified{{else if eq .Type 1}}cell-del{{end}}"></td>
+                  {{end}}
+                  {{if and .MovedR .MovedR.BlockStart}}
+                    <td class="line-num thread-gutter cell-moved-num"></td>
+                    <td class="move-header-cell">
+                      <span class="move-header-actions">
+                        <a href="/r/{{$.RepoSlug}}/c/{{$.ChangeKey}}/f/{{if .MovedR.PeerPath}}{{TrimSlash .MovedR.PeerPath}}{{else}}{{TrimSlash $.FilePath}}{{end}}?{{if $.BaseParam}}base={{$.BaseParam}}&{{end}}{{if $.TargetParam}}target={{$.TargetParam}}&{{end}}side=L&mode={{$.DiffMode}}{{if gt .MovedR.PeerEnd .MovedR.PeerStart}}&end={{.MovedR.PeerEnd}}{{end}}#L{{.MovedR.PeerStart}}" class="move-badge" data-peer-path="{{.MovedR.PeerPath}}" data-peer-start="{{.MovedR.PeerStart}}" data-peer-end="{{.MovedR.PeerEnd}}" data-peer-side="L" onclick="handleJumpToMovePeer(event, this)">
+                          ← Moved from {{if .MovedR.PeerPath}}{{.MovedR.PeerPath}}:{{end}}L{{.MovedR.PeerStart}}{{if ne .MovedR.PeerStart .MovedR.PeerEnd}}–{{.MovedR.PeerEnd}}{{end}}{{if .MovedR.BlockModified}} (modified){{end}}
+                        </a>
+                        <button type="button" class="move-popup-btn" data-peer-path="{{.MovedR.PeerPath}}" data-peer-start="{{.MovedR.PeerStart}}" data-peer-end="{{.MovedR.PeerEnd}}" data-peer-side="L"{{if .MovedR.BlockModified}} data-move-modified="true"{{end}} onclick="handleOpenMovePeerPopup(event, this)" title="Open moved source in popup window" aria-label="Open moved source in popup window">
+                          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.6"/><line x1="1.5" y1="5" x2="12.5" y2="5"/></svg>
+                        </button>
+                      </span>
+                    </td>
+                  {{else}}
+                    <td class="line-num thread-gutter {{if eq .Type 3}}cell-empty{{else if and .MovedR (not .MovedR.Modified)}}cell-moved-num{{else if eq .Type 1}}cell-add-num{{end}}"></td>
+                    <td class="line-code {{if eq .Type 3}}cell-empty{{else if and .MovedR (not .MovedR.Modified)}}cell-moved{{else if and .MovedR .MovedR.Modified}}cell-add cell-moved-modified{{else if eq .Type 1}}cell-add{{end}}"></td>
+                  {{end}}
+                </tr>
+              {{end}}
+              <tr class="diff-row {{if or (and (eq .Type 3) .RebasedL) (and (eq .Type 2) .RebasedR) (and (eq .Type 1) .RebasedL .RebasedR)}}row-rebased{{end}}"
+                  data-skip-group="{{.SkipGroup}}"
+                  data-line-l="{{if gt .LeftLine 0}}{{.LeftLine}}{{end}}"
+                  data-line-r="{{if gt .RightLine 0}}{{.RightLine}}{{end}}">
+                <td class="line-num {{if and .MovedL (not .MovedL.Modified)}}cell-moved-num{{else if or (eq .Type 3) (eq .Type 1)}}cell-del-num{{else if eq .Type 2}}cell-empty{{end}}"
+                    data-gutter-side="L"
+                    onclick="openCommentForm(this.parentNode, {{.LeftLine}}, 'L')">{{if gt .LeftLine 0}}{{.LeftLine}}{{end}}</td>
+                <td class="line-code {{if and .MovedL (not .MovedL.Modified)}}cell-moved{{else if and .MovedL .MovedL.Modified}}cell-del cell-moved-modified{{else if or (eq .Type 3) (eq .Type 1)}}cell-del{{else if eq .Type 2}}cell-empty{{end}}"
+                    data-side="L">{{.RenderLeftHTML}}</td>
+
+                <td class="line-num {{if and .MovedR (not .MovedR.Modified)}}cell-moved-num{{else if or (eq .Type 2) (eq .Type 1)}}cell-add-num{{else if eq .Type 3}}cell-empty{{end}}"
+                    data-gutter-side="R"
+                    onclick="openCommentForm(this.parentNode, {{.RightLine}}, 'R')">{{if gt .RightLine 0}}{{.RightLine}}{{end}}</td>
+                <td class="line-code {{if and .MovedR (not .MovedR.Modified)}}cell-moved{{else if and .MovedR .MovedR.Modified}}cell-add cell-moved-modified{{else if or (eq .Type 2) (eq .Type 1)}}cell-add{{else if eq .Type 3}}cell-empty{{end}}"
+                    data-side="R">{{.RenderRightHTML}}</td>
+              </tr>
+
+              {{$hasL := false}}
+              {{$hasR := false}}
+              {{$lThreads := index $.LeftThreads .LeftLine}}
+              {{$rThreads := index $.RightThreads .RightLine}}
+              {{if and (gt .LeftLine 0) $lThreads}}{{$hasL = true}}{{end}}
+              {{if and (gt .RightLine 0) $rThreads}}{{$hasR = true}}{{end}}
+
+              {{if or $hasL $hasR}}
+                <tr class="thread-row">
+                  <td class="line-num thread-gutter{{if eq .LeftLine 0}} cell-empty{{end}}"></td>
+                  {{if $hasL}}
+                    <td class="thread-cell">
+                      {{range $lThreads}}{{template "thread_card" .}}{{end}}
+                    </td>
+                  {{else}}
+                    <td class="line-code{{if eq .LeftLine 0}} cell-empty{{end}}"></td>
+                  {{end}}
+                  <td class="line-num thread-gutter{{if eq .RightLine 0}} cell-empty{{end}}"></td>
+                  {{if $hasR}}
+                    <td class="thread-cell">
+                      {{range $rThreads}}{{template "thread_card" .}}{{end}}
+                    </td>
+                  {{else}}
+                    <td class="line-code{{if eq .RightLine 0}} cell-empty{{end}}"></td>
+                  {{end}}
+                </tr>
+              {{end}}
+            {{end}}
+          {{end}}
+        </tbody>
+      </table>
+    {{end}}
+  {{end}}
+</div>
+{{end}}
