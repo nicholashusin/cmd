@@ -254,8 +254,7 @@ func (s *Server) computeMoveBundle(repo vcs.Repo, view *engine.ChangeView) *Move
 			return
 		}
 
-		edits := diff.Edits(baseLines, targetLines)
-		rawRows := diff.BuildDiffRows(baseLines, targetLines, edits)
+		rawRows := diff.BuildDiffRows(baseLines, targetLines, diff.DetectLang(cleanPath))
 
 		mfd := &moveFileData{
 			baseData:    baseData,

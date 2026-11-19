@@ -658,6 +658,7 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 	}
 
 	cleanPath := strings.TrimPrefix(vcsPath, "/")
+	lang := diff.DetectLang(vcsPath)
 	var baseData []byte
 	var targetData []byte
 	var baseLines []string
@@ -707,8 +708,7 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 			return data
 		}
 
-		edits := diff.Edits(baseLines, targetLines)
-		rawRows = diff.BuildDiffRows(baseLines, targetLines, edits)
+		rawRows = diff.BuildDiffRows(baseLines, targetLines, lang)
 	}
 
 	// Rebase attribution applies only when comparing two snapshots of the same change
@@ -796,7 +796,6 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 		}
 	}
 
-	lang := diff.DetectLang(vcsPath)
 	baseTokens := diff.HighlightLinesKeep(baseLines, lang, baseKeep)
 	targetTokens := diff.HighlightLinesKeep(targetLines, lang, targetKeep)
 

@@ -283,8 +283,29 @@ func runeSpansToByteSpans(s string, rSpans []runeSpan) []Span {
 }
 
 // BuildDiffRows creates side-by-side rows from left and right lines using
-// multi-line hunk intraline diffing and alignment.
-func BuildDiffRows(left, right []string, edits []Edit) []Row {
+// multi-line hunk intraline diffing and alignment. Changes to whitespace
+// outside of string literals are not shown.
+func BuildDiffRows(left, right []string, lang Lang) []Row {
+	leftKeys, leftStrs := wsKeys(left, lang)
+	rightKeys, rightStrs := wsKeys(right, lang)
+	rows := buildDiffRows(left, right, Edits(leftKeys, rightKeys))
+	for i := range rows {
+		r := &rows[i]
+		if r.Type != RowChange {
+			continue
+		}
+		if leftKeys[r.LeftLine-1] == rightKeys[r.RightLine-1] {
+			r.Type = RowEqual
+			r.LeftIntra, r.RightIntra = nil, nil
+			continue
+		}
+		r.LeftIntra = trimWS(r.LeftText, leftStrs[r.LeftLine-1], r.LeftIntra)
+		r.RightIntra = trimWS(r.RightText, rightStrs[r.RightLine-1], r.RightIntra)
+	}
+	return rows
+}
+
+func buildDiffRows(left, right []string, edits []Edit) []Row {
 	type lineHunk struct {
 		a0, a1 int
 		b0, b1 int

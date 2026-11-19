@@ -707,10 +707,9 @@ func h1ServerKeepAlivesDisabled(hs ServerConfig) bool {
 
 	leftLines := SplitLines([]byte(leftCode))
 	rightLines := SplitLines([]byte(rightCode))
-	edits := Edits(leftLines, rightLines)
-	rows := BuildDiffRows(leftLines, rightLines, edits)
+	rows := BuildDiffRows(leftLines, rightLines, LangGo)
 
-	// 1. Verify 1-to-1 pairing of the 6 statements
+	// 1. Verify the 6 re-indented statements are paired 1-to-1 as unchanged
 	statements := []string{
 		"\t// TODO: Dedup with http.Error?",
 		"\th := w.Header()",
@@ -725,18 +724,11 @@ func h1ServerKeepAlivesDisabled(hs ServerConfig) bool {
 		for _, r := range rows {
 			if r.LeftText == stmt {
 				found = true
-				if r.Type != RowChange {
-					t.Errorf("line %q: expected RowChange, got %v", stmt, r.Type)
+				if r.Type != RowEqual {
+					t.Errorf("line %q: expected RowEqual, got %v", stmt, r.Type)
 				}
 				if r.RightText != "\t"+stmt {
 					t.Errorf("line %q: expected RightText %q, got %q", stmt, "\t"+stmt, r.RightText)
-				}
-				if len(r.LeftIntra) != 0 {
-					t.Errorf("line %q: expected empty LeftIntra, got %+v", stmt, r.LeftIntra)
-				}
-				wantRightIntra := []Span{{Start: 0, End: 1}}
-				if len(r.RightIntra) != 1 || r.RightIntra[0] != wantRightIntra[0] {
-					t.Errorf("line %q: expected RightIntra %+v, got %+v", stmt, wantRightIntra, r.RightIntra)
 				}
 				break
 			}
@@ -764,9 +756,8 @@ func h1ServerKeepAlivesDisabled(hs ServerConfig) bool {
 			if gotLeftSub != "handler." {
 				t.Errorf("fmt.Fprintln: expected LeftIntra %q, got %q", "handler.", gotLeftSub)
 			}
-			wantRightIntra := []Span{{Start: 0, End: 1}}
-			if len(r.RightIntra) != 1 || r.RightIntra[0] != wantRightIntra[0] {
-				t.Errorf("fmt.Fprintln: expected RightIntra %+v, got %+v", wantRightIntra, r.RightIntra)
+			if len(r.RightIntra) != 0 {
+				t.Errorf("fmt.Fprintln: expected empty RightIntra, got %+v", r.RightIntra)
 			}
 			break
 		}
@@ -803,24 +794,47 @@ func h1ServerKeepAlivesDisabled(hs ServerConfig) bool {
 	}
 }
 
-func TestWhitespaceSlidingBoundary(t *testing.T) {
-	leftCode := "x =  a\n"
-	rightCode := "x =   b \n"
-	leftLines := SplitLines([]byte(leftCode))
-	rightLines := SplitLines([]byte(rightCode))
-	edits := Edits(leftLines, rightLines)
-	rows := BuildDiffRows(leftLines, rightLines, edits)
-	if len(rows) != 1 || rows[0].Type != RowChange {
-		t.Fatalf("expected 1 RowChange, got %+v", rows)
+func TestBuildDiffRowsWhitespace(t *testing.T) {
+	tests := []struct {
+		name        string
+		left, right string
+		// Highlighted text on the right of the only changed row, or nil if
+		// no row should change.
+		wantIntra []string
+	}{
+		{name: "indentation", left: "if x {\nfoo()\n}\n", right: "if x {\n\tfoo()\n}\n"},
+		{name: "alignment", left: "a int\nbb int\n", right: "a   int\nbb  int\n"},
+		{name: "trailing", left: "foo() \n", right: "foo()\n"},
+		{name: "indentation and change", left: "return foo(x)\n", right: "\treturn foo(y)\n", wantIntra: []string{"y"}},
+		{name: "spacing and change", left: "x =  a\n", right: "x =   b \n", wantIntra: []string{"b"}},
+		{name: "string literal", left: `s := "a b"` + "\n", right: `s := "a  b"` + "\n", wantIntra: []string{" "}},
+		{name: "multi-line raw string", left: "s := `\na\n`\n", right: "s := `\n\ta\n`\n", wantIntra: []string{"\t"}},
 	}
-	r := rows[0]
-	if len(r.RightIntra) != 1 {
-		t.Fatalf("expected 1 RightIntra span, got %+v", r.RightIntra)
-	}
-	span := r.RightIntra[0]
-	gotSub := r.RightText[span.Start:span.End]
-	if gotSub != " b " {
-		t.Errorf("expected RightIntra span %q, got %q (span: %+v in %q)", " b ", gotSub, span, r.RightText)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var changed []Row
+			for _, r := range BuildDiffRows(SplitLines([]byte(tt.left)), SplitLines([]byte(tt.right)), LangGo) {
+				if r.Type != RowEqual {
+					changed = append(changed, r)
+				}
+			}
+			if tt.wantIntra == nil {
+				if len(changed) != 0 {
+					t.Errorf("got changed rows %+v, want none", changed)
+				}
+				return
+			}
+			if len(changed) != 1 || changed[0].Type != RowChange {
+				t.Fatalf("got changed rows %+v, want a single RowChange", changed)
+			}
+			var gotIntra []string
+			for _, s := range changed[0].RightIntra {
+				gotIntra = append(gotIntra, changed[0].RightText[s.Start:s.End])
+			}
+			if !slices.Equal(gotIntra, tt.wantIntra) {
+				t.Errorf("got RightIntra %q, want %q", gotIntra, tt.wantIntra)
+			}
+		})
 	}
 }
 
@@ -949,7 +963,7 @@ func FuzzMyersDiff(f *testing.F) {
 		_ = Unified(collapsed)
 
 		// 4. Test BuildDiffRows
-		diffRows := BuildDiffRows(oldLines, newLines, edits)
+		diffRows := BuildDiffRows(oldLines, newLines, LangGo)
 		assertRowSpans(diffRows)
 	})
 }
