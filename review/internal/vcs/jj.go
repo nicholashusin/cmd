@@ -9,11 +9,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const jjLogTemplate = `change_id ++ "\x1f" ++ commit_id ++ "\x1f" ++ parents.map(|p| p.commit_id()).join(" ") ++ "\x1f" ++ parents.map(|p| p.change_id()).join(" ") ++ "\x1f" ++ parents.map(|p| p.description().first_line()).join("\n") ++ "\x1f" ++ author.name() ++ " <" ++ author.email() ++ ">" ++ "\x1f" ++ author.timestamp() ++ "\x1f" ++ committer.name() ++ " <" ++ committer.email() ++ ">" ++ "\x1f" ++ committer.timestamp() ++ "\x1f" ++ empty ++ "\x1f" ++ current_working_copy ++ "\x1f" ++ description ++ "\x1e"`
+
+const jjDiffTemplate = `status_char ++ "\x1f" ++ source.path() ++ "\x1f" ++ path ++ "\x1e"`
 
 // JJRepo implements the Repo interface for Jujutsu repositories.
 type JJRepo struct {
@@ -236,57 +239,51 @@ func (r *JJRepo) Commit(rev string) (*Change, error) {
 }
 
 func (r *JJRepo) Files(baseRev, targetRev string) ([]*File, error) {
-	if r.gitDir != "" {
+	if r.gitDir != "" && !r.conflicted(baseRev) && !r.conflicted(targetRev) {
 		files, err := gitDiffFiles(r.gitDir, r.root, baseRev, targetRev)
 		if err == nil {
 			return files, nil
 		}
 	}
 
-	// Fallback to jj diff --summary
+	if baseRev == "" {
+		baseRev = "root()"
+	}
+	out, err := r.runCmd("jj", "--ignore-working-copy", "--config", `ui.paginate="never"`, "diff", "--from", baseRev, "--to", targetRev, "-T", jjDiffTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("listing jj changed files: %w", err)
+	}
 	files := []*File{
 		{
 			Path:   CommitMsgPath,
 			Status: FileModified,
 		},
 	}
-
-	var jjDiffArgs []string
-	if baseRev == "" || strings.Trim(baseRev, "0") == "" {
-		jjDiffArgs = []string{"--config", `ui.paginate="never"`, "diff", "-r", targetRev, "--summary"}
-	} else {
-		jjDiffArgs = []string{"--config", `ui.paginate="never"`, "diff", "--from", baseRev, "--to", targetRev, "--summary"}
-	}
-	out, err := r.runCmd("jj", jjDiffArgs...)
-	if err != nil {
-		return files, nil
-	}
-
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if len(line) < 3 {
+	for _, rec := range strings.Split(string(out), "\x1e") {
+		fields := strings.Split(rec, "\x1f")
+		if len(fields) != 3 {
 			continue
 		}
-		statusChar := line[0]
-		path := strings.TrimSpace(line[1:])
-		var status FileStatus
-		switch statusChar {
-		case 'A':
-			status = FileAdded
-		case 'D':
-			status = FileDeleted
-		case 'R':
-			status = FileRenamed
-		default:
-			status = FileModified
+		f := &File{Path: fields[2]}
+		switch fields[0] {
+		case "A":
+			f.Status = FileAdded
+		case "D":
+			f.Status = FileDeleted
+		case "R", "C":
+			f.Status = FileRenamed
+			f.OldPath = fields[1]
 		}
-		files = append(files, &File{
-			Path:   path,
-			Status: status,
-		})
+		files = append(files, f)
 	}
-
 	return files, nil
+}
+
+// conflicted reports whether rev has unresolved conflicts, whose files Git
+// can't read.
+func (r *JJRepo) conflicted(rev string) bool {
+	cf, err := r.cache.catFile(r.gitDir)
+	return err == nil && cf.JJConflict(rev)
 }
 
 func (r *JJRepo) ListDir(rev, dirPath string) ([]string, error) {
@@ -438,7 +435,7 @@ func (r *JJRepo) Content(rev, path string) ([]byte, error) {
 		return os.ReadFile(fullPath)
 	}
 
-	if r.gitDir != "" {
+	if r.gitDir != "" && !r.conflicted(rev) {
 		cf, err := r.cache.catFile(r.gitDir)
 		if err == nil {
 			blob, err := cf.ReadBlob(rev + ":" + cleanPath)
@@ -451,10 +448,11 @@ func (r *JJRepo) Content(rev, path string) ([]byte, error) {
 		}
 	}
 
-	// Fallback to jj file show
-	out, err := r.runCmd("jj", "--ignore-working-copy", "--config", `ui.paginate="never"`, "file", "show", "-r", rev, cleanPath)
+	// Fall back to jj, which also renders conflicts with conflict markers.
+	out, err := r.runCmd("jj", "--ignore-working-copy", "--config", `ui.paginate="never"`, "file", "show", "-r", rev, "root-file:"+strconv.Quote(cleanPath))
 	if err != nil {
-		if strings.Contains(err.Error(), "No such file") || strings.Contains(err.Error(), "No such path") || strings.Contains(err.Error(), "no such file") {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && bytes.Contains(exitErr.Stderr, []byte("No such path")) {
 			return nil, os.ErrNotExist
 		}
 		return nil, fmt.Errorf("reading content %s:%s: %w", rev, cleanPath, err)
@@ -509,7 +507,7 @@ func (r *JJRepo) BlobOID(rev, path string) (string, error) {
 	if cleanPath == "" || cleanPath == "." {
 		return "", errors.New("invalid path")
 	}
-	if r.gitDir != "" {
+	if r.gitDir != "" && !r.conflicted(rev) {
 		cf, err := r.cache.catFile(r.gitDir)
 		if err == nil {
 			return cf.BlobOID(rev, cleanPath)

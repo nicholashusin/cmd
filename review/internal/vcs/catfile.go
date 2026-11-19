@@ -51,6 +51,7 @@ type CatFileBatch struct {
 	stdinBuf     *bufio.Writer
 	stdout       *bufio.Reader
 	knownTrees   map[string]bool
+	jjConflicts  map[string]bool
 	subtreeCache map[string]cachedSubtree
 	closed       atomic.Bool
 }
@@ -86,6 +87,7 @@ func NewCatFileBatch(gitDir string) (*CatFileBatch, error) {
 		stdinBuf:     bufio.NewWriterSize(stdin, 64*1024),
 		stdout:       bufio.NewReaderSize(stdoutPipe, 256*1024),
 		knownTrees:   make(map[string]bool),
+		jjConflicts:  make(map[string]bool),
 		subtreeCache: make(map[string]cachedSubtree),
 	}
 	runtime.AddCleanup(cf, func(p *catFileProc) {
@@ -183,6 +185,27 @@ func (c *CatFileBatch) HasTree(rev string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.hasTreeLocked(rev)
+}
+
+// JJConflict reports whether rev is a commit that jj wrote with unresolved
+// conflicts. The Git tree of such a commit holds every side of the conflict
+// under .jjconflict-* directories, so its files can't be read from Git as is.
+func (c *CatFileBatch) JJConflict(rev string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if conflict, ok := c.jjConflicts[rev]; ok {
+		return conflict
+	}
+	objType, _, data, err := c.readObjectLocked(rev)
+	if err != nil {
+		return false
+	}
+	header, _, _ := bytes.Cut(data, []byte("\n\n"))
+	conflict := objType == "commit" && bytes.Contains(header, []byte("\njj:trees "))
+	if IsImmutableHexRev(rev) {
+		c.jjConflicts[rev] = conflict
+	}
+	return conflict
 }
 
 // ReadBlob retrieves the raw bytes of an object (e.g. "rev:path" or blob SHA).

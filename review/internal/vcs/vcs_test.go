@@ -471,6 +471,82 @@ func TestJJLiveSnapshotWorkspaceEditPromptness(t *testing.T) {
 	}
 }
 
+func TestJJConflicts(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not installed")
+	}
+
+	dir := t.TempDir()
+	runJJ := func(args ...string) string {
+		cmd := exec.Command("jj", append([]string{"--config", "ui.paginate=\"never\""}, args...)...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("jj %v failed: %s (%v)", args, string(out), err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	writeFile := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runJJ("git", "init", "--colocate")
+	runJJ("config", "set", "--repo", "user.name", "JJ Tester")
+	runJJ("config", "set", "--repo", "user.email", "jj@example.com")
+
+	writeFile("f.txt", "a\nb\nc\n")
+	writeFile("other.txt", "unchanged\n")
+	runJJ("describe", "-m", "base")
+	runJJ("new", "-m", "side 1")
+	writeFile("f.txt", "a\nside 1\nc\n")
+	side1 := runJJ("log", "--no-graph", "-r", "@", "-T", "change_id")
+	runJJ("new", "@-", "-m", "side 2")
+	writeFile("f.txt", "a\nside 2\nc\n")
+	runJJ("rebase", "-r", side1, "-d", "@")
+	runJJ("new", side1, "-m", "resolve")
+	writeFile("f.txt", "a\nresolved\nc\n")
+	runJJ("status")
+
+	parent := runJJ("log", "--no-graph", "-r", side1+"-", "-T", "commit_id")
+	conflicted := runJJ("log", "--no-graph", "-r", side1, "-T", "commit_id")
+	resolved := runJJ("log", "--no-graph", "-r", "@", "-T", "commit_id")
+
+	repo, err := Open(dir, nil)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// Both the conflicted change and its child resolving the conflict only touch f.txt.
+	for _, revs := range [][2]string{{parent, conflicted}, {conflicted, resolved}} {
+		files, err := repo.Files(revs[0], revs[1])
+		if err != nil {
+			t.Fatalf("Files(%s, %s) failed: %v", revs[0], revs[1], err)
+		}
+		var paths []string
+		for _, f := range files {
+			paths = append(paths, f.Path)
+		}
+		if want := []string{CommitMsgPath, "f.txt"}; !slices.Equal(paths, want) {
+			t.Errorf("Files(%s, %s) = %q, want %q", revs[0], revs[1], paths, want)
+		}
+	}
+
+	if got, err := repo.Content(conflicted, "f.txt"); err != nil || !strings.Contains(string(got), "<<<<<<<") {
+		t.Errorf("Content(conflicted, f.txt) = %q, %v; want conflict markers", got, err)
+	}
+	if got, err := repo.Content(conflicted, "other.txt"); err != nil || string(got) != "unchanged\n" {
+		t.Errorf("Content(conflicted, other.txt) = %q, %v; want %q", got, err, "unchanged\n")
+	}
+	if _, err := repo.Content(conflicted, "missing.txt"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Content(conflicted, missing.txt) err = %v, want os.ErrNotExist", err)
+	}
+	if oid, err := repo.(BlobOIDer).BlobOID(conflicted, "f.txt"); err == nil {
+		t.Errorf("BlobOID(conflicted, f.txt) = %s, want an error so callers compare contents instead", oid)
+	}
+}
+
 func TestGitDiffFilesSingleSubprocess(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
