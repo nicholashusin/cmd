@@ -3489,6 +3489,7 @@
         return;
       }
 
+      const leftPath = container.getAttribute('data-left-path') || '';
       const params = new URLSearchParams({
         repo: container.getAttribute('data-repo') || '',
         change: container.getAttribute('data-change') || '',
@@ -3501,6 +3502,7 @@
         right_end: rEnd,
         mode: container.getAttribute('data-diff-mode') || 'split'
       });
+      if (leftPath) params.set('left_path', leftPath);
 
       btn.disabled = true;
       try {
@@ -3561,6 +3563,7 @@
         reqREnd = rEnd > 0 ? rEnd : 0;
       }
 
+      const leftPath = container.getAttribute('data-left-path') || '';
       const params = new URLSearchParams({
         repo: container.getAttribute('data-repo') || '',
         change: container.getAttribute('data-change') || '',
@@ -3573,6 +3576,7 @@
         right_end: reqREnd,
         mode: container.getAttribute('data-diff-mode') || 'split'
       });
+      if (leftPath) params.set('left_path', leftPath);
 
       btn.disabled = true;
       try {
@@ -5608,6 +5612,12 @@
     let container = null;
     fileSec = document.querySelector(`.diff-file-section[data-file-path="${escapeAttrVal(cleanDefPath)}"]`);
     container = document.querySelector(`.diff-container[data-file-path="${escapeAttrVal(cleanDefPath)}"]`);
+    if (!container && lookupSide === 'L') {
+      container = document.querySelector(`.diff-container[data-left-path="${escapeAttrVal(cleanDefPath)}"]`);
+      if (container && !fileSec && container.closest) {
+        fileSec = container.closest('.diff-file-section');
+      }
+    }
     if (container && container.hasAttribute && container.hasAttribute('data-ext-pkg')) {
       container = null;
     }
@@ -7632,7 +7642,9 @@
   window.openSymbolPopupAt = openSymbolPopupAt;
   async function openSymbolPopupAt(container, side, line, col, anchorEl, highlightAnchor) {
     if (!container || line <= 0 || !anchorEl) return false;
-    const filePath = (container.getAttribute && container.getAttribute('data-file-path')) || '';
+    const rawFilePath = (container.getAttribute && container.getAttribute('data-file-path')) || '';
+    const leftFilePath = (container.getAttribute && container.getAttribute('data-left-path')) || '';
+    const filePath = (side === 'L' && leftFilePath) ? leftFilePath : rawFilePath;
     const extPkg = (container.getAttribute && container.getAttribute('data-ext-pkg')) || '';
     const extFile = (container.getAttribute && container.getAttribute('data-ext-file')) || '';
     const originPath = (container.getAttribute && container.getAttribute('data-origin-path')) || '';
@@ -8027,7 +8039,9 @@
     const line = parseInt((tr.getAttribute && tr.getAttribute(lineAttr)) || '0', 10);
     if (line <= 0) return false;
 
-    const filePath = (container.getAttribute && container.getAttribute('data-file-path')) || '';
+    const rawFilePath = (container.getAttribute && container.getAttribute('data-file-path')) || '';
+    const leftFilePath = (container.getAttribute && container.getAttribute('data-left-path')) || '';
+    const filePath = (side === 'L' && leftFilePath) ? leftFilePath : rawFilePath;
     const extPkg = (container.getAttribute && container.getAttribute('data-ext-pkg')) || '';
     const extFile = (container.getAttribute && container.getAttribute('data-ext-file')) || '';
     return (extPkg && extFile) ? extFile.endsWith('.go') : filePath.endsWith('.go');

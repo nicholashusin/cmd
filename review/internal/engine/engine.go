@@ -531,6 +531,12 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 	}
 
 	hasCommitMsgBase := CommitMsgHasBase(repo, c, snaps, baseRev, targetRev)
+	oldPathByNew := make(map[string]string)
+	for _, f := range allFiles {
+		if f != nil && f.Status == vcs.FileRenamed && f.OldPath != "" {
+			oldPathByNew[strings.TrimPrefix(f.Path, "/")] = f.OldPath
+		}
+	}
 	scope := NewViewScope(snaps, baseRev, targetRev, isLiveTarget)
 	var visibleThreads []*db.Thread
 	for _, th := range allThreads {
@@ -549,6 +555,11 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 				th.Stale = false
 			} else if rev != "" && repo != nil {
 				lines := getLines(rev, th.Path)
+				if lines == nil && effectiveSide == "L" {
+					if oldP := oldPathByNew[strings.TrimPrefix(th.Path, "/")]; oldP != "" {
+						lines = getLines(rev, oldP)
+					}
+				}
 				if lines == nil {
 					th.Stale = true
 				} else if newStart, newEnd, matched := matchAnchorLines(lines, th.StartLine, th.AnchorLines); matched {
@@ -930,6 +941,27 @@ func reanchorThreads(repo vcs.Repo, c *vcs.Change, snaps []*db.Snapshot, scope *
 		return hasCommitMsgBase
 	}
 
+	var renamedOldPathChecked bool
+	var oldPathByNew map[string]string
+	lookupOldPath := func(path string) string {
+		if !renamedOldPathChecked {
+			renamedOldPathChecked = true
+			if repo != nil && baseRev != "" && targetRev != "" && baseRev != targetRev {
+				if files, err := repo.Files(baseRev, targetRev); err == nil {
+					for _, f := range files {
+						if f != nil && f.Status == vcs.FileRenamed && f.OldPath != "" {
+							if oldPathByNew == nil {
+								oldPathByNew = make(map[string]string)
+							}
+							oldPathByNew[strings.TrimPrefix(f.Path, "/")] = f.OldPath
+						}
+					}
+				}
+			}
+		}
+		return oldPathByNew[strings.TrimPrefix(path, "/")]
+	}
+
 	for i, th := range threads {
 		effectiveSide := th.Side
 		if scope != nil {
@@ -965,6 +997,11 @@ func reanchorThreads(repo vcs.Repo, c *vcs.Change, snaps []*db.Snapshot, scope *
 			tv.Stale = false
 		} else if rev != "" && repo != nil {
 			lines := getLines(rev, th.Path)
+			if lines == nil && effectiveSide == "L" {
+				if oldP := lookupOldPath(th.Path); oldP != "" {
+					lines = getLines(rev, oldP)
+				}
+			}
 			if lines == nil {
 				tv.Stale = true
 			} else if newStart, newEnd, matched := matchAnchorLines(lines, th.StartLine, th.AnchorLines); matched {
@@ -1157,6 +1194,23 @@ func AddCommentRangeWithTarget(d *db.DB, repo vcs.Repo, repoID int64, c *vcs.Cha
 	// Extract anchor text from content
 	var anchorLines string
 	data, err := repo.Content(rev, path)
+	if (err != nil || len(data) == 0) && side == "L" && repo != nil && path != vcs.CommitMsgPath {
+		compareTarget := targetRev
+		if compareTarget == "" {
+			compareTarget = c.Rev
+		}
+		if compareTarget != "" && compareTarget != rev {
+			if files, fErr := repo.Files(rev, compareTarget); fErr == nil {
+				normPath := strings.TrimPrefix(path, "/")
+				for _, f := range files {
+					if f != nil && f.Status == vcs.FileRenamed && f.OldPath != "" && strings.TrimPrefix(f.Path, "/") == normPath {
+						data, err = repo.Content(rev, f.OldPath)
+						break
+					}
+				}
+			}
+		}
+	}
 	if err == nil && len(data) > 0 {
 		lines := diff.SplitLines(data)
 		if startLine > 0 && startLine <= len(lines) {

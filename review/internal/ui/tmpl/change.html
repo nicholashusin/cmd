@@ -183,7 +183,7 @@
               <a href="/r/{{$.Record.Slug}}/c/{{$.View.Change.Key}}/f/{{TrimSlash .Path}}?base={{$.BaseParam}}&target={{$.TargetParam}}&mode={{$.DiffMode}}&ctx={{$.CtxParam}}" class="file-link">
                 <span class="file-reviewed-icon" data-reviewed-icon="{{TrimSlash .Path}}" style="{{if not .Reviewed}}display: none;{{end}}">✓</span>
                 {{if .StatusCode}}<span class="file-status status-{{.StatusCode}}" title="{{.StatusTitle}}">{{.StatusCode}}</span>{{end}}
-                <span>{{.Path}}</span>
+                <span>{{if .OldPath}}<span class="file-old-path">{{.OldPath}} → </span>{{end}}{{.Path}}</span>
               </a>
               <div class="file-stats">
                 {{if .WhitespaceOnly}}
@@ -220,7 +220,7 @@
                   <span class="file-reviewed-icon file-reviewed-icon-{{$i}}" data-reviewed-icon="{{TrimSlash $df.FilePath}}" style="{{if not $df.FileReviewed}}display: none;{{end}}">✓</span>
                   {{if $df.StatusCode}}<span class="file-status status-{{$df.StatusCode}}" title="{{$df.StatusTitle}}">{{$df.StatusCode}}</span>{{end}}
                   <span class="diff-file-label">
-                    <span class="diff-file-name" title="{{$df.FilePath}}">{{$df.FilePath}}</span>
+                    <span class="diff-file-name" title="{{if $df.OldPath}}{{$df.OldPath}} → {{end}}{{$df.FilePath}}">{{if $df.OldPath}}<span class="file-old-path">{{$df.OldPath}} → </span>{{end}}{{$df.FilePath}}</span>
                     {{if $df.WhitespaceOnly}}
                       <span class="badge badge-ws-only">whitespace only</span>
                     {{else if or (gt $df.Added 0) (gt $df.Deleted 0)}}

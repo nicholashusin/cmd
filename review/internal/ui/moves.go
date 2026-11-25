@@ -257,8 +257,12 @@ func (s *Server) computeMoveBundle(repo vcs.Repo, view *engine.ChangeView, ignor
 	processFile := func(idx int) {
 		f := validFiles[idx]
 		cleanPath := strings.TrimPrefix(f.Path, "/")
+		basePath := f.Path
+		if f.Status == vcs.FileRenamed && f.OldPath != "" {
+			basePath = f.OldPath
+		}
 
-		baseData, _ := repo.Content(view.BaseRev, f.Path)
+		baseData, _ := repo.Content(view.BaseRev, basePath)
 		targetData, _ := repo.Content(view.TargetRev, f.Path)
 
 		if diff.IsBinary(baseData) || diff.IsBinary(targetData) {
@@ -274,7 +278,11 @@ func (s *Server) computeMoveBundle(repo vcs.Repo, view *engine.ChangeView, ignor
 			return
 		}
 
-		rawRows := diff.BuildDiffRows(baseLines, targetLines, diff.DetectLang(cleanPath), ignoreWS)
+		lang := diff.DetectLang(cleanPath)
+		if lang == diff.LangNone && basePath != f.Path {
+			lang = diff.DetectLang(basePath)
+		}
+		rawRows := diff.BuildDiffRows(baseLines, targetLines, lang, ignoreWS)
 		added, deleted := countDiffRows(rawRows)
 
 		mfd := &moveFileData{

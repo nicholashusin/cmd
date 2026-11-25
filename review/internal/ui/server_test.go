@@ -22064,3 +22064,133 @@ func TestServerWhitespaceToggleAndFiles(t *testing.T) {
 		t.Errorf("expected diff rows to render when ignore_ws is off")
 	}
 }
+
+func TestServerRenamedFileDiff(t *testing.T) {
+	srv, ts, d, repoDir := setupTestServer(t)
+	defer srv.broker.Close()
+	defer ts.Close()
+	defer d.Close()
+
+	run := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	var baseLines []string
+	baseLines = append(baseLines, "package main", "")
+	for i := 1; i <= 20; i++ {
+		baseLines = append(baseLines, fmt.Sprintf("var line%02d = %d", i, i))
+	}
+	origContent := strings.Join(baseLines, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(repoDir, "old.go"), []byte(origContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "pure_old.go"), []byte("package main\n\nconst unchanged = true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "old.go", "pure_old.go")
+	baseRev := run("commit", "-m", "Add files\n\nChange-Id: Idddddddddddddddddddddddddddddddddddddddd")
+	_ = baseRev
+	baseRev = run("rev-parse", "HEAD")
+
+	// Rename old.go -> new.go and edit only line 12; pure-rename pure_old.go -> pure_new.go.
+	run("mv", "old.go", "new.go")
+	run("mv", "pure_old.go", "pure_new.go")
+	editedLines := append([]string(nil), baseLines...)
+	editedLines[11] = "var line10 = 999"
+	if err := os.WriteFile(filepath.Join(repoDir, "new.go"), []byte(strings.Join(editedLines, "\n")+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "-m", "Rename files\n\nChange-Id: Ieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+	targetRev := run("rev-parse", "HEAD")
+
+	rec, err := d.RepoBySlug(filepath.Base(repoDir))
+	if err != nil || rec == nil {
+		t.Fatalf("RepoBySlug: %v", err)
+	}
+	changeKey := "Ieeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+	getBody := func(url string) string {
+		resp, err := http.Get(url)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s failed: %v", url, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return string(b)
+	}
+
+	// 1. All-diffs view shows old.go → new.go, diffs against old.go (only 1 del + 1 add), and shows pure rename banner.
+	body := getBody(fmt.Sprintf("%s/r/%s/c/%s?diffs=all&mode=unified", ts.URL, rec.Slug, changeKey))
+	if !strings.Contains(body, "old.go → </span>new.go") {
+		t.Errorf("expected old.go → new.go header in all-diffs view")
+	}
+	if !strings.Contains(body, `data-left-path="old.go"`) {
+		t.Errorf("expected data-left-path=\"old.go\" on renamed diff container")
+	}
+	if !strings.Contains(body, "File renamed from <code>pure_old.go</code> with no content changes.") {
+		t.Errorf("expected pure rename notice for pure_new.go")
+	}
+	// Single-file diff for new.go must show only 1 deleted line and 1 added line (not all 22 lines added!).
+	singleBody := getBody(fmt.Sprintf("%s/r/%s/c/%s/f/new.go?mode=unified", ts.URL, rec.Slug, changeKey))
+	if !strings.Contains(singleBody, "old.go → </span>new.go") {
+		t.Errorf("expected old.go → new.go in single-file breadcrumb")
+	}
+	if gotDel := strings.Count(singleBody, `class="diff-row row-del`); gotDel != 1 {
+		t.Errorf("expected 1 row-del for edited rename, got %d", gotDel)
+	}
+	if gotAdd := strings.Count(singleBody, `class="diff-row row-add`); gotAdd != 1 {
+		t.Errorf("expected 1 row-add for edited rename, got %d", gotAdd)
+	}
+
+	// 2. Context expansion loads left side from old.go via left_path.
+	expandURL := fmt.Sprintf("%s/api/diff/expand?repo=%s&change=%s&left_rev=%s&right_rev=%s&path=new.go&left_path=old.go&left_start=1&left_end=4&right_start=1&right_end=4&mode=split",
+		ts.URL, rec.Slug, changeKey, baseRev, targetRev)
+	expandBody := getBody(expandURL)
+	if !strings.Contains(expandBody, `data-side="L">`) || !strings.Contains(expandBody, "line01") {
+		t.Errorf("expected expanded left context from old.go, got: %s", expandBody)
+	}
+	if strings.Count(expandBody, "line01") != 2 {
+		t.Errorf("expected line01 on both L and R sides in split expand, got: %s", expandBody)
+	}
+
+	// 3. Adding an L-side comment on the renamed file anchors cleanly (not stale).
+	addPayload, _ := json.Marshal(map[string]any{
+		"repo":       rec.Slug,
+		"change":     changeKey,
+		"rev":        baseRev,
+		"left_rev":   baseRev,
+		"right_rev":  targetRev,
+		"path":       "new.go",
+		"side":       "L",
+		"start_line": 12,
+		"end_line":   12,
+		"body":       "why did line10 change?",
+	})
+	respAdd, err := http.Post(ts.URL+"/api/threads/add", "application/json", bytes.NewReader(addPayload))
+	if err != nil || respAdd.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/threads/add failed: %v", err)
+	}
+	var addRes struct {
+		Thread struct {
+			AnchorLines string `json:"anchor_lines"`
+		} `json:"thread"`
+		HTML string `json:"html"`
+	}
+	if err := json.NewDecoder(respAdd.Body).Decode(&addRes); err != nil {
+		t.Fatal(err)
+	}
+	_ = respAdd.Body.Close()
+	if !strings.Contains(addRes.Thread.AnchorLines, "var line10 = 10") {
+		t.Errorf("expected L-side thread anchor from old.go, got %q", addRes.Thread.AnchorLines)
+	}
+	if strings.Contains(addRes.HTML, "thread-stale") {
+		t.Errorf("expected L-side thread on renamed file not to be stale, got: %s", addRes.HTML)
+	}
+}

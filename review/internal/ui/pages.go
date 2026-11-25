@@ -40,6 +40,7 @@ type FileDiffData struct {
 	BaseParam          string
 	TargetParam        string
 	FilePath           string
+	OldPath            string
 	StatusCode         string
 	StatusTitle        string
 	FileIndex          int
@@ -47,6 +48,7 @@ type FileDiffData struct {
 	CtxParam           string
 	IsAllRebased       bool
 	WhitespaceOnly     bool
+	RenamedUnchanged   bool
 	IsBinary           bool
 	IsTooLarge         bool
 	FileReviewed       bool
@@ -258,7 +260,7 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 			}
 			f.AddedLines = mfd.added
 			f.DeletedLines = mfd.deleted
-			if f.Status == vcs.FileModified && mfd.added == 0 && mfd.deleted == 0 && !bytes.Equal(mfd.baseData, mfd.targetData) {
+			if (f.Status == vcs.FileModified || f.Status == vcs.FileRenamed) && mfd.added == 0 && mfd.deleted == 0 && !bytes.Equal(mfd.baseData, mfd.targetData) {
 				f.WhitespaceOnly = true
 			}
 		}
@@ -287,6 +289,7 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 					BaseParam:      baseSel,
 					TargetParam:    targetSel,
 					FilePath:       f.Path,
+					OldPath:        f.OldPath,
 					StatusCode:     f.StatusCode(),
 					StatusTitle:    f.StatusTitle(),
 					FileIndex:      fileIdx,
@@ -668,6 +671,7 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 	for _, f := range view.Files {
 		if f.Path == vcsPath || strings.TrimPrefix(f.Path, "/") == strings.TrimPrefix(vcsPath, "/") {
 			matchedFile = f
+			data.OldPath = f.OldPath
 			data.Added = f.AddedLines
 			data.Deleted = f.DeletedLines
 			data.StatusCode = f.StatusCode()
@@ -678,12 +682,20 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 	}
 	data.InDiff = matchedFile != nil
 
+	basePath := vcsPath
+	if matchedFile != nil && matchedFile.Status == vcs.FileRenamed && matchedFile.OldPath != "" {
+		basePath = matchedFile.OldPath
+	}
+
 	if bundle == nil && fileIdx != -1 && vcsPath != vcs.CommitMsgPath {
 		bundle = s.getMoveBundle(repo, view, ignoreWS)
 	}
 
 	cleanPath := strings.TrimPrefix(vcsPath, "/")
 	lang := diff.DetectLang(vcsPath)
+	if lang == diff.LangNone && basePath != vcsPath {
+		lang = diff.DetectLang(basePath)
+	}
 	var baseData []byte
 	var targetData []byte
 	var baseLines []string
@@ -720,7 +732,7 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 		}
 	} else {
 		if !(vcsPath == vcs.CommitMsgPath && !view.HasCommitMsgBase) {
-			baseData, _ = repo.Content(view.BaseRev, vcsPath)
+			baseData, _ = repo.Content(view.BaseRev, basePath)
 		}
 		targetData, _ = repo.Content(view.TargetRev, vcsPath)
 
@@ -759,7 +771,7 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 			targetParentRev = c.Parent
 		}
 		if baseParentRev != "" && targetParentRev != "" && baseParentRev != targetParentRev {
-			baseParentData, _ := repo.Content(baseParentRev, vcsPath)
+			baseParentData, _ := repo.Content(baseParentRev, basePath)
 			targetParentData, _ := repo.Content(targetParentRev, vcsPath)
 			diff.MarkRebased(rawRows, baseData, targetData, baseParentData, targetParentData)
 			data.IsAllRebased = diff.AllRebased(rawRows)
@@ -791,8 +803,11 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 			break
 		}
 	}
-	if ignoreWS && !hasChanges && matchedFile != nil && matchedFile.Status == vcs.FileModified && vcsPath != vcs.CommitMsgPath && !bytes.Equal(baseData, targetData) {
+	if ignoreWS && !hasChanges && matchedFile != nil && (matchedFile.Status == vcs.FileModified || matchedFile.Status == vcs.FileRenamed) && vcsPath != vcs.CommitMsgPath && !bytes.Equal(baseData, targetData) {
 		data.WhitespaceOnly = true
+	}
+	if !hasChanges && matchedFile != nil && matchedFile.Status == vcs.FileRenamed && matchedFile.OldPath != "" && bytes.Equal(baseData, targetData) {
+		data.RenamedUnchanged = true
 	}
 
 	if mfd != nil {

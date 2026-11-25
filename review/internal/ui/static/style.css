@@ -897,6 +897,11 @@ header.app-header.header-status-lgtm {
   font-weight: 400;
 }
 
+.file-old-path {
+  color: var(--muted);
+  font-weight: 400;
+}
+
 .diff-notice-banner {
   display: flex;
   align-items: center;

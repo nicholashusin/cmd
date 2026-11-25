@@ -104,7 +104,8 @@
 <div class="diff-container" id="diff-container-{{.FileIndex}}"
      data-repo="{{.RepoSlug}}"
      data-change="{{.ChangeKey}}"
-     data-file-path="{{TrimSlash .FilePath}}"
+     data-file-path="{{TrimSlash .FilePath}}"{{if .OldPath}}
+     data-left-path="{{TrimSlash .OldPath}}"{{end}}
      data-left-rev="{{.LeftRev}}"
      data-right-rev="{{.RightRev}}"
      data-diff-mode="{{.DiffMode}}"{{if .NextUnreviewedFile}}
@@ -128,6 +129,12 @@
     <div class="diff-notice-banner">
       <span>This file only has whitespace changes.</span>
       <button type="button" class="btn btn-sm" onclick="toggleWhitespace()">Show whitespace</button>
+    </div>
+  {{end}}
+
+  {{if .RenamedUnchanged}}
+    <div class="diff-notice-banner">
+      <span>File renamed from <code>{{.OldPath}}</code> with no content changes.</span>
     </div>
   {{end}}
 

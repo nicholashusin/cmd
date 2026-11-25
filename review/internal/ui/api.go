@@ -1042,6 +1042,10 @@ func (s *Server) handleAPIDiffExpand(w http.ResponseWriter, r *http.Request) {
 	if vcs.IsCommitMsgPath(filePath) {
 		vcsPath = vcs.CommitMsgPath
 	}
+	leftPath := vcsPath
+	if lp := strings.TrimSpace(q.Get("left_path")); lp != "" && vcsPath != vcs.CommitMsgPath {
+		leftPath = lp
+	}
 
 	var baseData []byte
 	skipCommitMsgBase := false
@@ -1058,7 +1062,7 @@ func (s *Server) handleAPIDiffExpand(w http.ResponseWriter, r *http.Request) {
 		skipCommitMsgBase = !engine.CommitMsgHasBase(repo, c, snaps, leftRev, rightRev)
 	}
 	if leftRev != "" && !skipCommitMsgBase {
-		baseData, _ = repo.Content(leftRev, vcsPath)
+		baseData, _ = repo.Content(leftRev, leftPath)
 	}
 	targetData, _ := repo.Content(rightRev, vcsPath)
 

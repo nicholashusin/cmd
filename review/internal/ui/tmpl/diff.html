@@ -7,7 +7,7 @@
   <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}?base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}" id="upLink">{{.View.Change.Key}}</a>
   <span class="sep">/</span>
   {{if .DiffData.StatusCode}}<span class="file-status status-{{.DiffData.StatusCode}}" title="{{.DiffData.StatusTitle}}">{{.DiffData.StatusCode}}</span>{{end}}
-  <span class="breadcrumb-file" title="{{.FilePath}}">{{.FilePath}}</span>
+  <span class="breadcrumb-file" title="{{if .DiffData.OldPath}}{{.DiffData.OldPath}} → {{end}}{{.FilePath}}">{{if .DiffData.OldPath}}<span class="file-old-path">{{.DiffData.OldPath}} → </span>{{end}}{{.FilePath}}</span>
   {{if .External}}<span class="badge" style="margin-left: 6px;">external</span>{{else if not .InDiff}}<span class="badge" style="margin-left: 6px;">unchanged</span>{{end}}
 {{end}}
 
