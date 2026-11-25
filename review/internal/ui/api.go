@@ -32,22 +32,42 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAPIState(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	if repoSlug := strings.TrimSpace(r.URL.Query().Get("repo")); repoSlug != "" && s.d != nil {
+	repoSlug := strings.TrimSpace(r.URL.Query().Get("repo"))
+	changeKey := strings.TrimSpace(r.URL.Query().Get("change"))
+	if repoSlug != "" && s.d != nil {
 		if rec, err := s.d.RepoBySlug(repoSlug); err == nil && rec != nil {
 			if repo, err := vcs.Open(rec.RootPath, s.cache); err == nil {
 				_, _ = repo.Changes()
 			}
 		}
 	}
-	sig := ""
+	var snap StateSnapshot
 	if s.broker != nil {
-		sig = s.broker.StateSignature()
+		snap = s.broker.StateFor(repoSlug, changeKey)
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"sig": sig})
+	writeJSON(w, http.StatusOK, snap)
 }
 
 func (s *Server) handleAPINotify(w http.ResponseWriter, r *http.Request) {
-	s.broker.Broadcast("reload", map[string]string{"reason": "notify"})
+	var req struct {
+		Reason string `json:"reason"`
+		Repo   string `json:"repo"`
+		Change string `json:"change"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if req.Reason == "" {
+		req.Reason = "notify"
+	}
+	payload := map[string]string{"reason": req.Reason}
+	if req.Repo != "" {
+		payload["repo"] = req.Repo
+	}
+	if req.Change != "" {
+		payload["change"] = req.Change
+	}
+	s.broker.Broadcast("reload", payload)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -85,7 +105,7 @@ func (s *Server) handleAPISnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.broker.Broadcast("reload", map[string]any{"reason": "snapshot", "snap": snap})
+	s.broker.Broadcast("reload", map[string]any{"reason": "snapshot", "repo": rec.Slug, "change": c.Key, "snap": snap})
 	writeJSON(w, http.StatusOK, map[string]any{"snapshot": snap, "created": created})
 }
 
@@ -196,11 +216,13 @@ func (s *Server) handleAPIPublish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if count > 0 || res.CreatedSnapshot || synced {
-		s.broker.Broadcast("reload", map[string]any{"reason": "publish", "count": count})
+		s.broker.Broadcast("reload", map[string]any{"reason": "publish", "repo": rec.Slug, "change": changeKey, "count": count})
 	}
+	stateSnap := s.broker.StateFor(rec.Slug, changeKey)
 	resp := map[string]any{
 		"published":         count,
-		"sig":               s.broker.StateSignature(),
+		"sig":               stateSnap.Sig,
+		"state":             stateSnap,
 		"change_counts":     changeCounts,
 		"file_counts":       fileCountsMap,
 		"thread_html":       threadHTML,
@@ -303,12 +325,14 @@ func (s *Server) handleAPIThreadsAdd(w http.ResponseWriter, r *http.Request) {
 	cardHTML, _ := s.renderThreadCardInChange(repo, c, snaps, th, req.LeftRev, req.RightRev)
 	fileCounts, changeCounts, _ := s.getCommentCountsForChangeView(repo, c, snaps, snapsLoaded, rec.ID, c.Key, th.Path, req.LeftRev, req.RightRev)
 
-	s.broker.Broadcast("reload", map[string]any{"reason": "comment_add", "thread_id": th.ID})
+	s.broker.Broadcast("reload", map[string]any{"reason": "comment_add", "repo": rec.Slug, "change": c.Key, "thread_id": th.ID})
+	stateSnap := s.broker.StateFor(rec.Slug, c.Key)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"thread":        th,
 		"message":       msg,
 		"html":          cardHTML,
-		"sig":           s.broker.StateSignature(),
+		"sig":           stateSnap.Sig,
+		"state":         stateSnap,
 		"file_path":     strings.TrimPrefix(th.Path, "/"),
 		"file_counts":   fileCounts,
 		"change_counts": changeCounts,
@@ -372,12 +396,18 @@ func (s *Server) handleAPIThreadsReply(w http.ResponseWriter, r *http.Request) {
 	cardHTML, _ := s.renderThreadCardInChange(repo, c, snaps, th, req.LeftRev, req.RightRev)
 	fileCounts, changeCounts, _ := s.getCommentCountsForChangeView(repo, c, snaps, snapsLoaded, th.RepoID, th.ChangeKey, th.Path, req.LeftRev, req.RightRev)
 
-	s.broker.Broadcast("reload", map[string]any{"reason": "comment_reply", "message_id": msg.ID})
+	replyRepo := ""
+	if rec != nil {
+		replyRepo = rec.Slug
+	}
+	s.broker.Broadcast("reload", map[string]any{"reason": "comment_reply", "repo": replyRepo, "change": th.ChangeKey, "message_id": msg.ID})
+	stateSnap := s.broker.StateFor(replyRepo, th.ChangeKey)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"message":       msg,
 		"thread":        th,
 		"html":          cardHTML,
-		"sig":           s.broker.StateSignature(),
+		"sig":           stateSnap.Sig,
+		"state":         stateSnap,
 		"file_path":     strings.TrimPrefix(th.Path, "/"),
 		"file_counts":   fileCounts,
 		"change_counts": changeCounts,
@@ -426,12 +456,18 @@ func (s *Server) handleAPIThreadsEdit(w http.ResponseWriter, r *http.Request) {
 	cardHTML, _ := s.renderThreadCardInChange(repo, c, snaps, th, req.LeftRev, req.RightRev)
 	fileCounts, changeCounts, _ := s.getCommentCountsForChangeView(repo, c, snaps, snapsLoaded, th.RepoID, th.ChangeKey, th.Path, req.LeftRev, req.RightRev)
 
-	s.broker.Broadcast("reload", map[string]any{"reason": "comment_edit", "message_id": msg.ID})
+	editRepo := ""
+	if rec != nil {
+		editRepo = rec.Slug
+	}
+	s.broker.Broadcast("reload", map[string]any{"reason": "comment_edit", "repo": editRepo, "change": th.ChangeKey, "message_id": msg.ID})
+	stateSnap := s.broker.StateFor(editRepo, th.ChangeKey)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"message":       msg,
 		"thread":        th,
 		"html":          cardHTML,
-		"sig":           s.broker.StateSignature(),
+		"sig":           stateSnap.Sig,
+		"state":         stateSnap,
 		"file_path":     strings.TrimPrefix(th.Path, "/"),
 		"file_counts":   fileCounts,
 		"change_counts": changeCounts,
@@ -489,13 +525,19 @@ func (s *Server) handleAPIThreadsDelete(w http.ResponseWriter, r *http.Request) 
 
 	fileCounts, changeCounts, _ := s.getCommentCountsForChangeView(repo, c, snaps, snapsLoaded, th.RepoID, th.ChangeKey, th.Path, req.LeftRev, req.RightRev)
 
-	s.broker.Broadcast("reload", map[string]any{"reason": "comment_delete", "message_id": req.MessageID})
+	delRepo := ""
+	if rec != nil {
+		delRepo = rec.Slug
+	}
+	s.broker.Broadcast("reload", map[string]any{"reason": "comment_delete", "repo": delRepo, "change": th.ChangeKey, "message_id": req.MessageID})
+	stateSnap := s.broker.StateFor(delRepo, th.ChangeKey)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":         "deleted",
 		"thread_id":      th.ID,
 		"thread_deleted": threadDeleted,
 		"html":           cardHTML,
-		"sig":            s.broker.StateSignature(),
+		"sig":            stateSnap.Sig,
+		"state":          stateSnap,
 		"file_path":      strings.TrimPrefix(th.Path, "/"),
 		"file_counts":    fileCounts,
 		"change_counts":  changeCounts,
@@ -534,12 +576,18 @@ func (s *Server) handleAPIThreadsResolve(w http.ResponseWriter, r *http.Request)
 	cardHTML, _ := s.renderThreadCardInChange(repo, c, snaps, th, req.LeftRev, req.RightRev)
 	fileCounts, changeCounts, _ := s.getCommentCountsForChangeView(repo, c, snaps, snapsLoaded, th.RepoID, th.ChangeKey, th.Path, req.LeftRev, req.RightRev)
 
-	s.broker.Broadcast("reload", map[string]any{"reason": "resolve", "thread_id": req.ThreadID})
+	resRepo := ""
+	if rec != nil {
+		resRepo = rec.Slug
+	}
+	s.broker.Broadcast("reload", map[string]any{"reason": "resolve", "repo": resRepo, "change": th.ChangeKey, "thread_id": req.ThreadID})
+	stateSnap := s.broker.StateFor(resRepo, th.ChangeKey)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":        "ok",
 		"thread":        th,
 		"html":          cardHTML,
-		"sig":           s.broker.StateSignature(),
+		"sig":           stateSnap.Sig,
+		"state":         stateSnap,
 		"file_path":     strings.TrimPrefix(th.Path, "/"),
 		"file_counts":   fileCounts,
 		"change_counts": changeCounts,
@@ -885,8 +933,9 @@ func (s *Server) handleAPIFilesReviewed(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	s.broker.Broadcast("reload", map[string]any{"reason": "file_reviewed"})
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "sig": s.broker.StateSignature()})
+	s.broker.Broadcast("reload", map[string]any{"reason": "file_reviewed", "repo": rec.Slug, "change": changeKey})
+	stateSnap := s.broker.StateFor(rec.Slug, changeKey)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "sig": stateSnap.Sig, "state": stateSnap})
 }
 
 func (s *Server) handleAPIChangesReviewed(w http.ResponseWriter, r *http.Request) {
@@ -933,10 +982,12 @@ func (s *Server) handleAPIChangesReviewed(w http.ResponseWriter, r *http.Request
 	}
 
 	revd, lgtm, _ := s.d.RevMark(rec.ID, changeKey, req.Rev)
-	s.broker.Broadcast("reload", map[string]any{"reason": "change_reviewed"})
+	s.broker.Broadcast("reload", map[string]any{"reason": "change_reviewed", "repo": rec.Slug, "change": changeKey})
+	stateSnap := s.broker.StateFor(rec.Slug, changeKey)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
-		"sig":      s.broker.StateSignature(),
+		"sig":      stateSnap.Sig,
+		"state":    stateSnap,
 		"reviewed": revd,
 		"lgtm":     lgtm,
 	})

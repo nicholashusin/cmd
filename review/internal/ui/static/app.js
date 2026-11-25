@@ -789,10 +789,98 @@
   let eventSource = null;
   let suppressSSEReloadUntil = 0;
   let staleBannerTimer = null;
+  let pendingSSEReason = '';
   let pageStateSig = document.documentElement.getAttribute('data-state-sig') || '';
+  const pageStateRepo = document.documentElement.getAttribute('data-state-repo') || '';
+  const pageStateChange = document.documentElement.getAttribute('data-state-change') || '';
+  let pageStateParts = null;
+  try {
+    const rawParts = document.documentElement.getAttribute('data-state-parts');
+    if (rawParts) pageStateParts = JSON.parse(rawParts);
+  } catch (_) {}
+
+  function applyPageState(data) {
+    if (!data) return;
+    if (data.sig) pageStateSig = data.sig;
+    if (data.state && typeof data.state === 'object') {
+      pageStateParts = data.state;
+    } else if (data.vcs !== undefined || data.comments !== undefined || data.snapshots !== undefined || data.marks !== undefined || data.repos !== undefined) {
+      pageStateParts = data;
+    }
+  }
+
+  function buildStateQuery() {
+    const sp = new URLSearchParams();
+    if (pageStateRepo) {
+      sp.set('repo', pageStateRepo);
+      if (pageStateChange) sp.set('change', pageStateChange);
+    } else if (window.location && window.location.pathname) {
+      const m = window.location.pathname.match(/^\/r\/([^/]+)(?:\/c\/([^/]+))?/);
+      if (m) {
+        sp.set('repo', decodeURIComponent(m[1]));
+        if (m[2]) sp.set('change', decodeURIComponent(m[2]));
+      }
+    }
+    const qs = sp.toString();
+    return qs ? '?' + qs : '';
+  }
+
+  function describeUpdateBanner(nextState, reason) {
+    const isChange = !!pageStateChange;
+    const prev = pageStateParts;
+    if (prev && nextState) {
+      const commentsChanged = nextState.comments !== undefined && prev.comments !== undefined && nextState.comments !== prev.comments;
+      const snapsChanged = nextState.snapshots !== undefined && prev.snapshots !== undefined && nextState.snapshots !== prev.snapshots;
+      const vcsChanged = nextState.vcs !== undefined && prev.vcs !== undefined && nextState.vcs !== prev.vcs;
+      const marksChanged = nextState.marks !== undefined && prev.marks !== undefined && nextState.marks !== prev.marks;
+      const reposChanged = nextState.repos !== undefined && prev.repos !== undefined && nextState.repos !== prev.repos;
+
+      if (commentsChanged && (vcsChanged || snapsChanged)) {
+        return (isChange ? 'Commit' : 'Repo') + ' and comments updated — click to refresh';
+      }
+      if (commentsChanged) {
+        if (reason === 'comment_reply') return 'New reply — click to refresh';
+        if (reason === 'comment_add') return 'New comment — click to refresh';
+        if (reason === 'resolve') return 'Thread status updated — click to refresh';
+        if (reason === 'publish') return 'Comments published — click to refresh';
+        return 'Comments updated — click to refresh';
+      }
+      if (snapsChanged) return 'New snapshot — click to refresh';
+      if (vcsChanged) return (isChange ? 'Commit updated' : 'Repo updated') + ' — click to refresh';
+      if (marksChanged) return 'Review status updated — click to refresh';
+      if (reposChanged) return 'Tracked repos updated — click to refresh';
+    }
+    switch (reason) {
+      case 'comment_reply': return 'New reply — click to refresh';
+      case 'comment_add': return 'New comment — click to refresh';
+      case 'comment_edit':
+      case 'comment_delete':
+      case 'publish': return 'Comments updated — click to refresh';
+      case 'resolve': return 'Thread status updated — click to refresh';
+      case 'snapshot': return 'New snapshot — click to refresh';
+      case 'file_reviewed':
+      case 'change_reviewed': return 'Review status updated — click to refresh';
+      case 'vcs': return (isChange ? 'Commit updated' : 'Repo updated') + ' — click to refresh';
+      default: return 'Repo updated — click to refresh';
+    }
+  }
+
+  function showOrHideUpdateBanner(data, reason) {
+    const banner = document.getElementById('updateBanner');
+    const sig = data && data.sig;
+    if (sig && (!pageStateSig || sig !== pageStateSig)) {
+      if (banner) {
+        banner.textContent = describeUpdateBanner(data, reason);
+        banner.classList.add('show');
+      }
+    } else if (banner) {
+      banner.classList.remove('show');
+    }
+  }
 
   function beginSelfReload() {
     suppressSSEReloadUntil = Date.now() + 5000;
+    pendingSSEReason = '';
     if (staleBannerTimer) {
       clearTimeout(staleBannerTimer);
       staleBannerTimer = null;
@@ -814,21 +902,32 @@
 
   function initSSE() {
     if (!window.EventSource || document.hidden || eventSource) return;
-    eventSource = new EventSource('/api/events');
+    eventSource = new EventSource('/api/events' + buildStateQuery());
 
     eventSource.addEventListener('reload', (e) => {
       if (Date.now() < suppressSSEReloadUntil) return;
       let evtSig = '';
+      let evtReason = '';
+      let evtRepo = '';
+      let evtChange = '';
       if (e && e.data) {
         try {
           const parsed = JSON.parse(e.data);
-          if (parsed && parsed.sig) evtSig = parsed.sig;
+          if (parsed) {
+            if (parsed.sig) evtSig = parsed.sig;
+            if (parsed.reason) evtReason = parsed.reason;
+            if (parsed.repo) evtRepo = parsed.repo;
+            if (parsed.change) evtChange = parsed.change;
+          }
         } catch (_) {}
       }
 
+      if (evtRepo && pageStateRepo && evtRepo !== pageStateRepo) return;
+      if (evtChange && pageStateChange && evtChange !== pageStateChange) return;
+
       const banner = document.getElementById('updateBanner');
 
-      if (evtSig && pageStateSig && evtSig === pageStateSig) {
+      if (!pageStateRepo && evtSig && pageStateSig && evtSig === pageStateSig) {
         if (staleBannerTimer) {
           clearTimeout(staleBannerTimer);
           staleBannerTimer = null;
@@ -837,25 +936,20 @@
         return;
       }
 
-      if (banner && banner.classList.contains('show')) {
-        return;
-      }
+      if (evtReason) pendingSSEReason = evtReason;
 
       if (!staleBannerTimer) {
         const delay = window.REVIEW_STALE_DELAY_MS ?? 300;
         staleBannerTimer = setTimeout(async () => {
           staleBannerTimer = null;
+          const reason = pendingSSEReason;
+          pendingSSEReason = '';
           if (Date.now() < suppressSSEReloadUntil) return;
           try {
-            const res = await fetch('/api/state', { cache: 'no-store' });
+            const res = await fetch('/api/state' + buildStateQuery(), { cache: 'no-store' });
             if (res.ok) {
               const data = await res.json();
-              const sig = data && data.sig;
-              if (sig && (!pageStateSig || sig !== pageStateSig)) {
-                if (banner) banner.classList.add('show');
-              } else {
-                if (banner) banner.classList.remove('show');
-              }
+              showOrHideUpdateBanner(data, reason);
             }
           } catch (_) {}
         }, delay);
@@ -877,18 +971,10 @@
     if (Date.now() - lastStateCheckAt < 1500) return;
     lastStateCheckAt = Date.now();
     try {
-      const m = window.location.pathname.match(/^\/r\/([^/]+)/);
-      const stateUrl = m ? '/api/state?repo=' + encodeURIComponent(m[1]) : '/api/state';
-      const res = await fetch(stateUrl, { cache: 'no-store' });
+      const res = await fetch('/api/state' + buildStateQuery(), { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json();
-        const sig = data && data.sig;
-        const banner = document.getElementById('updateBanner');
-        if (sig && (!pageStateSig || sig !== pageStateSig)) {
-          if (banner) banner.classList.add('show');
-        } else {
-          if (banner) banner.classList.remove('show');
-        }
+        showOrHideUpdateBanner(data, '');
       }
     } catch (_) {}
   }
@@ -2526,7 +2612,7 @@
       throw new Error('failed');
     }).then(data => {
       if (!data) return;
-      if (data.sig) pageStateSig = data.sig;
+      applyPageState(data);
       suppressSSEReloadUntil = Date.now() + 300;
       clearRangeHighlights();
       const inlineRow = document.getElementById('inlineNewComment');
@@ -2717,7 +2803,7 @@
       throw new Error('failed');
     }).then(data => {
       if (!data) return;
-      if (data.sig) pageStateSig = data.sig;
+      applyPageState(data);
       suppressSSEReloadUntil = Date.now() + 300;
       clearRangeHighlights();
       const draftKey = form.getAttribute('data-draft-key') || getEditDraftKey(msgID, form);
@@ -3678,7 +3764,7 @@
       throw new Error('failed');
     }).then(data => {
       if (!data) return;
-      if (data.sig) pageStateSig = data.sig;
+      applyPageState(data);
       suppressSSEReloadUntil = Date.now() + 300;
       clearRangeHighlights();
       try {
@@ -3724,7 +3810,7 @@
       throw new Error('failed');
     }).then(data => {
       if (!data) return;
-      if (data.sig) pageStateSig = data.sig;
+      applyPageState(data);
       suppressSSEReloadUntil = Date.now() + 300;
       clearRangeHighlights();
 
@@ -3769,7 +3855,7 @@
       throw new Error('failed');
     }).then(data => {
       if (!data) return;
-      if (data.sig) pageStateSig = data.sig;
+      applyPageState(data);
       suppressSSEReloadUntil = Date.now() + 300;
       clearRangeHighlights();
       if (data.thread_deleted) {
@@ -3827,7 +3913,7 @@
         try {
           const data = await res.json();
           if (data && data.sig) {
-            pageStateSig = data.sig;
+            applyPageState(data);
           }
         } catch (_) {}
         suppressSSEReloadUntil = Date.now() + 300;
@@ -3867,7 +3953,7 @@
         try {
           data = await res.json();
           if (data && data.sig) {
-            pageStateSig = data.sig;
+            applyPageState(data);
           }
         } catch (_) {}
         suppressSSEReloadUntil = Date.now() + 300;
@@ -3958,7 +4044,7 @@
         try {
           data = await res.json();
           if (data && data.sig) {
-            pageStateSig = data.sig;
+            applyPageState(data);
           }
         } catch (_) {}
         suppressSSEReloadUntil = Date.now() + 300;
@@ -4405,7 +4491,7 @@
         try {
           const data = await res.json();
           if (data && data.sig) {
-            pageStateSig = data.sig;
+            applyPageState(data);
           }
         } catch (_) {}
         suppressSSEReloadUntil = Date.now() + 300;

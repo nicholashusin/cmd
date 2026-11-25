@@ -460,7 +460,11 @@ func (e *Env) cmdSnapshot(args []string) error {
 		}
 	}
 
-	daemon.Notify(d.Path())
+	changeKey := ""
+	if len(targets) == 1 {
+		changeKey = targets[0].Key
+	}
+	daemon.NotifyEvent(d.Path(), "snapshot", rec.Slug, changeKey)
 	return nil
 }
 
@@ -820,7 +824,7 @@ func (e *Env) cmdAdd(args []string) error {
 		return err
 	}
 
-	daemon.Notify(d.Path())
+	daemon.NotifyEvent(d.Path(), "comment_add", rec.Slug, c.Key)
 	lineDesc := fmt.Sprintf("%d", startLine)
 	if startLine == 0 {
 		lineDesc = "file-level"
@@ -912,7 +916,18 @@ func (e *Env) cmdReply(args []string) error {
 		fmt.Fprintf(e.Stdout, "Marked thread #%d as resolved.\n", threadID)
 	}
 
-	daemon.Notify(d.Path())
+	reason := "comment_reply"
+	if text == "" {
+		reason = "resolve"
+	}
+	var repoSlug, changeKey string
+	if th, err := d.ThreadByID(threadID); err == nil && th != nil {
+		changeKey = th.ChangeKey
+		if rec, err := d.RepoByID(th.RepoID); err == nil && rec != nil {
+			repoSlug = rec.Slug
+		}
+	}
+	daemon.NotifyEvent(d.Path(), reason, repoSlug, changeKey)
 	return nil
 }
 
@@ -947,12 +962,19 @@ func (e *Env) cmdEdit(args []string) error {
 	}
 	defer d.Close()
 
-	msg, _, err := d.EditMessage(msgID, text)
+	msg, th, err := d.EditMessage(msgID, text)
 	if err != nil {
 		return err
 	}
 
-	daemon.Notify(d.Path())
+	var repoSlug, changeKey string
+	if th != nil {
+		changeKey = th.ChangeKey
+		if rec, err := d.RepoByID(th.RepoID); err == nil && rec != nil {
+			repoSlug = rec.Slug
+		}
+	}
+	daemon.NotifyEvent(d.Path(), "comment_edit", repoSlug, changeKey)
 	fmt.Fprintf(e.Stdout, "Updated message #%d: %s\n", msg.ID, msg.Body)
 	return nil
 }
@@ -975,6 +997,8 @@ func (e *Env) cmdResolve(args []string, resolve bool) error {
 	}
 	defer d.Close()
 
+	var notifyRepo, notifyChange string
+	var multipleChanges bool
 	for _, arg := range fs.Args() {
 		id, err := strconv.ParseInt(arg, 10, 64)
 		if err != nil {
@@ -983,6 +1007,16 @@ func (e *Env) cmdResolve(args []string, resolve bool) error {
 		if err := d.SetResolved(id, resolve); err != nil {
 			return err
 		}
+		if th, err := d.ThreadByID(id); err == nil && th != nil {
+			if rec, err := d.RepoByID(th.RepoID); err == nil && rec != nil {
+				if notifyRepo == "" {
+					notifyRepo = rec.Slug
+					notifyChange = th.ChangeKey
+				} else if notifyRepo != rec.Slug || notifyChange != th.ChangeKey {
+					multipleChanges = true
+				}
+			}
+		}
 		if resolve {
 			fmt.Fprintf(e.Stdout, "Resolved thread #%d\n", id)
 		} else {
@@ -990,7 +1024,10 @@ func (e *Env) cmdResolve(args []string, resolve bool) error {
 		}
 	}
 
-	daemon.Notify(d.Path())
+	if multipleChanges {
+		notifyRepo, notifyChange = "", ""
+	}
+	daemon.NotifyEvent(d.Path(), "resolve", notifyRepo, notifyChange)
 	return nil
 }
 
@@ -1015,6 +1052,7 @@ func (e *Env) cmdPublish(args []string) error {
 	defer closeRepo()
 
 	var res *engine.PublishResult
+	publishChange := ""
 	if fs.NArg() > 0 {
 		changeArg := fs.Arg(0)
 		key := changeArg
@@ -1024,6 +1062,7 @@ func (e *Env) cmdPublish(args []string) error {
 		} else {
 			c = nil
 		}
+		publishChange = key
 		res, err = engine.PublishChange(d, repo, rec.ID, key, c, true)
 		if err != nil {
 			return err
@@ -1035,7 +1074,7 @@ func (e *Env) cmdPublish(args []string) error {
 		}
 	}
 
-	daemon.Notify(d.Path())
+	daemon.NotifyEvent(d.Path(), "publish", rec.Slug, publishChange)
 	fmt.Fprintf(e.Stdout, "Published %d draft comments.\n", res.Published)
 	return nil
 }
@@ -1142,7 +1181,7 @@ func (e *Env) cmdForget(args []string) error {
 		}
 	}
 
-	daemon.Notify(d.Path())
+	daemon.NotifyEvent(d.Path(), "repo_forget", "", "")
 	return nil
 }
 

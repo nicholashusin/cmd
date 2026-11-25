@@ -22194,3 +22194,174 @@ func TestServerRenamedFileDiff(t *testing.T) {
 		t.Errorf("expected L-side thread on renamed file not to be stale, got: %s", addRes.HTML)
 	}
 }
+
+func TestSSEScopedNotificationsAndReasons(t *testing.T) {
+	srv, ts, d, repoDir1 := setupTestServer(t)
+	defer srv.broker.Close()
+	defer ts.Close()
+	defer d.Close()
+
+	// Create a second git repo tracked by the same server.
+	repoDir2 := t.TempDir()
+	runGit := func(dir string, args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+		}
+	}
+	runGit(repoDir2, "init", "-b", "main")
+	runGit(repoDir2, "config", "user.name", "UI Tester")
+	runGit(repoDir2, "config", "user.email", "ui@example.com")
+	if err := os.WriteFile(filepath.Join(repoDir2, "other.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(repoDir2, "add", "other.go")
+	runGit(repoDir2, "commit", "-m", "Other repo commit\n\nChange-Id: I9999999999999999999999999999999999999999")
+
+	rec1, _ := d.EnsureRepo(repoDir1)
+	rec2, _ := d.EnsureRepo(repoDir2)
+
+	// Add a second commit in repo1 so we have two distinct changes in the same repo.
+	if err := os.WriteFile(filepath.Join(repoDir1, "second.go"), []byte("package main\nvar x = 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(repoDir1, "add", "second.go")
+	runGit(repoDir1, "commit", "-m", "Second commit\n\nChange-Id: I2222222222222222222222222222222222222222")
+
+	changeA := "Iaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	changeB := "I2222222222222222222222222222222222222222"
+
+	getState := func(query string) StateSnapshot {
+		resp, err := http.Get(ts.URL + "/api/state" + query)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /api/state%s failed: %v", query, err)
+		}
+		defer resp.Body.Close()
+		var snap StateSnapshot
+		if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+			t.Fatal(err)
+		}
+		return snap
+	}
+
+	// Open three SSE streams: global, repo1/changeA, repo2.
+	openSSE := func(query string) (<-chan string, func()) {
+		ctx, cancel := context.WithCancel(context.Background())
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/events"+query, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := bufio.NewReader(resp.Body)
+		// Drain initial connected event (2 lines + blank).
+		for i := 0; i < 3; i++ {
+			if _, err := r.ReadString('\n'); err != nil {
+				t.Fatalf("reading connected event: %v", err)
+			}
+		}
+		ch := make(chan string, 16)
+		go func() {
+			defer close(ch)
+			for {
+				var sb strings.Builder
+				for {
+					line, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					sb.WriteString(line)
+					if line == "\n" {
+						ch <- sb.String()
+						break
+					}
+				}
+			}
+		}()
+		return ch, func() {
+			cancel()
+			_ = resp.Body.Close()
+		}
+	}
+
+	rGlobal, closeGlobal := openSSE("")
+	defer closeGlobal()
+	rChangeA, closeChangeA := openSSE("?repo=" + rec1.Slug + "&change=" + changeA)
+	defer closeChangeA()
+	rRepo2, closeRepo2 := openSSE("?repo=" + rec2.Slug)
+	defer closeRepo2()
+
+	readEventTimeout := func(ch <-chan string, timeout time.Duration) (string, bool) {
+		select {
+		case evt, ok := <-ch:
+			return evt, ok
+		case <-time.After(timeout):
+			return "", false
+		}
+	}
+
+	beforeA := getState("?repo=" + rec1.Slug + "&change=" + changeA)
+	beforeB := getState("?repo=" + rec1.Slug + "&change=" + changeB)
+	beforeR2 := getState("?repo=" + rec2.Slug)
+
+	// Add a comment on repo1/changeB -> global gets it, repo1/changeA and repo2 must NOT!
+	pAdd, _ := json.Marshal(map[string]any{
+		"repo":       rec1.Slug,
+		"change":     changeB,
+		"path":       "second.go",
+		"side":       "R",
+		"start_line": 2,
+		"end_line":   2,
+		"body":       "comment on B",
+	})
+	resp, err := http.Post(ts.URL+"/api/threads/add", "application/json", bytes.NewReader(pAdd))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/threads/add failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	evtGlobal, ok := readEventTimeout(rGlobal, time.Second)
+	if !ok || !strings.Contains(evtGlobal, `"reason":"comment_add"`) || !strings.Contains(evtGlobal, `"change":"`+changeB+`"`) {
+		t.Fatalf("expected global SSE to receive scoped comment_add for changeB, got ok=%v evt=%q", ok, evtGlobal)
+	}
+	if evtA, gotA := readEventTimeout(rChangeA, 200*time.Millisecond); gotA {
+		t.Errorf("changeA SSE should not receive changeB comment event, got %q", evtA)
+	}
+	if evtR2, gotR2 := readEventTimeout(rRepo2, 200*time.Millisecond); gotR2 {
+		t.Errorf("repo2 SSE should not receive repo1 event, got %q", evtR2)
+	}
+
+	// Verify /api/state scoping and component digests: only changeB's comments digest changed.
+	afterA := getState("?repo=" + rec1.Slug + "&change=" + changeA)
+	afterB := getState("?repo=" + rec1.Slug + "&change=" + changeB)
+	afterR2 := getState("?repo=" + rec2.Slug)
+	if afterA.Sig != beforeA.Sig {
+		t.Errorf("changeA sig should be unchanged, got %s -> %s", beforeA.Sig, afterA.Sig)
+	}
+	if afterR2.Sig != beforeR2.Sig {
+		t.Errorf("repo2 sig should be unchanged, got %s -> %s", beforeR2.Sig, afterR2.Sig)
+	}
+	if afterB.Sig == beforeB.Sig || afterB.Comments == beforeB.Comments {
+		t.Errorf("expected changeB sig and comments digest to change: before=%+v after=%+v", beforeB, afterB)
+	}
+	if afterB.VCS != beforeB.VCS || afterB.Snapshots != beforeB.Snapshots || afterB.Marks != beforeB.Marks {
+		t.Errorf("expected only changeB comments digest to change: before=%+v after=%+v", beforeB, afterB)
+	}
+
+	// Notify for repo1/changeA via /api/notify -> changeA receives it with exact reason.
+	notifyBody, _ := json.Marshal(map[string]string{
+		"reason": "comment_reply",
+		"repo":   rec1.Slug,
+		"change": changeA,
+	})
+	respN, err := http.Post(ts.URL+"/api/notify", "application/json", bytes.NewReader(notifyBody))
+	if err != nil || respN.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/notify failed: %v", err)
+	}
+	_ = respN.Body.Close()
+
+	evtA, ok := readEventTimeout(rChangeA, time.Second)
+	if !ok || !strings.Contains(evtA, `"reason":"comment_reply"`) {
+		t.Fatalf("expected changeA SSE to receive comment_reply, got ok=%v evt=%q", ok, evtA)
+	}
+}

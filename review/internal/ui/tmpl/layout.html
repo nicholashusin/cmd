@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en"{{if or (eq .ThemePref "light") (eq .ThemePref "dark")}} data-theme="{{.ThemePref}}"{{end}}{{if eq .IgnoreWSPref "off"}} data-ignore-ws="off"{{end}}{{if eq .SyntaxPref "off"}} data-syntax="off"{{end}}{{if eq .ScopeSidePref "L"}} data-scope-side="L"{{end}} data-state-sig="{{.StateSig}}">
+<html lang="en"{{if or (eq .ThemePref "light") (eq .ThemePref "dark")}} data-theme="{{.ThemePref}}"{{end}}{{if eq .IgnoreWSPref "off"}} data-ignore-ws="off"{{end}}{{if eq .SyntaxPref "off"}} data-syntax="off"{{end}}{{if eq .ScopeSidePref "L"}} data-scope-side="L"{{end}} data-state-sig="{{.StateSig}}"{{if .StateRepo}} data-state-repo="{{.StateRepo}}"{{end}}{{if .StateChange}} data-state-change="{{.StateChange}}"{{end}}{{if .StatePartsJSON}} data-state-parts="{{.StatePartsJSON}}"{{end}}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">

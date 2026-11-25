@@ -97,15 +97,32 @@ func CheckHealth(addr string) bool {
 // Notify sends a POST request to /api/notify on the running server, waking up SSE clients.
 // Silently ignored if server is not running or unreachable.
 func Notify(dbPath string) {
+	NotifyEvent(dbPath, "cli", "", "")
+}
+
+// NotifyEvent sends a scoped reload notification to /api/notify on the running server.
+func NotifyEvent(dbPath, reason, repoSlug, changeKey string) {
 	configDir := ConfigDir(dbPath)
 	info, err := GetServerInfo(configDir)
 	if err != nil || info == nil || !IsAlive(info.PID) {
 		return
 	}
 
+	if reason == "" {
+		reason = "cli"
+	}
+	body, err := json.Marshal(map[string]string{
+		"reason": reason,
+		"repo":   repoSlug,
+		"change": changeKey,
+	})
+	if err != nil {
+		return
+	}
+
 	url := fmt.Sprintf("http://%s/api/notify", DialAddr(info.Addr))
 	client := http.Client{Timeout: 200 * time.Millisecond}
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(`{"reason":"cli"}`))
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(string(body)))
 	if err == nil {
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)

@@ -179,6 +179,7 @@ func (s *Server) handleRepo(w http.ResponseWriter, r *http.Request) {
 		"Record":        rec,
 		"GraphRows":     graphRows,
 		"Summaries":     sums,
+		"StateRepo":     rec.Slug,
 	})
 }
 
@@ -319,6 +320,8 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 		"DiffMode":      diffMode,
 		"CtxParam":      ctxParam,
 		"DiffFiles":     diffFiles,
+		"StateRepo":     rec.Slug,
+		"StateChange":   c.Key,
 	})
 
 	if s.sym != nil && view != nil {
@@ -465,6 +468,8 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 		"TargetParam":   targetSel,
 		"CtxParam":      ctxParam,
 		"DiffData":      diffData,
+		"StateRepo":     rec.Slug,
+		"StateChange":   c.Key,
 	})
 
 	if s.sym != nil && view != nil && strings.HasSuffix(vcsPath, ".go") {
@@ -650,6 +655,8 @@ func (s *Server) handleExternalFile(w http.ResponseWriter, r *http.Request) {
 		"BaseParam":     baseSel,
 		"TargetParam":   targetSel,
 		"CtxParam":      "all",
+		"StateRepo":     rec.Slug,
+		"StateChange":   c.Key,
 	})
 }
 

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
@@ -408,9 +409,14 @@ func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 			m["ScopeSidePref"] = s.d.Pref("scope_side", "R")
 		}
 		if s.broker != nil {
-			sig := s.broker.StateSignature()
-			m["StateSig"] = sig
-			s.broker.InitLastSignature(sig)
+			stateRepo, _ := m["StateRepo"].(string)
+			stateChange, _ := m["StateChange"].(string)
+			snap := s.broker.StateFor(stateRepo, stateChange)
+			m["StateSig"] = snap.Sig
+			if b, err := json.Marshal(snap); err == nil {
+				m["StatePartsJSON"] = string(b)
+			}
+			s.broker.InitBaseline()
 		}
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

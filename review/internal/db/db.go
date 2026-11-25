@@ -12,6 +12,24 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// StateParts holds per-category semantic digests for identifying what changed.
+type StateParts struct {
+	Repos     string `json:"repos,omitempty"`
+	Snapshots string `json:"snapshots,omitempty"`
+	Comments  string `json:"comments,omitempty"`
+	Marks     string `json:"marks,omitempty"`
+}
+
+type stateDigestKey struct {
+	repoID    int64
+	changeKey string
+}
+
+type cachedStateDigest struct {
+	digest string
+	parts  StateParts
+}
+
 // DB wraps the SQLite connection for review metadata.
 type DB struct {
 	db               *sql.DB
@@ -20,7 +38,7 @@ type DB struct {
 	digestValid      bool
 	lastTotalChanges int64
 	lastDataVersion  int64
-	lastDigest       string
+	digestCache      map[stateDigestKey]cachedStateDigest
 }
 
 // DefaultPath returns the default SQLite database path in ~/.config/review/review.db
@@ -197,146 +215,260 @@ func (d *DB) SetPref(key, val string) error {
 	return nil
 }
 
+func shortSHA(sum [32]byte) string {
+	return hex.EncodeToString(sum[:])[:16]
+}
+
 // StateDigest computes a SHA-256 hex digest of the semantic review DB state.
 func (d *DB) StateDigest() string {
+	dig, _ := d.StateDigestFor(0, "")
+	return dig
+}
+
+// StateDigestFor computes a semantic DB digest and per-category sub-digests scoped to
+// the entire DB (repoID == 0), a single repository (repoID > 0, changeKey == ""), or
+// a single change (repoID > 0, changeKey != "").
+func (d *DB) StateDigestFor(repoID int64, changeKey string) (string, StateParts) {
 	var totalChanges, dataVersion int64
 	tcErr := d.db.QueryRow("SELECT total_changes()").Scan(&totalChanges)
 	dvErr := d.db.QueryRow("PRAGMA data_version").Scan(&dataVersion)
 
+	key := stateDigestKey{repoID: repoID, changeKey: changeKey}
 	d.digestMu.Lock()
 	if tcErr == nil && dvErr == nil && d.digestValid &&
 		totalChanges == d.lastTotalChanges && dataVersion == d.lastDataVersion {
-		cached := d.lastDigest
-		d.digestMu.Unlock()
-		return cached
+		if entry, ok := d.digestCache[key]; ok {
+			d.digestMu.Unlock()
+			return entry.digest, entry.parts
+		}
 	}
 	d.digestMu.Unlock()
 
-	h := sha256.New()
+	dig, parts, ok := d.computeStateDigest(repoID, changeKey)
+	if ok && tcErr == nil && dvErr == nil {
+		var afterTC, afterDV int64
+		if d.db.QueryRow("SELECT total_changes()").Scan(&afterTC) == nil &&
+			d.db.QueryRow("PRAGMA data_version").Scan(&afterDV) == nil &&
+			afterTC == totalChanges && afterDV == dataVersion {
+			d.digestMu.Lock()
+			newer := !d.digestValid || totalChanges > d.lastTotalChanges || dataVersion > d.lastDataVersion
+			same := d.digestValid && totalChanges == d.lastTotalChanges && dataVersion == d.lastDataVersion
+			if newer {
+				d.digestCache = make(map[stateDigestKey]cachedStateDigest)
+				d.lastTotalChanges = totalChanges
+				d.lastDataVersion = dataVersion
+				d.digestValid = true
+				d.digestCache[key] = cachedStateDigest{digest: dig, parts: parts}
+			} else if same {
+				if len(d.digestCache) >= 256 {
+					d.digestCache = make(map[stateDigestKey]cachedStateDigest)
+				}
+				d.digestCache[key] = cachedStateDigest{digest: dig, parts: parts}
+			}
+			d.digestMu.Unlock()
+		}
+	}
+	return dig, parts
+}
+
+func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StateParts, bool) {
+	hRepos := sha256.New()
+	hSnaps := sha256.New()
+	hComments := sha256.New()
+	hMarks := sha256.New()
 	queryFailed := false
 
 	// 1. repos
-	if rows, err := d.db.Query("SELECT id, slug, root_path FROM repos ORDER BY id"); err == nil {
-		for rows.Next() {
-			var id int64
-			var slug, rootPath string
-			if err := rows.Scan(&id, &slug, &rootPath); err == nil {
-				fmt.Fprintf(h, "repo:%d:%s:%s\n", id, slug, rootPath)
-			}
+	if changeKey == "" {
+		var rows *sql.Rows
+		var err error
+		if repoID == 0 {
+			rows, err = d.db.Query("SELECT id, slug, root_path FROM repos ORDER BY id")
+		} else {
+			rows, err = d.db.Query("SELECT id, slug, root_path FROM repos WHERE id = ? ORDER BY id", repoID)
 		}
-		if rows.Err() != nil {
+		if err == nil {
+			for rows.Next() {
+				var id int64
+				var slug, rootPath string
+				if err := rows.Scan(&id, &slug, &rootPath); err == nil {
+					fmt.Fprintf(hRepos, "repo:%d:%s:%s\n", id, slug, rootPath)
+				}
+			}
+			if rows.Err() != nil {
+				queryFailed = true
+			}
+			rows.Close()
+		} else {
 			queryFailed = true
 		}
-		rows.Close()
-	} else {
-		queryFailed = true
 	}
 
 	// 2. snapshots
-	if rows, err := d.db.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots ORDER BY id"); err == nil {
-		for rows.Next() {
-			var id, repoID int64
-			var changeKey string
-			var num int
-			var rev, parentRev string
-			if err := rows.Scan(&id, &repoID, &changeKey, &num, &rev, &parentRev); err == nil {
-				fmt.Fprintf(h, "snap:%d:%d:%s:%d:%s:%s\n", id, repoID, changeKey, num, rev, parentRev)
-			}
+	{
+		var rows *sql.Rows
+		var err error
+		switch {
+		case repoID == 0:
+			rows, err = d.db.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots ORDER BY id")
+		case changeKey == "":
+			rows, err = d.db.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots WHERE repo_id = ? ORDER BY id", repoID)
+		default:
+			rows, err = d.db.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots WHERE repo_id = ? AND change_key = ? ORDER BY id", repoID, changeKey)
 		}
-		if rows.Err() != nil {
+		if err == nil {
+			for rows.Next() {
+				var id, rID int64
+				var ck string
+				var num int
+				var rev, parentRev string
+				if err := rows.Scan(&id, &rID, &ck, &num, &rev, &parentRev); err == nil {
+					fmt.Fprintf(hSnaps, "snap:%d:%d:%s:%d:%s:%s\n", id, rID, ck, num, rev, parentRev)
+				}
+			}
+			if rows.Err() != nil {
+				queryFailed = true
+			}
+			rows.Close()
+		} else {
 			queryFailed = true
 		}
-		rows.Close()
-	} else {
-		queryFailed = true
 	}
 
 	// 3. threads
-	if rows, err := d.db.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads ORDER BY id"); err == nil {
-		for rows.Next() {
-			var id, repoID int64
-			var changeKey, rev string
-			var snapNum int
-			var path, side string
-			var startLine, endLine int
-			var startCol, endCol int
-			var resolved bool
-			if err := rows.Scan(&id, &repoID, &changeKey, &rev, &snapNum, &path, &side, &startLine, &endLine, &startCol, &endCol, &resolved); err == nil {
-				fmt.Fprintf(h, "thread:%d:%d:%s:%s:%d:%s:%s:%d:%d:%d:%d:%t\n", id, repoID, changeKey, rev, snapNum, path, side, startLine, endLine, startCol, endCol, resolved)
-			}
+	{
+		var rows *sql.Rows
+		var err error
+		switch {
+		case repoID == 0:
+			rows, err = d.db.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads ORDER BY id")
+		case changeKey == "":
+			rows, err = d.db.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads WHERE repo_id = ? ORDER BY id", repoID)
+		default:
+			rows, err = d.db.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads WHERE repo_id = ? AND change_key = ? ORDER BY id", repoID, changeKey)
 		}
-		if rows.Err() != nil {
+		if err == nil {
+			for rows.Next() {
+				var id, rID int64
+				var ck, rev string
+				var snapNum int
+				var path, side string
+				var startLine, endLine int
+				var startCol, endCol int
+				var resolved bool
+				if err := rows.Scan(&id, &rID, &ck, &rev, &snapNum, &path, &side, &startLine, &endLine, &startCol, &endCol, &resolved); err == nil {
+					fmt.Fprintf(hComments, "thread:%d:%d:%s:%s:%d:%s:%s:%d:%d:%d:%d:%t\n", id, rID, ck, rev, snapNum, path, side, startLine, endLine, startCol, endCol, resolved)
+				}
+			}
+			if rows.Err() != nil {
+				queryFailed = true
+			}
+			rows.Close()
+		} else {
 			queryFailed = true
 		}
-		rows.Close()
-	} else {
-		queryFailed = true
 	}
 
 	// 4. messages
-	if rows, err := d.db.Query("SELECT id, thread_id, author, draft, body FROM messages ORDER BY id"); err == nil {
-		for rows.Next() {
-			var id, threadID int64
-			var author string
-			var draft bool
-			var body string
-			if err := rows.Scan(&id, &threadID, &author, &draft, &body); err == nil {
-				fmt.Fprintf(h, "msg:%d:%d:%s:%t:%s\n", id, threadID, author, draft, body)
-			}
+	{
+		var rows *sql.Rows
+		var err error
+		switch {
+		case repoID == 0:
+			rows, err = d.db.Query("SELECT id, thread_id, author, draft, body FROM messages ORDER BY id")
+		case changeKey == "":
+			rows, err = d.db.Query("SELECT m.id, m.thread_id, m.author, m.draft, m.body FROM messages m JOIN threads t ON m.thread_id = t.id WHERE t.repo_id = ? ORDER BY m.id", repoID)
+		default:
+			rows, err = d.db.Query("SELECT m.id, m.thread_id, m.author, m.draft, m.body FROM messages m JOIN threads t ON m.thread_id = t.id WHERE t.repo_id = ? AND t.change_key = ? ORDER BY m.id", repoID, changeKey)
 		}
-		if rows.Err() != nil {
+		if err == nil {
+			for rows.Next() {
+				var id, threadID int64
+				var author string
+				var draft bool
+				var body string
+				if err := rows.Scan(&id, &threadID, &author, &draft, &body); err == nil {
+					fmt.Fprintf(hComments, "msg:%d:%d:%s:%t:%s\n", id, threadID, author, draft, body)
+				}
+			}
+			if rows.Err() != nil {
+				queryFailed = true
+			}
+			rows.Close()
+		} else {
 			queryFailed = true
 		}
-		rows.Close()
-	} else {
-		queryFailed = true
 	}
 
 	// 5. file_marks
-	if rows, err := d.db.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE reviewed = 1 ORDER BY repo_id, change_key, rev, path"); err == nil {
-		for rows.Next() {
-			var repoID int64
-			var changeKey, rev, path string
-			if err := rows.Scan(&repoID, &changeKey, &rev, &path); err == nil {
-				fmt.Fprintf(h, "file_mark:%d:%s:%s:%s\n", repoID, changeKey, rev, path)
-			}
+	{
+		var rows *sql.Rows
+		var err error
+		switch {
+		case repoID == 0:
+			rows, err = d.db.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE reviewed = 1 ORDER BY repo_id, change_key, rev, path")
+		case changeKey == "":
+			rows, err = d.db.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE repo_id = ? AND reviewed = 1 ORDER BY change_key, rev, path", repoID)
+		default:
+			rows, err = d.db.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE repo_id = ? AND change_key = ? AND reviewed = 1 ORDER BY rev, path", repoID, changeKey)
 		}
-		if rows.Err() != nil {
+		if err == nil {
+			for rows.Next() {
+				var rID int64
+				var ck, rev, path string
+				if err := rows.Scan(&rID, &ck, &rev, &path); err == nil {
+					fmt.Fprintf(hMarks, "file_mark:%d:%s:%s:%s\n", rID, ck, rev, path)
+				}
+			}
+			if rows.Err() != nil {
+				queryFailed = true
+			}
+			rows.Close()
+		} else {
 			queryFailed = true
 		}
-		rows.Close()
-	} else {
-		queryFailed = true
 	}
 
 	// 6. rev_marks
-	if rows, err := d.db.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE reviewed = 1 OR lgtm = 1 ORDER BY repo_id, change_key, rev"); err == nil {
-		for rows.Next() {
-			var repoID int64
-			var changeKey, rev string
-			var reviewed, lgtm bool
-			if err := rows.Scan(&repoID, &changeKey, &rev, &reviewed, &lgtm); err == nil {
-				fmt.Fprintf(h, "rev_mark:%d:%s:%s:%t:%t\n", repoID, changeKey, rev, reviewed, lgtm)
-			}
+	{
+		var rows *sql.Rows
+		var err error
+		switch {
+		case repoID == 0:
+			rows, err = d.db.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE reviewed = 1 OR lgtm = 1 ORDER BY repo_id, change_key, rev")
+		case changeKey == "":
+			rows, err = d.db.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE repo_id = ? AND (reviewed = 1 OR lgtm = 1) ORDER BY change_key, rev", repoID)
+		default:
+			rows, err = d.db.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE repo_id = ? AND change_key = ? AND (reviewed = 1 OR lgtm = 1) ORDER BY rev", repoID, changeKey)
 		}
-		if rows.Err() != nil {
+		if err == nil {
+			for rows.Next() {
+				var rID int64
+				var ck, rev string
+				var reviewed, lgtm bool
+				if err := rows.Scan(&rID, &ck, &rev, &reviewed, &lgtm); err == nil {
+					fmt.Fprintf(hMarks, "rev_mark:%d:%s:%s:%t:%t\n", rID, ck, rev, reviewed, lgtm)
+				}
+			}
+			if rows.Err() != nil {
+				queryFailed = true
+			}
+			rows.Close()
+		} else {
 			queryFailed = true
 		}
-		rows.Close()
-	} else {
-		queryFailed = true
 	}
 
-	digest := hex.EncodeToString(h.Sum(nil))
-
-	d.digestMu.Lock()
-	if !queryFailed && tcErr == nil && dvErr == nil {
-		d.lastTotalChanges = totalChanges
-		d.lastDataVersion = dataVersion
-		d.lastDigest = digest
-		d.digestValid = true
+	parts := StateParts{
+		Snapshots: shortSHA([32]byte(hSnaps.Sum(nil))),
+		Comments:  shortSHA([32]byte(hComments.Sum(nil))),
+		Marks:     shortSHA([32]byte(hMarks.Sum(nil))),
 	}
-	d.digestMu.Unlock()
+	if changeKey == "" {
+		parts.Repos = shortSHA([32]byte(hRepos.Sum(nil)))
+	}
 
-	return digest
+	hAll := sha256.New()
+	fmt.Fprintf(hAll, "%s:%s:%s:%s", parts.Repos, parts.Snapshots, parts.Comments, parts.Marks)
+	return hex.EncodeToString(hAll.Sum(nil)), parts, !queryFailed
 }
