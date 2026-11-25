@@ -498,6 +498,18 @@ func (r *GitRepo) ListGoFileBlobs(rev string) ([]GoFileBlob, error) {
 	return cf.ListGoFileBlobs(rev)
 }
 
+// ListAllFileBlobs implements AllBlobRepo for GitRepo.
+func (r *GitRepo) ListAllFileBlobs(rev string) ([]GoFileBlob, error) {
+	if rev == "" || rev == "working" {
+		return nil, os.ErrNotExist
+	}
+	cf, err := r.cache.catFile(r.gitDir)
+	if err != nil {
+		return nil, err
+	}
+	return cf.ListAllFileBlobs(rev)
+}
+
 // StreamBlobs implements GoBlobRepo for GitRepo.
 func (r *GitRepo) StreamBlobs(oids []string, visit func(idx int, oid string, data []byte)) error {
 	cf, err := r.cache.catFile(r.gitDir)

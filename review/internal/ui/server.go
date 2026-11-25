@@ -184,6 +184,8 @@ func NewServer(d *db.DB, cache *vcs.Cache, listenAddr string) (*Server, error) {
 	mux.HandleFunc("GET /api/symbol/refs", s.handleAPISymbolRefs)
 	mux.HandleFunc("POST /api/symbol/refs/batch", s.handleAPISymbolRefsBatch)
 	mux.HandleFunc("GET /api/symbol/impls", s.handleAPISymbolImpls)
+	mux.HandleFunc("GET /api/search", s.handleAPISearch)
+	mux.HandleFunc("GET /api/file/preview", s.handleAPIFilePreview)
 
 	// Fallback for directory paths pasted from shell or trailing slashes
 	mux.HandleFunc("GET /{path...}", s.handleFallback)

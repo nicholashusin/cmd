@@ -738,6 +738,67 @@ func (d *DB) ThreadsForChange(repoID int64, changeKey string) ([]*Thread, error)
 	return threads, nil
 }
 
+// ThreadsForRepo retrieves all threads across all changes in a repository, with messages populated.
+func (d *DB) ThreadsForRepo(repoID int64) ([]*Thread, error) {
+	rows, err := d.db.Query(`
+		SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved, anchor_lines, created_at
+		FROM threads
+		WHERE repo_id = ?
+		ORDER BY created_at DESC, id DESC
+	`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var threads []*Thread
+	threadMap := make(map[int64]*Thread)
+	for rows.Next() {
+		var th Thread
+		var resolvedInt int
+		if err := rows.Scan(&th.ID, &th.RepoID, &th.ChangeKey, &th.Rev, &th.SnapshotNum, &th.Path, &th.Side, &th.StartLine, &th.EndLine, &th.StartCol, &th.EndCol, &resolvedInt, &th.AnchorLines, &th.CreatedAt); err != nil {
+			return nil, err
+		}
+		th.Resolved = (resolvedInt == 1)
+		threads = append(threads, &th)
+		threadMap[th.ID] = &th
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(threads) == 0 {
+		return nil, nil
+	}
+
+	mRows, err := d.db.Query(`
+		SELECT m.id, m.thread_id, m.author, m.body, m.draft, m.created_at, m.updated_at
+		FROM messages m
+		JOIN threads t ON m.thread_id = t.id
+		WHERE t.repo_id = ?
+		ORDER BY m.id ASC
+	`, repoID)
+	if err != nil {
+		return nil, err
+	}
+	defer mRows.Close()
+
+	for mRows.Next() {
+		var m Message
+		var draftInt int
+		if err := mRows.Scan(&m.ID, &m.ThreadID, &m.Author, &m.Body, &draftInt, &m.CreatedAt, &m.UpdatedAt); err != nil {
+			return nil, err
+		}
+		m.Draft = (draftInt == 1)
+		if th, ok := threadMap[m.ThreadID]; ok {
+			th.Messages = append(th.Messages, &m)
+		}
+	}
+	if err := mRows.Err(); err != nil {
+		return nil, err
+	}
+	return threads, nil
+}
+
 // ThreadsForChanges fetches all threads (with their messages) for multiple change keys in at most 2 SQL queries.
 func (d *DB) ThreadsForChanges(repoID int64, changeKeys []string) (map[string][]*Thread, error) {
 	result := make(map[string][]*Thread)

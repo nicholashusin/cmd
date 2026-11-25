@@ -192,6 +192,13 @@ type GoBlobRepo interface {
 	StreamBlobs(oids []string, visit func(idx int, oid string, data []byte)) error
 }
 
+// AllBlobRepo is an optional interface for repositories that can quickly list
+// and stream Git blob objects for all searchable files at a revision.
+type AllBlobRepo interface {
+	ListAllFileBlobs(rev string) ([]GoFileBlob, error)
+	StreamBlobs(oids []string, visit func(idx int, oid string, data []byte)) error
+}
+
 // DirGoBlobRepo is an optional interface for repositories that can quickly read all
 // non-test .go file blobs in a directory at a given revision in a single pipelined operation.
 type DirGoBlobRepo interface {

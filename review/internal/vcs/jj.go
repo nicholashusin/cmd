@@ -542,6 +542,20 @@ func (r *JJRepo) ListGoFileBlobs(rev string) ([]GoFileBlob, error) {
 	return nil, errors.New("git backend unavailable for jj repo")
 }
 
+// ListAllFileBlobs implements AllBlobRepo for JJRepo when backed by gitDir.
+func (r *JJRepo) ListAllFileBlobs(rev string) ([]GoFileBlob, error) {
+	if rev == "" || rev == "working" {
+		return nil, os.ErrNotExist
+	}
+	if r.gitDir != "" {
+		cf, err := r.cache.catFile(r.gitDir)
+		if err == nil {
+			return cf.ListAllFileBlobs(rev)
+		}
+	}
+	return nil, errors.New("git backend unavailable for jj repo")
+}
+
 // StreamBlobs implements GoBlobRepo for JJRepo when backed by gitDir.
 func (r *JJRepo) StreamBlobs(oids []string, visit func(idx int, oid string, data []byte)) error {
 	if r.gitDir != "" {

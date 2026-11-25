@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -2747,4 +2748,227 @@ func TestRebaseAuditPass1Fixes(t *testing.T) {
 			t.Errorf("snap-1 pin = %s, want %s", got, c2v2.Rev)
 		}
 	})
+}
+
+func TestParseSearchQuery(t *testing.T) {
+	q := ParseSearchQuery(`f:^internal/ -f:_test\.go$ s:Broker method:Broadcast p:ui "exact phrase" -ignored /foo\d+/ author:alice is:unresolved case:yes`)
+	if !q.CaseSensitive {
+		t.Errorf("expected CaseSensitive=true when case:yes appears at end")
+	}
+	if len(q.FileFilters) != 2 || q.FileFilters[0].Negated || !q.FileFilters[1].Negated {
+		t.Errorf("unexpected FileFilters: %+v", q.FileFilters)
+	}
+	if len(q.SymbolFilters) != 2 || q.SymbolFilters[0].Kind != "" || q.SymbolFilters[1].Kind != "method" {
+		t.Errorf("unexpected SymbolFilters: %+v", q.SymbolFilters)
+	}
+	if len(q.PkgFilters) != 1 || q.PkgFilters[0].Raw != "ui" {
+		t.Errorf("unexpected PkgFilters: %+v", q.PkgFilters)
+	}
+	if len(q.AuthorFilters) != 1 || q.AuthorFilters[0].Raw != "alice" {
+		t.Errorf("unexpected AuthorFilters: %+v", q.AuthorFilters)
+	}
+	if !q.WantUnresolved {
+		t.Errorf("expected WantUnresolved=true")
+	}
+	if len(q.Terms) != 3 {
+		t.Fatalf("expected 3 content terms, got %d (%+v)", len(q.Terms), q.Terms)
+	}
+	if q.Terms[0].Raw != "exact phrase" || !q.Terms[0].Literal || q.Terms[0].MatchString("EXACT PHRASE") {
+		t.Errorf("expected case-sensitive literal phrase term, got %+v", q.Terms[0])
+	}
+	if !q.Terms[1].Negated || q.Terms[1].Raw != "ignored" {
+		t.Errorf("expected negated term, got %+v", q.Terms[1])
+	}
+	if !q.Terms[2].MatchString("foo42") || q.Terms[2].MatchString("FOO42") {
+		t.Errorf("expected case-sensitive regex term, got %+v", q.Terms[2])
+	}
+
+	// Unclosed regex gracefully falls back to literal without panicking.
+	qBad := ParseSearchQuery("foo(")
+	if len(qBad.Terms) != 1 || !qBad.Terms[0].MatchString("call foo(bar)") {
+		t.Errorf("expected literal fallback for invalid regex, got %+v", qBad.Terms)
+	}
+}
+
+func TestCodeSearch(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+		}
+	}
+	run("init", "-b", "main")
+	run("config", "user.name", "Search Tester")
+	run("config", "user.email", "search@example.com")
+
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/myrepo\n\ngo 1.24\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "pkg", "auth"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pkg", "auth", "token.go"), []byte("package auth\n\ntype TokenStore struct{}\n\nfunc (t *TokenStore) VerifyToken(tok string) bool {\n\treturn tok == \"secretNeedle\"\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pkg", "auth", "token_test.go"), []byte("package auth\n\nfunc TestVerifyToken() {\n\t_ = \"secretNeedle\"\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "src", "net", "http"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "net", "http", "server.go"), []byte("package http\n\ntype Handler interface {\n\tServeHTTP(w int)\n}\n\ntype Server struct {\n\tReadTimeout int\n}\n\nfunc (s *Server) ServeHTTP(w int) {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-m", "base commit")
+	run("checkout", "-b", "feature")
+
+	if err := os.WriteFile(filepath.Join(dir, "handler.go"), []byte("package main\n\nfunc HandleLogin() string {\n\t_ = \"secretNeedle\"\n\t_ = \"secretNeedle\"\n\t_ = \"secretNeedle\"\n\t_ = \"secretNeedle\"\n\t_ = \"secretNeedle\"\n\treturn \"secretNeedle\"\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "handler.go")
+	run("commit", "-m", "Add login handler\n\nChange-Id: I1111111111111111111111111111111111111111")
+
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	rec, err := d.EnsureRepo(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := vcs.Open(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err := repo.Changes()
+	if err != nil || len(changes) == 0 {
+		t.Fatalf("expected changes, got %v", err)
+	}
+	c := changes[0]
+
+	th1, _, err := AddComment(d, repo, rec.ID, c, c.Rev, "handler.go", "R", 3, 3, "alice", "Check secretNeedle validation", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.AddMessage(th1.ID, "carol", "Follow-up reply on same thread", false); err != nil {
+		t.Fatal(err)
+	}
+	th2, _, err := AddComment(d, repo, rec.ID, c, c.Rev, "handler.go", "R", 4, 4, "bob", "Looks resolved already", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetResolved(th2.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	runSearch := func(q string) *CodeSearchResult {
+		t.Helper()
+		res, err := CodeSearch(context.Background(), CodeSearchOptions{
+			DB:           d,
+			Repo:         repo,
+			RepoID:       rec.ID,
+			Change:       c,
+			BaseRev:      c.Parent,
+			TargetRev:    c.Rev,
+			IsLiveTarget: true,
+			Query:        q,
+		})
+		if err != nil {
+			t.Fatalf("CodeSearch(%q): %v", q, err)
+		}
+		return res
+	}
+
+	// 1. Quick Open via f: returns matching repo files (including unchanged files).
+	resFiles := runSearch("f:token")
+	if len(resFiles.Files) != 2 {
+		t.Fatalf("f:token expected 2 files, got %+v", resFiles.Files)
+	}
+
+	// 2. Symbol search via method: + p: finds TokenStore.VerifyToken in unchanged pkg/auth.
+	resSyms := runSearch("method:Verify p:auth")
+	if len(resSyms.Symbols) != 1 || resSyms.Symbols[0].Name != "TokenStore.VerifyToken" || resSyms.Symbols[0].Kind != "method" {
+		t.Fatalf("method:Verify p:auth expected TokenStore.VerifyToken, got %+v", resSyms.Symbols)
+	}
+
+	// 3. Repo-wide code search with -f:_test ranks changed file first and excludes tests.
+	resCode := runSearch("secretNeedle -f:_test")
+	if len(resCode.Code) != 2 {
+		t.Fatalf("expected 2 non-test code files, got %+v", resCode.Code)
+	}
+	if resCode.Code[0].Path != "handler.go" || !resCode.Code[0].InChange {
+		t.Errorf("expected changed handler.go first, got %+v", resCode.Code[0])
+	}
+	if resCode.Code[1].Path != "pkg/auth/token.go" || resCode.Code[1].InChange {
+		t.Errorf("expected unchanged pkg/auth/token.go second, got %+v", resCode.Code[1])
+	}
+	if len(resCode.Comments) != 1 || resCode.Comments[0].Author != "alice" {
+		t.Errorf("expected default search to also include matching comment by alice, got %+v", resCode.Comments)
+	}
+
+	// 4. Scoped comment search with author: & is:unresolved, plus deduplicated is:unresolved listing.
+	resComments := runSearch("in:comments is:unresolved author:alice")
+	if len(resComments.Comments) != 1 || resComments.Comments[0].Author != "alice" || resComments.Comments[0].Resolved {
+		t.Fatalf("expected 1 unresolved comment by alice, got %+v", resComments.Comments)
+	}
+	if len(resComments.Code) != 0 || len(resComments.Files) != 0 {
+		t.Errorf("expected in:comments not to return code/files, got code=%d files=%d", len(resComments.Code), len(resComments.Files))
+	}
+	resUnres := runSearch("is:unresolved")
+	if len(resUnres.Comments) != 1 || resUnres.Comments[0].ThreadID != th1.ID {
+		t.Fatalf("expected multi-message unresolved thread deduplicated to 1 hit, got %+v", resUnres.Comments)
+	}
+
+	// 5. in:change restricts search to modified files only.
+	resInChange := runSearch("in:change secretNeedle")
+	if len(resInChange.Code) != 1 || resInChange.Code[0].Path != "handler.go" {
+		t.Errorf("expected in:change to return only handler.go, got %+v", resInChange.Code)
+	}
+
+	// 6. Code Search style qualified Go symbol queries (pkg.Sym, src-trimmed import path, fields, interface methods, module path).
+	resQualBare := runSearch(`"net/http.Server"`)
+	if len(resQualBare.Symbols) == 0 || resQualBare.Symbols[0].Name != "Server" || resQualBare.Symbols[0].Kind != "struct" || resQualBare.Symbols[0].Path != "src/net/http/server.go" {
+		t.Fatalf("expected \"net/http.Server\" to rank struct Server #1, got %+v", resQualBare.Symbols)
+	}
+	resQualUnquoted := runSearch(`net/http.Server`)
+	if len(resQualUnquoted.Symbols) == 0 || resQualUnquoted.Symbols[0].Name != "Server" || resQualUnquoted.Symbols[0].Path != "src/net/http/server.go" {
+		t.Fatalf("expected unquoted net/http.Server to rank struct Server #1, got %+v", resQualUnquoted.Symbols)
+	}
+	resQualSym := runSearch(`s:^net/http\.Server$`)
+	if len(resQualSym.Symbols) != 1 || resQualSym.Symbols[0].Name != "Server" {
+		t.Fatalf("expected s:^net/http\\.Server$ to match only Server, got %+v", resQualSym.Symbols)
+	}
+	resQualMethod := runSearch(`s:net/http.Server.ServeHTTP`)
+	if len(resQualMethod.Symbols) != 1 || resQualMethod.Symbols[0].Name != "Server.ServeHTTP" {
+		t.Fatalf("expected s:net/http.Server.ServeHTTP to match Server.ServeHTTP, got %+v", resQualMethod.Symbols)
+	}
+	resQualField := runSearch(`field:net/http.Server.ReadTimeout`)
+	if len(resQualField.Symbols) != 1 || resQualField.Symbols[0].Name != "Server.ReadTimeout" || resQualField.Symbols[0].Kind != "field" {
+		t.Fatalf("expected field:net/http.Server.ReadTimeout to match ReadTimeout field, got %+v", resQualField.Symbols)
+	}
+	resIfaceMethod := runSearch(`method:http.Handler.ServeHTTP`)
+	if len(resIfaceMethod.Symbols) != 1 || resIfaceMethod.Symbols[0].Name != "Handler.ServeHTTP" {
+		t.Fatalf("expected method:http.Handler.ServeHTTP to match Handler.ServeHTTP, got %+v", resIfaceMethod.Symbols)
+	}
+	resModQual := runSearch(`s:example.com/myrepo/pkg/auth.TokenStore.VerifyToken`)
+	if len(resModQual.Symbols) != 1 || resModQual.Symbols[0].Name != "TokenStore.VerifyToken" {
+		t.Fatalf("expected module-qualified symbol query to match TokenStore.VerifyToken, got %+v", resModQual.Symbols)
+	}
+	resNegFirst := runSearch(`-s:Handler s:Server`)
+	if len(resNegFirst.Symbols) == 0 || resNegFirst.Symbols[0].Name != "Server" {
+		t.Fatalf("expected -s:Handler s:Server to rank exact Server #1, got %+v", resNegFirst.Symbols)
+	}
+	resModPkg := runSearch(`p:example.com/myrepo/pkg/auth secretNeedle`)
+	if len(resModPkg.Code) == 0 || resModPkg.Code[0].Path != "pkg/auth/token.go" {
+		t.Fatalf("expected module-qualified p: filter to work in code search, got %+v", resModPkg.Code)
+	}
+	resModPkgFiles := runSearch(`p:example.com/myrepo/pkg/auth`)
+	if len(resModPkgFiles.Files) != 2 {
+		t.Fatalf("expected module-qualified p: filter to find 2 files in pkg/auth, got %+v", resModPkgFiles.Files)
+	}
 }

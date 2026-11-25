@@ -25,6 +25,7 @@ import (
 	"nicholas.sh/cmd/review/internal/db"
 	"nicholas.sh/cmd/review/internal/diff"
 	"nicholas.sh/cmd/review/internal/engine"
+	"nicholas.sh/cmd/review/internal/gosym"
 	"nicholas.sh/cmd/review/internal/vcs"
 )
 
@@ -22486,5 +22487,443 @@ func TestTimestampsAndRoundContext(t *testing.T) {
 		if !strings.Contains(buf.String(), `<time class="commit-time rel-time"`) {
 			t.Errorf("expected commit-time on %s", path)
 		}
+	}
+}
+
+func TestServerCodeSearchAndFilePreview(t *testing.T) {
+	srv, ts, d, repoDir := setupTestServer(t)
+	defer srv.broker.Close()
+	defer ts.Close()
+	defer d.Close()
+
+	// Add an unchanged base file in a subdirectory by creating a second commit on top.
+	if err := os.MkdirAll(filepath.Join(repoDir, "util"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "util", "helper.go"), []byte("package util\n\nfunc ComputeAnswer() int {\n\treturn 42\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+		}
+	}
+	runGit("add", "util/helper.go")
+	runGit("commit", "-m", "Add helper\n\nChange-Id: I5555555555555555555555555555555555555555")
+
+	rec, err := d.EnsureRepo(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := vcs.Open(repoDir, srv.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err := repo.Changes()
+	if err != nil || len(changes) == 0 {
+		t.Fatalf("expected changes, got %v", err)
+	}
+	c := changes[0]
+
+	if _, _, err := engine.AddComment(d, repo, rec.ID, c, c.Rev, "util/helper.go", "R", 3, 3, "reviewer", "Check ComputeAnswer edge case", false, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. /api/search returns symbols, comments with timestamps & <mark>, and syntax-highlighted code lines.
+	resp, err := http.Get(fmt.Sprintf("%s/api/search?repo=%s&change=%s&q=%s", ts.URL, rec.Slug, c.Key, url.QueryEscape("ComputeAnswer")))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/search failed: %v", err)
+	}
+	var searchRes apiSearchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&searchRes); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if len(searchRes.Symbols) == 0 || searchRes.Symbols[0].Name != "ComputeAnswer" {
+		t.Errorf("expected ComputeAnswer symbol, got %+v", searchRes.Symbols)
+	}
+	if len(searchRes.Comments) != 1 || !strings.Contains(searchRes.Comments[0].SnippetHTML, `<mark class="cs-match">ComputeAnswer</mark>`) || searchRes.Comments[0].RelTime == "" {
+		t.Errorf("expected highlighted comment with timestamp, got %+v", searchRes.Comments)
+	}
+	if len(searchRes.Code) == 0 || !strings.Contains(searchRes.Code[0].Lines[0].LineHTML, `<mark class="cs-match">`) {
+		t.Errorf("expected highlighted code line, got %+v", searchRes.Code)
+	}
+
+	// 2. Repo-level /api/search (without change param) searches repo files and repo comments.
+	respRepo, err := http.Get(fmt.Sprintf("%s/api/search?repo=%s&q=%s", ts.URL, rec.Slug, url.QueryEscape("f:hello.go")))
+	if err != nil || respRepo.StatusCode != http.StatusOK {
+		t.Fatalf("GET repo /api/search failed: %v", err)
+	}
+	var repoRes apiSearchResponse
+	if err := json.NewDecoder(respRepo.Body).Decode(&repoRes); err != nil {
+		t.Fatal(err)
+	}
+	_ = respRepo.Body.Close()
+	if len(repoRes.Files) != 1 || repoRes.Files[0].Path != "hello.go" {
+		t.Errorf("expected repo Quick Open to find hello.go, got %+v", repoRes.Files)
+	}
+
+	// 3. /api/file/preview returns highlighted snippet with Active line for floating popup display.
+	respPrev, err := http.Get(fmt.Sprintf("%s/api/file/preview?repo=%s&change=%s&path=util/helper.go&line=3", ts.URL, rec.Slug, c.Key))
+	if err != nil || respPrev.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/file/preview failed: %v", err)
+	}
+	var prevRes gosym.Result
+	if err := json.NewDecoder(respPrev.Body).Decode(&prevRes); err != nil {
+		t.Fatal(err)
+	}
+	_ = respPrev.Body.Close()
+	if !prevRes.Found || prevRes.DefPath != "util/helper.go" || prevRes.DefLine != 3 || len(prevRes.Snippet) < 3 || !prevRes.Snippet[2].Active {
+		t.Fatalf("unexpected /api/file/preview result: %+v", prevRes)
+	}
+
+	// 4. Change toolbar replaces old #changeSearchInput with #codeSearchBtn ("Search" + icon),
+	// while header keeps #wsToggleBtn directly to the left of #syntaxToggleBtn (no header Search button).
+	respPage, err := http.Get(fmt.Sprintf("%s/r/%s/c/%s", ts.URL, rec.Slug, c.Key))
+	if err != nil || respPage.StatusCode != http.StatusOK {
+		t.Fatalf("GET change failed: %v", err)
+	}
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(respPage.Body)
+	_ = respPage.Body.Close()
+	htmlStr := buf.String()
+	if strings.Contains(htmlStr, `id="changeSearchInput"`) {
+		t.Errorf("expected unused #changeSearchInput to be removed")
+	}
+	headerEnd := strings.Index(htmlStr, `</header>`)
+	if headerEnd != -1 && strings.Contains(htmlStr[:headerEnd], `id="codeSearchBtn"`) {
+		t.Errorf("expected #codeSearchBtn in change toolbar, not in app header")
+	}
+	toolbarIdx := strings.Index(htmlStr, `class="change-toolbar"`)
+	csIdx := strings.Index(htmlStr, `id="codeSearchBtn"`)
+	wsIdx := strings.Index(htmlStr, `id="wsToggleBtn"`)
+	synIdx := strings.Index(htmlStr, `id="syntaxToggleBtn"`)
+	if toolbarIdx == -1 || csIdx == -1 || csIdx < toolbarIdx {
+		t.Errorf("expected #codeSearchBtn inside change toolbar, got toolbar=%d cs=%d", toolbarIdx, csIdx)
+	}
+	if wsIdx == -1 || synIdx == -1 || !(wsIdx < synIdx) {
+		t.Errorf("expected #wsToggleBtn left of #syntaxToggleBtn, got %d, %d", wsIdx, synIdx)
+	}
+}
+
+func TestUI_FloatingPopupCodeSearchButton(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available")
+	}
+	script := `
+const fs = require("fs");
+const vm = require("vm");
+const path = require("path");
+const code = fs.readFileSync(path.join("static", "app.js"), "utf8");
+
+function makeEl(tag) {
+  const listeners = {};
+  const attrs = {};
+  const clsSet = new Set();
+  const el = {
+    tagName: (tag || "DIV").toUpperCase(),
+    id: "",
+    value: "",
+    children: [],
+    parentElement: null,
+    style: {},
+    scrollTop: 0,
+    scrollLeft: 0,
+    isConnected: true,
+    _innerHTML: "",
+    get className() { return Array.from(clsSet).join(" "); },
+    set className(v) {
+      clsSet.clear();
+      String(v || "").split(/\s+/).filter(Boolean).forEach(c => clsSet.add(c));
+    },
+    classList: {
+      add(...cs) { cs.forEach(c => clsSet.add(c)); },
+      remove(...cs) { cs.forEach(c => clsSet.delete(c)); },
+      contains(c) { return clsSet.has(c); },
+    },
+    setAttribute(k, v) {
+      attrs[k] = String(v);
+      if (k === "class") this.className = v;
+      if (k === "id") this.id = String(v);
+    },
+    getAttribute(k) {
+      if (k === "id") return this.id || null;
+      return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null;
+    },
+    hasAttribute(k) { return Object.prototype.hasOwnProperty.call(attrs, k); },
+    removeAttribute(k) { delete attrs[k]; },
+    appendChild(child) {
+      child.parentElement = this;
+      this.children.push(child);
+      return child;
+    },
+    remove() {
+      this.isConnected = false;
+      if (this.parentElement) {
+        const i = this.parentElement.children.indexOf(this);
+        if (i >= 0) this.parentElement.children.splice(i, 1);
+        this.parentElement = null;
+      }
+    },
+    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+    dispatch(type, evt) {
+      (listeners[type] || []).forEach(fn => fn(evt));
+    },
+    focus() {},
+    select() {},
+    getBoundingClientRect() { return { left: 100, top: 100, right: 200, bottom: 120, width: 100, height: 20 }; },
+    closest(sel) {
+      let cur = this;
+      const parts = sel.split(",").map(s => s.trim());
+      while (cur) {
+        for (const p of parts) {
+          if (p.startsWith(".") && cur.classList && cur.classList.contains(p.slice(1))) return cur;
+          if (p.startsWith("[") && p.endsWith("]")) {
+            const inner = p.slice(1, -1);
+            const eq = inner.indexOf("=");
+            if (eq >= 0) {
+              const k = inner.slice(0, eq);
+              const v = inner.slice(eq + 1).replace(/^"|"$/g, "");
+              if (cur.getAttribute && cur.getAttribute(k) === v) return cur;
+            } else if (cur.hasAttribute && cur.hasAttribute(inner)) {
+              return cur;
+            }
+          }
+        }
+        cur = cur.parentElement;
+      }
+      return null;
+    },
+    querySelector(sel) {
+      if (sel === ".sym-btn-search" && this._innerHTML.includes("sym-btn-search")) {
+        const b = makeEl("BUTTON");
+        b.className = "sym-btn-action sym-btn-search";
+        b.setAttribute("data-action", "search");
+        b.parentElement = this;
+        return b;
+      }
+      if (sel === ".sym-btn-back" && this._innerHTML.includes("sym-btn-back")) {
+        const b = makeEl("BUTTON");
+        b.className = "sym-btn-back";
+        b.parentElement = this;
+        return b;
+      }
+      if (sel === ".cs-search-input" && this._innerHTML.includes("cs-search-input")) {
+        if (!this._csInput) {
+          this._csInput = makeEl("INPUT");
+          this._csInput.className = "cs-search-input";
+          this._csInput.parentElement = this;
+        }
+        return this._csInput;
+      }
+      if (sel === ".cs-results" && this._innerHTML.includes("cs-results")) {
+        if (!this._csResults) {
+          this._csResults = makeEl("DIV");
+          this._csResults.className = "cs-results";
+          this._csResults.parentElement = this;
+        }
+        return this._csResults;
+      }
+      for (const ch of this.children) {
+        const found = ch.querySelector(sel);
+        if (found) return found;
+      }
+      return null;
+    },
+    querySelectorAll() { return []; },
+  };
+  Object.defineProperty(el, "innerHTML", {
+    get() { return el._innerHTML; },
+    set(v) { el._innerHTML = String(v || ""); el._csInput = null; el._csResults = null; },
+  });
+  return el;
+}
+
+const body = makeEl("BODY");
+const docEl = makeEl("HTML");
+docEl.setAttribute("data-state-repo", "myrepo");
+docEl.setAttribute("data-state-change", "chg1");
+
+const docListeners = {};
+const doc = {
+  documentElement: docEl,
+  body,
+  hidden: false,
+  activeElement: body,
+  createElement: makeEl,
+  getElementById: () => null,
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener(type, fn) { (docListeners[type] = docListeners[type] || []).push(fn); },
+  dispatch(type, evt) { (docListeners[type] || []).forEach(fn => fn(evt)); },
+};
+
+const win = {
+  document: doc,
+  location: { pathname: "/r/myrepo/c/chg1", search: "", hash: "", href: "" },
+  innerWidth: 1280,
+  innerHeight: 800,
+  scrollX: 0,
+  scrollY: 0,
+  URLSearchParams,
+  AbortController,
+  localStorage: { getItem: () => null, setItem() {} },
+  addEventListener() {},
+  fetch: async () => ({
+    ok: true,
+    json: async () => ({
+      query: "Foo",
+      files: [{ path: "foo.go", in_change: true }],
+      symbols: [{ name: "Foo", kind: "func", path: "foo.go", line: 10, col: 5 }],
+      comments: [],
+      code: [],
+      total_code: 0,
+    }),
+  }),
+};
+win.window = win;
+
+const ctx = vm.createContext({
+  window: win,
+  document: doc,
+  localStorage: win.localStorage,
+  URLSearchParams,
+  AbortController,
+  fetch: win.fetch,
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+  console,
+});
+vm.runInContext(code, ctx);
+
+(async () => {
+  // 1. Standalone openCodeSearchPopup spawns dead-center in viewport, starts unpinned, and hides redundant search button.
+  win.scrollY = 200;
+  const inst = win.openCodeSearchPopup("Foo");
+  if (!inst || !inst.contentEl.innerHTML.includes("cs-search-input")) {
+    throw new Error("expected floating popup to render .cs-search-input");
+  }
+  if (win.isPopupPersistent(inst)) {
+    throw new Error("expected newly spawned Code Search popup to start unpinned");
+  }
+  // Viewport is 1280x800, scrollY=200, popupW=680, fallback height=320 -> left=300px, top=200+(800-320)/2=440px.
+  if (inst.el.style.left !== "300px" || inst.el.style.top !== "440px") {
+    throw new Error("expected Code Search popup dead-center in viewport (300px, 440px), got (" + inst.el.style.left + ", " + inst.el.style.top + ")");
+  }
+  await new Promise(r => setTimeout(r, 30));
+  if (!inst.contentEl._csResults || !inst.contentEl._csResults.innerHTML.includes("foo.go")) {
+    throw new Error("expected Code Search results rendered for Foo");
+  }
+  if (inst.contentEl._csResults.innerHTML.includes("cs-item-jump") || inst.contentEl._csResults.innerHTML.includes("↗")) {
+    throw new Error("expected Code Search result rows not to render inconsistent diagonal jump arrows");
+  }
+  if (!inst.contentEl._csResults.innerHTML.includes("sym-group-header")) {
+    throw new Error("expected Code Search section headers to reuse .sym-group-header");
+  }
+  if (!inst.contentEl._csResults.innerHTML.includes("sym-list-inner")) {
+    throw new Error("expected Code Search results to wrap items in .sym-list-inner for horizontal scrolling");
+  }
+
+  // 1b. Clicking (pointerdown, including document capture) on .cs-search-input must NOT preventDefault or steal focus to popup container,
+  // and moving the mouse outside the popup must NOT blur the focused search input!
+  let popupFocused = false;
+  let prevented = false;
+  let inputBlurred = false;
+  inst.el.focus = () => { popupFocused = true; };
+  const fakeInput = makeEl("INPUT");
+  fakeInput.className = "cs-search-input";
+  fakeInput.parentElement = inst.el;
+  fakeInput.blur = () => { inputBlurred = true; };
+  const downEvt = {
+    button: 0,
+    clientX: 200,
+    clientY: 120,
+    target: fakeInput,
+    preventDefault() { prevented = true; },
+    stopPropagation() {},
+  };
+  doc.dispatch("pointerdown", downEvt);
+  inst.el.dispatch("pointerdown", downEvt);
+  if (prevented) {
+    throw new Error("expected pointerdown on .cs-search-input NOT to call preventDefault / start drag");
+  }
+  if (popupFocused) {
+    throw new Error("expected pointerdown on .cs-search-input NOT to steal focus to popup container");
+  }
+  doc.activeElement = fakeInput;
+  doc.dispatch("pointermove", { clientX: 5, clientY: 5 });
+  if (inputBlurred) {
+    throw new Error("expected pointermove outside popup NOT to blur focused .cs-search-input");
+  }
+  // Escape while .cs-search-input is focused still closes the popup even after mouse moved outside.
+  if (!win.triggerEscapeAction(fakeInput, {})) {
+    throw new Error("expected Escape on focused .cs-search-input to close search popup");
+  }
+  if (inst.el.isConnected !== false) {
+    throw new Error("expected standalone search popup to be closed after Escape");
+  }
+
+  // 1c. Navigating away (clicking outside) closes an unpinned Code Search popup automatically,
+  // whereas moving/resizing pins it so it stays open.
+  const unpinned = win.openCodeSearchPopup("");
+  doc.dispatch("pointerdown", { button: 0, clientX: 10, clientY: 10, target: body });
+  if (unpinned.el.isConnected !== false) {
+    throw new Error("expected clicking outside to auto-close unpinned Code Search popup");
+  }
+  const pinned = win.openCodeSearchPopup("");
+  pinned.moved = true;
+  doc.dispatch("pointerdown", { button: 0, clientX: 10, clientY: 10, target: body });
+  if (pinned.el.isConnected === false) {
+    throw new Error("expected moved Code Search popup to stay open when clicking outside");
+  }
+  win.closeAllSymbolPopups();
+
+  // 2. Symbol popup header always includes .sym-btn-search, and clicking it switches to Code Search with Back button!
+  const symInst = win.openCodeSearchPopup();
+  symInst.history = [];
+  symInst.currentState = {
+    kind: "def",
+    data: { found: true, in_repo: true, def_path: "a.go", display_path: "a.go", def_line: 1, symbol_name: "Bar" },
+    ctx: { repo: "myrepo", change: "chg1", side: "R", base: "parent", target: "live", leftRev: "a", rightRev: "b" },
+  };
+  // Trigger click on .sym-btn-search inside popup
+  const fakeSearchBtn = makeEl("BUTTON");
+  fakeSearchBtn.className = "sym-btn-action sym-btn-search";
+  fakeSearchBtn.setAttribute("data-action", "search");
+  symInst.el.dispatch("click", { target: fakeSearchBtn, preventDefault() {}, stopPropagation() {} });
+  if (symInst.currentState.kind !== "search") {
+    throw new Error("expected clicking .sym-btn-search to switch popup to search view");
+  }
+  if (symInst.history.length !== 1 || symInst.history[0].kind !== "def") {
+    throw new Error("expected previous symbol def pushed to popup history");
+  }
+  if (!symInst.contentEl.innerHTML.includes("sym-btn-back")) {
+    throw new Error("expected Back button when entering Code Search from symbol popup");
+  }
+  // Clicking Back returns to symbol def view (which has .sym-btn-search again!)
+  const fakeBackBtn = makeEl("BUTTON");
+  fakeBackBtn.className = "sym-btn-back";
+  symInst.el.dispatch("click", { target: fakeBackBtn, preventDefault() {}, stopPropagation() {} });
+  if (symInst.currentState.kind !== "def") {
+    throw new Error("expected Back button to restore symbol def view");
+  }
+  if (!symInst.contentEl.innerHTML.includes("sym-btn-search")) {
+    throw new Error("expected restored symbol popup header to include .sym-btn-search");
+  }
+})().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+`
+	cmd := exec.Command(nodeBin, "-e", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("TestUI_FloatingPopupCodeSearchButton failed: %v\n%s", err, string(out))
 	}
 }

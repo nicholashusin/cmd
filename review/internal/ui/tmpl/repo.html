@@ -16,7 +16,11 @@
         <h2>{{.Record.Slug}}</h2>
         <span class="repo-path">{{.Record.RootPath}}</span>
       </div>
-      <div>
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <button type="button" id="codeSearchBtn" class="btn btn-sm code-search-trigger-btn" onclick="openCodeSearchPopup()" title="Code Search &amp; Quick Open (/ or Cmd/Ctrl+K)">
+          <span>Search</span>
+          <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"></circle><line x1="10.5" y1="10.5" x2="14" y2="14"></line></svg>
+        </button>
         <button class="btn btn-sm btn-danger" onclick="forgetRepo('{{.Record.Slug}}')">Forget Repo</button>
       </div>
     </div>

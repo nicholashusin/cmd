@@ -30,6 +30,10 @@
     {{if eq .CtxParam "all"}}Context View{{else}}Full file{{end}}
   </a>
   {{end}}
+  <button type="button" id="codeSearchBtn" class="btn btn-sm code-search-trigger-btn" onclick="openCodeSearchPopup()" title="Code Search &amp; Quick Open (/ or Cmd/Ctrl+K)">
+    <span>Search</span>
+    <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"></circle><line x1="10.5" y1="10.5" x2="14" y2="14"></line></svg>
+  </button>
   <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}?diffs=all&base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{.CtxParam}}" class="btn btn-sm" title="View all file diffs together">
     All Diffs
   </a>

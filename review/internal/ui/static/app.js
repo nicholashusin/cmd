@@ -1365,6 +1365,11 @@
     }
   }
 
+  function isPopupFormControl(el) {
+    if (!el || !el.closest) return false;
+    return !!el.closest('input, textarea, select, label, [contenteditable="true"], .cs-search-input, .cs-search-input-wrap');
+  }
+
   function blurFocusedPopupIfAny() {
     const ae = document.activeElement;
     if (ae && ae.closest && ae.closest('.symbol-popup') && ae.blur) {
@@ -1373,6 +1378,13 @@
   }
 
   function getFocusedSymbolPopup(activeEl) {
+    if (activeEl && activeEl.closest && isPopupFormControl(activeEl)) {
+      const inputPopup = activeEl.closest('.symbol-popup');
+      if (inputPopup) {
+        const match = openSymbolPopups.find(p => p && p.el === inputPopup);
+        if (match) return match;
+      }
+    }
     if (activePopupInst && openSymbolPopups.includes(activePopupInst)) {
       return activePopupInst;
     }
@@ -1464,7 +1476,8 @@
     if (activeEl) {
       const tag = activeEl.tagName;
       const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (activeEl.isContentEditable === true);
-      if (isInput) {
+      const isPopupSearchInput = !!(activeEl.classList && activeEl.classList.contains('cs-search-input'));
+      if (isInput && !isPopupSearchInput) {
         if (activeEl.blur) activeEl.blur();
         return true;
       }
@@ -1620,7 +1633,9 @@
           dismissUnpinnedPopupsExcept(inst);
         }
         activePopupInst = inst;
-        if (inst.el && inst.el.focus) inst.el.focus({ preventScroll: true });
+        if (!isPopupFormControl(targetEl) && inst.el && inst.el.focus) {
+          inst.el.focus({ preventScroll: true });
+        }
         return;
       }
     }
@@ -1637,7 +1652,12 @@
     lastPointerY = e.clientY;
     const topInst = findTopmostPopupAtPoint(e.clientX, e.clientY);
     activePopupInst = topInst || null;
-    if (!topInst) blurFocusedPopupIfAny();
+    if (!topInst) {
+      const ae = document.activeElement;
+      if (!(ae && ae.closest && ae.closest('.symbol-popup') && isPopupFormControl(ae))) {
+        blurFocusedPopupIfAny();
+      }
+    }
   }, { passive: true, capture: true });
 
   const chunkNavState = { el: null, scrollY: -1 };
@@ -4646,6 +4666,10 @@
       inst.listAbort.abort();
       inst.listAbort = null;
     }
+    if (inst._searchTimer) {
+      clearTimeout(inst._searchTimer);
+      inst._searchTimer = null;
+    }
 
     const idx = openSymbolPopups.indexOf(inst);
     if (idx !== -1) {
@@ -4691,11 +4715,13 @@
     return !!(popupOrInst && popupOrInst.classList && popupOrInst.classList.contains('sym-shaded'));
   }
 
-  function renderPopupWindowControlsHtml(popupOrInst) {
+  function renderPopupWindowControlsHtml(popupOrInst, opts) {
     const shaded = isInstShaded(popupOrInst);
     const glyph = shaded ? '+' : '−';
     const label = shaded ? 'Unshade popup' : 'Shade popup';
-    return `<button type="button" class="sym-btn-shade" title="${label}" aria-label="${label}" aria-expanded="${shaded ? 'false' : 'true'}">${glyph}</button><button type="button" class="sym-btn-close" aria-label="Close">×</button>`;
+    const hideSearch = !!(opts && opts.hideSearch);
+    const searchBtn = hideSearch ? '' : `<button type="button" class="sym-btn-action sym-btn-search" data-action="search" title="Code Search (f: s: p: in:comments)" aria-label="Code Search"><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"></circle><line x1="10.5" y1="10.5" x2="14" y2="14"></line></svg></button>`;
+    return `${searchBtn}<button type="button" class="sym-btn-shade" title="${label}" aria-label="${label}" aria-expanded="${shaded ? 'false' : 'true'}">${glyph}</button><button type="button" class="sym-btn-close" aria-label="Close">×</button>`;
   }
 
   function syncPopupShadeUI(popupOrInst) {
@@ -4767,6 +4793,10 @@
       inst.listAbort.abort();
       inst.listAbort = null;
     }
+    if (inst._searchTimer) {
+      clearTimeout(inst._searchTimer);
+      inst._searchTimer = null;
+    }
     if (inst.lookupAbort) {
       inst.lookupAbort.abort();
       inst.lookupAbort = null;
@@ -4780,10 +4810,12 @@
       renderImplsView(inst, prevState.data, prevState.ctx, prevState.scrollTop, prevState.scrollLeft);
     } else if (prevState.kind === 'move') {
       renderMovePopup(inst, prevState.data, prevState.ctx, prevState.scrollTop, canBack);
+    } else if (prevState.kind === 'search') {
+      renderSearchView(inst, prevState, prevState.scrollTop, prevState.scrollLeft);
     } else {
       renderSymbolPopup(inst, prevState.data, prevState.ctx, prevState.scrollTop, canBack);
     }
-    if (activePopupInst === inst && inst.el && inst.el.focus) {
+    if (prevState.kind !== 'search' && activePopupInst === inst && inst.el && inst.el.focus) {
       inst.el.focus({ preventScroll: true });
     }
     return true;
@@ -5244,12 +5276,20 @@
       }
       bringPopupToFront(inst);
       activePopupInst = inst;
-      if (inst.el && inst.el.focus) inst.el.focus({ preventScroll: true });
+
+      const isFormControl = isPopupFormControl(e.target);
+      if (!isFormControl && inst.el && inst.el.focus) {
+        inst.el.focus({ preventScroll: true });
+      }
 
       const resizeHandle = e.target.closest ? e.target.closest('.sym-resize-handle') : null;
       if (resizeHandle) {
         const dir = (resizeHandle.getAttribute && resizeHandle.getAttribute('data-resize-dir')) || '';
         startResize(e, resizeHandle, dir);
+        return;
+      }
+
+      if (isFormControl) {
         return;
       }
 
@@ -5278,7 +5318,7 @@
       }
 
       // b) Interactive rows or inline links/tokens
-      if (e.target.closest && e.target.closest('.sym-ref-row, .sym-impl-row, [data-resolve-sym], a[href], span[class*="tok-"], [class*="tok-"], code, mark')) {
+      if (e.target.closest && e.target.closest('.sym-ref-row, .sym-impl-row, [data-resolve-sym], .cs-item, .cs-file-group-hdr, [data-cs-kind], a[href], span[class*="tok-"], [class*="tok-"], code, mark')) {
         return;
       }
 
@@ -5791,6 +5831,7 @@
       }
 
       if (targetRow) {
+        dismissUnpinnedPopupsExcept(null);
         targetRow.scrollIntoView({ block: 'center' });
         flashDiffRows(targetRow, lookupSide);
         return;
@@ -5879,6 +5920,7 @@
     if (container) {
       const targetRow = container.querySelector(`tr.diff-row[data-line-r="${defLine}"]`);
       if (targetRow) {
+        dismissUnpinnedPopupsExcept(null);
         targetRow.scrollIntoView({ block: 'center' });
         flashDiffRows(targetRow, lookupSide);
         return;
@@ -6910,10 +6952,10 @@
         : locLabel;
       const locClass = defWillNav ? 'sym-popup-loc-link sym-will-nav' : 'sym-popup-loc-link';
       const locTitle = defWillNav ? 'Open definition in single-file view' : 'Jump to definition';
-      if (data.in_repo && data.def_line > 0) {
+      if (data.in_repo && data.def_line > 0 && stateCtx && stateCtx.change) {
         const href = buildInRepoJumpHref(stateCtx, data.def_path, data.def_line);
         headerLocHtml = `<a href="${href}" class="${locClass}" data-jump-def data-def-path="${escapeHtml(data.def_path)}" data-def-line="${data.def_line}" data-lookup-side="${stateCtx.side}" title="${locTitle}">${locInner}</a>`;
-      } else if (!data.in_repo && data.def_pkg && data.def_file && data.def_line > 0) {
+      } else if (!data.in_repo && data.def_pkg && data.def_file && data.def_line > 0 && stateCtx && stateCtx.change) {
         const extUrl = buildExtJumpHref(stateCtx, data.def_pkg, data.def_file, data.def_line, stateCtx.originPath);
         headerLocHtml = `<a href="${extUrl}" class="${locClass}" data-jump-def data-ext="true" data-pkg="${escapeHtml(data.def_pkg)}" data-file="${escapeHtml(data.def_file)}" data-def-line="${data.def_line}" data-lookup-side="${stateCtx.side}" title="${locTitle}">${locInner}</a>`;
       } else {
@@ -7121,6 +7163,635 @@
     if (typeof updateIdentOccurrences === 'function') updateIdentOccurrences();
   }
 
+  function getCodeSearchContext(inst) {
+    const existing = (inst && inst.currentState && inst.currentState.ctx) || null;
+    const sp = (typeof URLSearchParams === 'function' && window.location)
+      ? new URLSearchParams(window.location.search || '')
+      : null;
+    const overview = document.querySelector ? document.querySelector('.change-overview') : null;
+    const diffContainer = document.querySelector ? document.querySelector('.diff-container') : null;
+    const allFilesEl = document.querySelector ? document.querySelector('.diff-all-files') : null;
+    const countsEl = document.getElementById ? document.getElementById('changeCommentCounts') : null;
+
+    let repo = (existing && existing.repo) || pageStateRepo ||
+      (diffContainer && diffContainer.getAttribute('data-repo')) ||
+      (allFilesEl && allFilesEl.getAttribute('data-repo')) ||
+      (countsEl && countsEl.getAttribute('data-repo')) || '';
+    let change = (existing && existing.change) || pageStateChange ||
+      (diffContainer && diffContainer.getAttribute('data-change')) ||
+      (allFilesEl && allFilesEl.getAttribute('data-change')) ||
+      (countsEl && countsEl.getAttribute('data-change')) || '';
+    if (!repo && window.location && window.location.pathname) {
+      const m = window.location.pathname.match(/^\/r\/([^/]+)(?:\/c\/([^/]+))?/);
+      if (m) {
+        repo = decodeURIComponent(m[1]);
+        if (!change && m[2]) change = decodeURIComponent(m[2]);
+      }
+    }
+    const base = (existing && existing.base) || (countsEl && countsEl.getAttribute('data-base')) || (sp && sp.get('base')) || '';
+    const target = (existing && existing.target) || (countsEl && countsEl.getAttribute('data-target')) || (sp && sp.get('target')) || '';
+    const side = (existing && existing.side) || 'R';
+    const leftRev = (existing && existing.leftRev) ||
+      (diffContainer && diffContainer.getAttribute('data-left-rev')) ||
+      (overview && overview.getAttribute('data-left-rev')) || '';
+    const rightRev = (existing && existing.rightRev) ||
+      (diffContainer && diffContainer.getAttribute('data-right-rev')) ||
+      (overview && overview.getAttribute('data-right-rev')) || '';
+    const mode = (existing && existing.mode) || (typeof getCurrentPageDiffMode === 'function' ? getCurrentPageDiffMode() : '') || (sp && sp.get('mode')) || '';
+
+    return { repo, change, base, target, side, leftRev, rightRev, mode };
+  }
+
+  function renderSearchGuideHtml() {
+    return `<div class="cs-guide">
+      <code>f:path</code><span>Quick-open or filter files by path regex (<code>-f:_test</code> to exclude)</span>
+      <code>s:pkg.Sym</code><span>Go symbols — supports <code>net/http.Server</code>, <code>Type.Method</code>, <code>func:</code>, <code>method:</code>, <code>type:</code>, <code>field:</code></span>
+      <code>p:pkg</code><span>Filter by Go package or directory</span>
+      <code>in:comments</code><span>Search review threads (<code>author:</code>, <code>is:unresolved</code>, <code>is:draft</code>)</span>
+      <code>in:change</code><span>Restrict search to files modified in this change</span>
+      <code>"exact" /re/</code><span>Literal phrase, regex, <code>case:yes</code>, or <code>-negate</code></span>
+    </div>`;
+  }
+
+  function renderSearchResultsHtml(stateCtx, data) {
+    if (!data) {
+      return renderSearchGuideHtml();
+    }
+    const files = Array.isArray(data.files) ? data.files : [];
+    const symbols = Array.isArray(data.symbols) ? data.symbols : [];
+    const comments = Array.isArray(data.comments) ? data.comments : [];
+    const codeGroups = Array.isArray(data.code) ? data.code : [];
+
+    if (files.length === 0 && symbols.length === 0 && comments.length === 0 && codeGroups.length === 0) {
+      return `<div class="sym-list-empty">No matches for <code>${escapeHtml(data.query || '')}</code></div>`;
+    }
+
+    let html = '';
+
+    if (files.length > 0) {
+      html += `<div class="sym-group-header">Files (${files.length})</div>`;
+      for (const f of files) {
+        const chBadge = f.in_change ? '<span class="sym-count-badge">changed</span>' : '';
+        html += `<div class="cs-item" role="button" tabindex="0" data-cs-kind="file" data-path="${escapeHtml(f.path)}" data-line="1">` +
+          `<div class="cs-item-main"><span class="cs-item-loc">${escapeHtml(f.path)}</span></div>` +
+          (chBadge ? `<div class="cs-item-meta">${chBadge}</div>` : '') +
+        `</div>`;
+      }
+    }
+
+    if (symbols.length > 0) {
+      html += `<div class="sym-group-header">Symbols (${symbols.length})</div>`;
+      for (const s of symbols) {
+        const chBadge = s.in_change ? '<span class="sym-count-badge">changed</span>' : '';
+        const locStr = `${s.path}:${s.line}`;
+        html += `<div class="cs-item" role="button" tabindex="0" data-cs-kind="symbol" data-path="${escapeHtml(s.path)}" data-line="${s.line}" data-col="${s.col || 0}">` +
+          `<div class="cs-item-main">` +
+            `<span class="cs-sym-kind">${escapeHtml(s.kind || 'sym')}</span>` +
+            `<span class="cs-sym-name">${escapeHtml(s.name)}</span>` +
+            `<span class="cs-item-loc">${escapeHtml(locStr)}</span>` +
+            chBadge +
+            (s.signature ? `<span class="cs-sym-sig">${escapeHtml(s.signature)}</span>` : '') +
+          `</div>` +
+        `</div>`;
+      }
+    }
+
+    if (comments.length > 0) {
+      html += `<div class="sym-group-header">Comments (${comments.length})</div>`;
+      for (const cm of comments) {
+        let loc = cm.path;
+        if (cm.line > 0) {
+          loc += `:L${cm.line}`;
+          if (cm.end_line && cm.end_line > cm.line) loc += `–${cm.end_line}`;
+        }
+        let badges = '';
+        if (cm.snapshot_num > 0) {
+          badges += `<span class="badge badge-round badge-xs">S${escapeHtml(cm.snapshot_num)}</span>`;
+        }
+        if (cm.draft) {
+          badges += '<span class="badge badge-draft badge-xs">draft</span>';
+        } else if (cm.resolved) {
+          badges += '<span class="badge badge-reviewed badge-xs">resolved</span>';
+        } else {
+          badges += '<span class="badge badge-count-unresolved badge-xs">unresolved</span>';
+        }
+        const timeStr = cm.rel_time || (cm.updated_at ? formatRelativeTime(cm.updated_at) : '');
+        const metaRight = `${cm.author ? escapeHtml(cm.author) : ''}${timeStr ? ` · ${escapeHtml(timeStr)}` : ''}`;
+        html += `<div class="cs-item cs-comment-item" role="button" tabindex="0" data-cs-kind="comment" data-thread-id="${escapeHtml(cm.thread_id)}" data-message-id="${escapeHtml(cm.message_id)}" data-change="${escapeHtml(cm.change_key || '')}" data-path="${escapeHtml(cm.path)}" data-snapshot-num="${escapeHtml(cm.snapshot_num || 0)}" data-in-current-view="${cm.in_current_view ? 'true' : 'false'}">` +
+          `<div class="cs-comment-top">` +
+            `<div class="cs-item-main"><span class="cs-item-loc">${escapeHtml(loc)}</span>${badges}</div>` +
+            `<div class="cs-item-meta">${metaRight}</div>` +
+          `</div>` +
+          `<div class="cs-comment-snippet">${cm.snippet_html || ''}</div>` +
+        `</div>`;
+      }
+    }
+
+    if (codeGroups.length > 0) {
+      const countLabel = data.truncated ? `${data.total_code}+` : String(data.total_code);
+      html += `<div class="sym-group-header">Code (${countLabel})</div>`;
+      for (const grp of codeGroups) {
+        const chBadge = grp.in_change ? '<span class="sym-count-badge">changed</span>' : '';
+        const firstLine = grp.lines && grp.lines[0] ? grp.lines[0].line : 1;
+        html += `<div class="cs-file-group-hdr" role="button" tabindex="0" data-cs-kind="file" data-path="${escapeHtml(grp.path)}" data-line="${firstLine}">` +
+          `<span class="cs-item-loc">${escapeHtml(grp.path)}</span>` +
+          (chBadge ? `<span class="cs-item-meta">${chBadge}</span>` : '') +
+        `</div>`;
+        for (const ln of grp.lines) {
+          html += `<div class="cs-item cs-code-item" role="button" tabindex="0" data-cs-kind="code" data-path="${escapeHtml(grp.path)}" data-line="${ln.line}" data-col="${ln.col || 0}">` +
+            `<span class="cs-code-num">${ln.line}</span>` +
+            `<span class="cs-code-text">${ln.line_html}</span>` +
+          `</div>`;
+        }
+      }
+    }
+
+    return `<div class="sym-list-inner">${html}</div>`;
+  }
+
+  function setSearchActiveIndex(contentEl, idx) {
+    if (!contentEl || !contentEl.querySelectorAll) return -1;
+    const items = Array.from(contentEl.querySelectorAll('.cs-item'));
+    items.forEach(el => el.classList && el.classList.remove('cs-item-active'));
+    if (items.length === 0) return -1;
+    const clamped = Math.max(0, Math.min(idx, items.length - 1));
+    const target = items[clamped];
+    if (target) {
+      if (target.classList) target.classList.add('cs-item-active');
+      const resultsEl = contentEl.querySelector ? contentEl.querySelector('.cs-results') : null;
+      if (resultsEl && target.getBoundingClientRect && resultsEl.getBoundingClientRect) {
+        const tRect = target.getBoundingClientRect();
+        const rRect = resultsEl.getBoundingClientRect();
+        if (tRect.height > 0 && rRect.height > 0) {
+          if (tRect.top < rRect.top) {
+            resultsEl.scrollTop -= (rRect.top - tRect.top);
+          } else if (tRect.bottom > rRect.bottom) {
+            resultsEl.scrollTop += (tRect.bottom - rRect.bottom);
+          }
+        }
+      }
+    }
+    return clamped;
+  }
+
+  function runCodeSearchQuery(inst, query, immediate) {
+    if (!inst || !inst.currentState || inst.currentState.kind !== 'search') return;
+    const state = inst.currentState;
+    state.query = query;
+    const contentEl = getPopupContentEl(inst);
+    const resultsEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.cs-results') : null;
+    const clearBtn = contentEl && contentEl.querySelector ? contentEl.querySelector('.cs-search-clear') : null;
+    const truncEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.cs-trunc-bar') : null;
+    if (clearBtn && clearBtn.style) {
+      clearBtn.style.display = query ? '' : 'none';
+    }
+
+    if (inst._searchTimer) {
+      clearTimeout(inst._searchTimer);
+      inst._searchTimer = null;
+    }
+    if (inst.listAbort) {
+      inst.listAbort.abort();
+      inst.listAbort = null;
+    }
+
+    const trimmed = (query || '').trim();
+    if (!trimmed) {
+      state.data = null;
+      state.activeIdx = -1;
+      if (resultsEl) resultsEl.innerHTML = renderSearchGuideHtml();
+      if (truncEl && truncEl.style) truncEl.style.display = 'none';
+      return;
+    }
+
+    const execFetch = async () => {
+      inst._searchTimer = null;
+      if (!inst.currentState || inst.currentState !== state || !openSymbolPopups.includes(inst)) return;
+      const ctx = state.ctx || getCodeSearchContext(inst);
+      if (!ctx.repo) {
+        if (resultsEl) resultsEl.innerHTML = '<div class="sym-list-empty">Open a repository to search.</div>';
+        if (truncEl && truncEl.style) truncEl.style.display = 'none';
+        return;
+      }
+      if (resultsEl && !state.data) {
+        resultsEl.innerHTML = '<div class="sym-list-empty">Searching…</div>';
+      }
+      const params = new URLSearchParams({ repo: ctx.repo, q: trimmed });
+      if (ctx.change) params.set('change', ctx.change);
+      if (ctx.base) params.set('base', ctx.base);
+      if (ctx.target) params.set('target', ctx.target);
+      if (ctx.side) params.set('side', ctx.side);
+
+      const abort = new AbortController();
+      inst.listAbort = abort;
+      try {
+        const res = await fetch('/api/search?' + params.toString(), {
+          cache: 'no-store',
+          signal: abort.signal,
+        });
+        if (inst.listAbort === abort) inst.listAbort = null;
+        if (!inst.currentState || inst.currentState !== state || !openSymbolPopups.includes(inst)) return;
+        if (!res.ok) {
+          if (resultsEl) resultsEl.innerHTML = '<div class="sym-list-empty">Search failed.</div>';
+          if (truncEl && truncEl.style) truncEl.style.display = 'none';
+          return;
+        }
+        const data = await res.json();
+        if (!inst.currentState || inst.currentState !== state || !openSymbolPopups.includes(inst)) return;
+        state.data = data;
+        if (resultsEl) {
+          resultsEl.innerHTML = renderSearchResultsHtml(ctx, data);
+          resultsEl.scrollTop = 0;
+          resultsEl.scrollLeft = 0;
+        }
+        if (truncEl && truncEl.style) {
+          truncEl.style.display = data.truncated ? '' : 'none';
+        }
+        state.activeIdx = setSearchActiveIndex(contentEl, 0);
+      } catch (err) {
+        if (err && err.name === 'AbortError') return;
+        if (resultsEl && inst.currentState === state) {
+          resultsEl.innerHTML = '<div class="sym-list-empty">Search failed.</div>';
+        }
+        if (truncEl && truncEl.style && inst.currentState === state) {
+          truncEl.style.display = 'none';
+        }
+      }
+    };
+
+    if (immediate) {
+      execFetch();
+    } else {
+      inst._searchTimer = setTimeout(execFetch, 140);
+    }
+  }
+
+  function renderSearchView(popupOrInst, state, restoredScrollTop, restoredScrollLeft) {
+    const inst = resolvePopupInst(popupOrInst) || popupOrInst;
+    const contentEl = getPopupContentEl(inst);
+    if (!contentEl || !state) return;
+
+    const ctx = state.ctx || getCodeSearchContext(inst);
+    state.ctx = ctx;
+    const canBack = !!(inst.history && inst.history.length > 0);
+    const backBtnHtml = canBack ? `<button type="button" class="sym-btn-back" title="Back" aria-label="Back">←</button>` : '';
+    const scopeLabel = ctx.change
+      ? (ctx.side === 'L' ? `${ctx.repo} (base)` : ctx.repo)
+      : (ctx.repo || 'repo');
+    const queryVal = state.query || '';
+
+    const hints = ['f:', 's:', 'func:', 'type:', 'p:', 'in:comments', 'is:unresolved', 'in:change', 'case:yes'];
+    const hintsHtml = hints.map(h =>
+      `<button type="button" class="cs-hint-chip" data-cs-hint="${escapeHtml(h)}">${escapeHtml(h)}</button>`
+    ).join('');
+
+    const headerInnerHtml = `
+      ${backBtnHtml}
+      <div class="sym-popup-loc">Code Search in <code>${escapeHtml(scopeLabel)}</code></div>
+      <div class="sym-popup-actions">${renderPopupWindowControlsHtml(inst, { hideSearch: true })}</div>
+    `;
+
+    contentEl.innerHTML = `
+      <div class="sym-popup-header">${headerInnerHtml}</div>
+      <div class="cs-search-bar">
+        <div class="cs-search-input-wrap">
+          <input type="text" class="cs-search-input" value="${escapeHtml(queryVal)}" placeholder="Search files, symbols, comments, code… (f: s: p: in:comments)" autocomplete="off" spellcheck="false">
+          <button type="button" class="cs-search-clear" title="Clear search" aria-label="Clear search" style="${queryVal ? '' : 'display: none;'}">×</button>
+        </div>
+        <div class="cs-hints">${hintsHtml}</div>
+      </div>
+      <div class="cs-results">${renderSearchResultsHtml(ctx, state.data)}</div>
+      <div class="sym-snippet-trunc cs-trunc-bar" style="${state.data && state.data.truncated ? '' : 'display: none;'}">More matches omitted — narrow with f:, p:, s:, or -exclude</div>
+    `;
+
+    state.headerHtml = headerInnerHtml;
+    syncPopupShadeUI(inst);
+    ensurePopupMinWidth(inst);
+
+    const resultsEl = contentEl.querySelector ? contentEl.querySelector('.cs-results') : null;
+    if (resultsEl) {
+      if (typeof restoredScrollTop === 'number') {
+        resultsEl.scrollTop = restoredScrollTop;
+      }
+      if (typeof restoredScrollLeft === 'number') {
+        resultsEl.scrollLeft = restoredScrollLeft;
+      }
+    }
+    if (state.data && typeof state.activeIdx === 'number' && state.activeIdx >= 0) {
+      state.activeIdx = setSearchActiveIndex(contentEl, state.activeIdx);
+    }
+
+    const inputEl = contentEl.querySelector ? contentEl.querySelector('.cs-search-input') : null;
+    if (inputEl && inputEl.addEventListener) {
+      inputEl.addEventListener('input', () => {
+        runCodeSearchQuery(inst, inputEl.value, false);
+      });
+      inputEl.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown') {
+          if (e.preventDefault) e.preventDefault();
+          const next = (typeof state.activeIdx === 'number' ? state.activeIdx : -1) + 1;
+          state.activeIdx = setSearchActiveIndex(contentEl, next);
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          if (e.preventDefault) e.preventDefault();
+          const prev = (typeof state.activeIdx === 'number' ? state.activeIdx : 1) - 1;
+          state.activeIdx = setSearchActiveIndex(contentEl, prev);
+          return;
+        }
+        if (e.key === 'Enter') {
+          if (e.preventDefault) e.preventDefault();
+          const curTrimmed = (inputEl.value || '').trim();
+          if (inst._searchTimer || (curTrimmed && (!state.data || (state.data.query || '').trim() !== curTrimmed))) {
+            if (curTrimmed) {
+              runCodeSearchQuery(inst, inputEl.value, true);
+            }
+            return;
+          }
+          const active = contentEl.querySelector ? (contentEl.querySelector('.cs-item.cs-item-active') || contentEl.querySelector('.cs-item')) : null;
+          if (active) {
+            openSearchResultInPopup(inst, active);
+          } else if (curTrimmed) {
+            runCodeSearchQuery(inst, inputEl.value, true);
+          }
+          return;
+        }
+      });
+      if (inputEl.focus) {
+        inputEl.focus({ preventScroll: true });
+        if (inputEl.setSelectionRange && queryVal) {
+          inputEl.setSelectionRange(queryVal.length, queryVal.length);
+        }
+      }
+    }
+  }
+
+  async function openSearchResultInPopup(inst, itemEl) {
+    if (!inst || !itemEl || !inst.currentState) return;
+    const kind = itemEl.getAttribute('data-cs-kind') || '';
+    const baseState = inst.currentState;
+    const stateCtx = baseState.ctx || getCodeSearchContext(inst);
+    const contentEl = getPopupContentEl(inst);
+    const resultsEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.cs-results') : null;
+    if (resultsEl) {
+      baseState.scrollTop = resultsEl.scrollTop;
+      baseState.scrollLeft = resultsEl.scrollLeft || 0;
+    }
+
+    if (kind === 'comment') {
+      const threadId = itemEl.getAttribute('data-thread-id') || '';
+      const msgId = itemEl.getAttribute('data-message-id') || '';
+      const cmChange = itemEl.getAttribute('data-change') || '';
+      const cmPath = itemEl.getAttribute('data-path') || '';
+      const snapNum = parseInt(itemEl.getAttribute('data-snapshot-num') || '0', 10);
+      const inView = itemEl.getAttribute('data-in-current-view') !== 'false';
+      if (cmChange && stateCtx.change && cmChange === stateCtx.change && typeof jumpToUnresolvedThread === 'function') {
+        if (!isPopupPersistent(inst)) {
+          closeSpecificSymbolPopup(inst);
+        }
+        jumpToUnresolvedThread(threadId, cmPath, msgId, snapNum, inView);
+        return;
+      }
+      if (stateCtx.repo && cmChange) {
+        const hash = msgId ? `#thread-${threadId}-msg-${msgId}` : `#thread-${threadId}`;
+        window.location.href = `/r/${encodeURIComponent(stateCtx.repo)}/c/${encodeURIComponent(cmChange)}${hash}`;
+      }
+      return;
+    }
+
+    const filePath = itemEl.getAttribute('data-path') || '';
+    const lineNum = parseInt(itemEl.getAttribute('data-line') || '1', 10) || 1;
+    const colNum = parseInt(itemEl.getAttribute('data-col') || '0', 10) || 0;
+    if (!filePath || !stateCtx.repo) return;
+
+    if (inst._searchTimer) {
+      clearTimeout(inst._searchTimer);
+      inst._searchTimer = null;
+    }
+    if (inst._abortPendingNav) {
+      inst._abortPendingNav();
+      inst._abortPendingNav = null;
+    } else if (inst.listAbort) {
+      inst.listAbort.abort();
+      inst.listAbort = null;
+    }
+
+    const headerEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.sym-popup-header') : null;
+    const prevHeaderHtml = (baseState && baseState.headerHtml) || (headerEl ? headerEl.innerHTML : null);
+    const loadingHeaderHtml = `
+      <button type="button" class="sym-btn-back" title="Back" aria-label="Back">←</button>
+      <div class="sym-popup-loc" style="color: var(--muted); font-size: 11px;">Loading ${escapeHtml(filePath)}…</div>
+      <div class="sym-popup-actions">
+        ${renderPopupWindowControlsHtml(inst, { hideSearch: true })}
+      </div>
+    `;
+    if (headerEl) {
+      headerEl.innerHTML = loadingHeaderHtml;
+      syncPopupShadeUI(inst);
+    }
+
+    function restoreHeader() {
+      if (headerEl && prevHeaderHtml !== null) {
+        headerEl.innerHTML = prevHeaderHtml;
+        syncPopupShadeUI(inst);
+      }
+    }
+
+    const abort = new AbortController();
+    inst.listAbort = abort;
+    inst._abortPendingNav = () => {
+      if (inst.listAbort === abort) {
+        abort.abort();
+        inst.listAbort = null;
+      }
+      restoreHeader();
+    };
+
+    try {
+      let data = null;
+      let lookupParams = null;
+
+      // For Go symbols, try /api/symbol first so Signature, Refs, and Impls work immediately.
+      if (kind === 'symbol' && filePath.endsWith('.go') && stateCtx.change) {
+        const symParams = new URLSearchParams({
+          repo: stateCtx.repo,
+          change: stateCtx.change,
+          path: filePath,
+          side: stateCtx.side || 'R',
+          line: lineNum,
+          col: colNum,
+          left_rev: stateCtx.leftRev || '',
+          right_rev: stateCtx.rightRev || '',
+          base: stateCtx.base || '',
+          target: stateCtx.target || '',
+        });
+        const symRes = await fetch('/api/symbol?' + symParams.toString(), {
+          cache: 'no-store',
+          signal: abort.signal,
+        });
+        if (symRes.ok) {
+          const symJson = await symRes.json();
+          if (symJson && symJson.found) {
+            data = symJson;
+            lookupParams = symParams;
+          }
+        }
+      }
+
+      if (!data) {
+        const prevParams = new URLSearchParams({
+          repo: stateCtx.repo,
+          path: filePath,
+          line: lineNum,
+          side: stateCtx.side || 'R',
+        });
+        if (stateCtx.change) prevParams.set('change', stateCtx.change);
+        if (stateCtx.base) prevParams.set('base', stateCtx.base);
+        if (stateCtx.target) prevParams.set('target', stateCtx.target);
+
+        const prevRes = await fetch('/api/file/preview?' + prevParams.toString(), {
+          cache: 'no-store',
+          signal: abort.signal,
+        });
+        if (prevRes.ok) {
+          const prevJson = await prevRes.json();
+          if (prevJson && prevJson.found) {
+            data = prevJson;
+          }
+        }
+      }
+
+      if (inst.listAbort === abort) inst.listAbort = null;
+      inst._abortPendingNav = null;
+      if (!openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
+      if (!data) {
+        restoreHeader();
+        return;
+      }
+
+      inst.history.push(baseState);
+      inst.currentState = {
+        kind: 'def',
+        data: data,
+        ctx: stateCtx,
+        lookupParams: lookupParams,
+        scrollTop: 0,
+      };
+      renderSymbolPopup(inst, data, stateCtx, undefined, true);
+    } catch (err) {
+      if (inst.listAbort === abort) inst.listAbort = null;
+      inst._abortPendingNav = null;
+      if (err && err.name === 'AbortError') return;
+      restoreHeader();
+    }
+  }
+
+  function openCodeSearchInPopup(inst, initialQuery) {
+    if (!inst) return null;
+    if (inst.shaded) setPopupShaded(inst, false, false);
+    if (inst._searchTimer) {
+      clearTimeout(inst._searchTimer);
+      inst._searchTimer = null;
+    }
+    if (inst._abortPendingNav) {
+      inst._abortPendingNav();
+      inst._abortPendingNav = null;
+    } else if (inst.listAbort) {
+      inst.listAbort.abort();
+      inst.listAbort = null;
+    }
+
+    const contentEl = getPopupContentEl(inst);
+    if (inst.currentState && inst.currentState.kind !== 'search') {
+      const scroller = contentEl && contentEl.querySelector
+        ? (contentEl.querySelector('.sym-popup-snippet') || contentEl.querySelector('.sym-list-body'))
+        : null;
+      if (scroller) {
+        inst.currentState.scrollTop = scroller.scrollTop;
+        inst.currentState.scrollLeft = scroller.scrollLeft || 0;
+      }
+      inst.history.push(inst.currentState);
+    }
+
+    const ctx = getCodeSearchContext(inst);
+    const searchState = {
+      kind: 'search',
+      ctx: ctx,
+      query: initialQuery || '',
+      data: null,
+      scrollTop: 0,
+      activeIdx: -1,
+    };
+    inst.currentState = searchState;
+    bringPopupToFront(inst);
+    renderSearchView(inst, searchState, 0);
+    if (searchState.query.trim()) {
+      runCodeSearchQuery(inst, searchState.query, true);
+    }
+    return inst;
+  }
+
+  function centerPopupInViewport(inst) {
+    if (!inst || !inst.el || !inst.el.style) return;
+    const vw = (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1024;
+    const vh = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight || 768;
+    const scrollX = window.scrollX || 0;
+    const scrollY = window.scrollY || 0;
+    const popupW = inst.resizedW
+      ? (inst.el.offsetWidth || 680)
+      : Math.min(680, Math.max(360, vw - 32));
+    if (!inst.resizedW) {
+      inst.el.style.width = popupW + 'px';
+    }
+    const measuredH = inst.el.offsetHeight || 320;
+    const left = Math.max(12, Math.round(scrollX + (vw - popupW) / 2));
+    const topClearance = (typeof getPopupTopClearance === 'function')
+      ? getPopupTopClearance()
+      : ((typeof getFloatingTopClearance === 'function') ? getFloatingTopClearance() : 50);
+    const minTop = Math.round(scrollY + Math.max(12, topClearance + 6));
+    const centeredTop = Math.round(scrollY + (vh - measuredH) / 2);
+    const top = Math.max(minTop, centeredTop);
+    inst.el.style.left = left + 'px';
+    inst.el.style.top = top + 'px';
+  }
+
+  function openCodeSearchPopup(initialQuery, opts) {
+    opts = opts || {};
+    if (opts.inInst) {
+      return openCodeSearchInPopup(opts.inInst, initialQuery || '');
+    }
+
+    for (let i = openSymbolPopups.length - 1; i >= 0; i--) {
+      const existing = openSymbolPopups[i];
+      if (existing && existing.currentState && existing.currentState.kind === 'search') {
+        if (existing.shaded) setPopupShaded(existing, false, false);
+        if (!isPopupPersistent(existing)) {
+          centerPopupInViewport(existing);
+        }
+        bringPopupToFront(existing);
+        const inputEl = existing.contentEl && existing.contentEl.querySelector
+          ? existing.contentEl.querySelector('.cs-search-input')
+          : null;
+        if (inputEl) {
+          if (typeof initialQuery === 'string' && initialQuery !== '') {
+            inputEl.value = initialQuery;
+            runCodeSearchQuery(existing, initialQuery, true);
+          }
+          if (inputEl.focus) inputEl.focus({ preventScroll: true });
+          if (inputEl.select) inputEl.select();
+        }
+        return existing;
+      }
+    }
+
+    const inst = createPopupInstance(null, false, 'Code Search');
+    centerPopupInViewport(inst);
+    openCodeSearchInPopup(inst, initialQuery || '');
+    centerPopupInViewport(inst);
+    return inst;
+  }
+  window.openCodeSearchPopup = openCodeSearchPopup;
+
   function attachPopupClickHandler(inst) {
     if (!inst || !inst.el) return;
     const popup = inst.el;
@@ -7171,6 +7842,68 @@
         if (evt.preventDefault) evt.preventDefault();
         if (evt.stopPropagation) evt.stopPropagation();
         stepPopupBackOrCancel(inst);
+        return;
+      }
+
+      const searchBtn = evt.target.closest ? evt.target.closest('.sym-btn-search, [data-action="search"]') : null;
+      if (searchBtn) {
+        if (evt.preventDefault) evt.preventDefault();
+        if (evt.stopPropagation) evt.stopPropagation();
+        openCodeSearchInPopup(inst, '');
+        return;
+      }
+
+      const hintChip = evt.target.closest ? evt.target.closest('.cs-hint-chip') : null;
+      if (hintChip) {
+        if (evt.preventDefault) evt.preventDefault();
+        if (evt.stopPropagation) evt.stopPropagation();
+        const prefix = hintChip.getAttribute('data-cs-hint') || '';
+        const contentEl = getPopupContentEl(inst);
+        const inputEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.cs-search-input') : null;
+        if (inputEl && prefix) {
+          const cur = inputEl.value || '';
+          const sep = cur && !cur.endsWith(' ') ? ' ' : '';
+          const tail = prefix.endsWith(':') ? '' : ' ';
+          inputEl.value = cur + sep + prefix + tail;
+          if (inputEl.focus) inputEl.focus({ preventScroll: true });
+          if (inputEl.setSelectionRange) {
+            inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+          }
+          runCodeSearchQuery(inst, inputEl.value, !prefix.endsWith(':'));
+        }
+        return;
+      }
+
+      const clearSearchBtn = evt.target.closest ? evt.target.closest('.cs-search-clear') : null;
+      if (clearSearchBtn) {
+        if (evt.preventDefault) evt.preventDefault();
+        if (evt.stopPropagation) evt.stopPropagation();
+        const contentEl = getPopupContentEl(inst);
+        const inputEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.cs-search-input') : null;
+        if (inputEl) {
+          inputEl.value = '';
+          if (inputEl.focus) inputEl.focus({ preventScroll: true });
+          runCodeSearchQuery(inst, '', true);
+        }
+        return;
+      }
+
+      const searchWrap = evt.target.closest ? evt.target.closest('.cs-search-input-wrap') : null;
+      if (searchWrap && !(evt.target.closest && evt.target.closest('.cs-search-input'))) {
+        const inputEl = searchWrap.querySelector ? searchWrap.querySelector('.cs-search-input') : null;
+        if (inputEl && inputEl.focus) {
+          inputEl.focus({ preventScroll: true });
+        }
+        return;
+      }
+
+      const csItem = evt.target.closest ? evt.target.closest('[data-cs-kind]') : null;
+      if (csItem) {
+        const sel = window.getSelection ? window.getSelection() : null;
+        if (sel && !sel.isCollapsed) return;
+        if (evt.preventDefault) evt.preventDefault();
+        if (evt.stopPropagation) evt.stopPropagation();
+        openSearchResultInPopup(inst, csItem);
         return;
       }
 
@@ -7682,7 +8415,7 @@
         if (e.target.closest && (e.target.closest('.sym-caller-toggle') || e.target.closest('.sym-group-action-btn') || e.target.closest('.sym-caller-prefix'))) {
           return;
         }
-        const resolveBtn = e.target.closest ? e.target.closest('[data-resolve-sym]') : null;
+        const resolveBtn = e.target.closest ? e.target.closest('[data-resolve-sym], [data-cs-kind]') : null;
         if (resolveBtn) {
           if (e.preventDefault) e.preventDefault();
           resolveBtn.click();
@@ -8281,6 +9014,15 @@
       return;
     }
 
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && (e.key === 'k' || e.key === 'K')) {
+      const ctx = getCodeSearchContext(null);
+      if (ctx.repo) {
+        if (e.preventDefault) e.preventDefault();
+        openCodeSearchPopup('');
+        return;
+      }
+    }
+
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       const target = e.target || document.activeElement;
       const commentFormWrap = (target && target.closest) ? target.closest('.comment-form, .msg-edit-form') : null;
@@ -8332,11 +9074,10 @@
       return;
     }
     if (e.key === '/') {
-      const search = document.getElementById('changeSearchInput');
-      if (search) {
+      const ctx = getCodeSearchContext(null);
+      if (ctx.repo) {
         e.preventDefault();
-        search.focus();
-        search.select();
+        openCodeSearchPopup('');
       }
       return;
     }

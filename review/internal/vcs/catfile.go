@@ -356,14 +356,21 @@ func shouldSkipGoDir(name string) bool {
 	return name == "" || name[0] == '.' || name[0] == '_' || name == "testdata" || name == "vendor" || name == "node_modules"
 }
 
+// shouldSkipSearchDir skips VCS internals and massive vendored trees during repo-wide search.
+func shouldSkipSearchDir(name string) bool {
+	return name == "" || name == ".git" || name == ".jj" || name == ".hg" || name == ".svn" || name == "vendor" || name == "node_modules"
+}
+
 type treeChild struct {
 	name string
 	oid  string
 }
 
 type cachedSubtree struct {
-	subdirs []treeChild
-	goFiles []treeChild
+	subdirs       []treeChild
+	goFiles       []treeChild
+	searchSubdirs []treeChild
+	allFiles      []treeChild
 }
 
 const maxCachedSubtrees = 16384
@@ -412,10 +419,14 @@ func parseSubtree(buf []byte, hexSHA string) cachedSubtree {
 			if !shouldSkipGoDir(name) {
 				st.subdirs = append(st.subdirs, treeChild{name: name, oid: entrySHA})
 			}
+			if !shouldSkipSearchDir(name) {
+				st.searchSubdirs = append(st.searchSubdirs, treeChild{name: name, oid: entrySHA})
+			}
 		} else if mode == "160000" {
 			// Submodule gitlink: skip
-		} else {
-			if strings.HasSuffix(name, ".go") && len(name) > 0 && name[0] != '.' && name[0] != '_' {
+		} else if name != "" {
+			st.allFiles = append(st.allFiles, treeChild{name: name, oid: entrySHA})
+			if strings.HasSuffix(name, ".go") && name[0] != '.' && name[0] != '_' {
 				st.goFiles = append(st.goFiles, treeChild{name: name, oid: entrySHA})
 			}
 		}
@@ -426,6 +437,15 @@ func parseSubtree(buf []byte, hexSHA string) cachedSubtree {
 // ListGoFileBlobs recursively finds all .go files at rev along with their Git blob OIDs,
 // leveraging content-addressed subtree caching and pipelined cat-file streaming.
 func (c *CatFileBatch) ListGoFileBlobs(rev string) ([]GoFileBlob, error) {
+	return c.listTreeBlobs(rev, true)
+}
+
+// ListAllFileBlobs recursively finds all searchable files at rev along with their Git blob OIDs.
+func (c *CatFileBatch) ListAllFileBlobs(rev string) ([]GoFileBlob, error) {
+	return c.listTreeBlobs(rev, false)
+}
+
+func (c *CatFileBatch) listTreeBlobs(rev string, goOnly bool) ([]GoFileBlob, error) {
 	if rev == "" {
 		return nil, os.ErrNotExist
 	}
@@ -459,13 +479,26 @@ func (c *CatFileBatch) ListGoFileBlobs(rev string) ([]GoFileBlob, error) {
 		oid string
 	}
 
+	pickFiles := func(st cachedSubtree) []treeChild {
+		if goOnly {
+			return st.goFiles
+		}
+		return st.allFiles
+	}
+	pickSubdirs := func(st cachedSubtree) []treeChild {
+		if goOnly {
+			return st.subdirs
+		}
+		return st.searchSubdirs
+	}
+
 	var blobs []GoFileBlob
-	for _, f := range rootSubtree.goFiles {
+	for _, f := range pickFiles(rootSubtree) {
 		blobs = append(blobs, GoFileBlob{Path: f.name, OID: f.oid})
 	}
 
 	var currentLevel []treeItem
-	for _, sub := range rootSubtree.subdirs {
+	for _, sub := range pickSubdirs(rootSubtree) {
 		currentLevel = append(currentLevel, treeItem{dir: sub.name, oid: sub.oid})
 	}
 
@@ -477,14 +510,14 @@ func (c *CatFileBatch) ListGoFileBlobs(rev string) ([]GoFileBlob, error) {
 		c.mu.Lock()
 		for _, item := range currentLevel {
 			if st, ok := c.subtreeCache[item.oid]; ok {
-				for _, f := range st.goFiles {
+				for _, f := range pickFiles(st) {
 					p := f.name
 					if item.dir != "" {
 						p = item.dir + "/" + f.name
 					}
 					blobs = append(blobs, GoFileBlob{Path: p, OID: f.oid})
 				}
-				for _, sub := range st.subdirs {
+				for _, sub := range pickSubdirs(st) {
 					subDir := sub.name
 					if item.dir != "" {
 						subDir = item.dir + "/" + sub.name
@@ -567,14 +600,14 @@ func (c *CatFileBatch) ListGoFileBlobs(rev string) ([]GoFileBlob, error) {
 						c.subtreeCache[item.oid] = st
 					}
 				}
-				for _, f := range st.goFiles {
+				for _, f := range pickFiles(st) {
 					p := f.name
 					if item.dir != "" {
 						p = item.dir + "/" + f.name
 					}
 					blobs = append(blobs, GoFileBlob{Path: p, OID: f.oid})
 				}
-				for _, sub := range st.subdirs {
+				for _, sub := range pickSubdirs(st) {
 					subDir := sub.name
 					if item.dir != "" {
 						subDir = item.dir + "/" + sub.name

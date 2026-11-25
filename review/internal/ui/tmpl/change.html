@@ -138,34 +138,12 @@
       </div>
 
       <div style="display: flex; align-items: center; gap: 8px;">
-        <form method="GET" action="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}" class="search-container">
-          <input type="hidden" name="base" value="{{.BaseParam}}">
-          <input type="hidden" name="target" value="{{.TargetParam}}">
-          <input type="hidden" name="diffs" value="{{.DiffsMode}}">
-          <input type="hidden" name="mode" value="{{.DiffMode}}">
-          {{if .CtxParam}}<input type="hidden" name="ctx" value="{{.CtxParam}}">{{end}}
-          <input id="changeSearchInput" type="text" name="q" value="{{.Query}}" placeholder="Search in change... (/)">
-        </form>
+        <button type="button" id="codeSearchBtn" class="btn btn-sm code-search-trigger-btn" onclick="openCodeSearchPopup()" title="Code Search &amp; Quick Open (/ or Cmd/Ctrl+K)">
+          <span>Search</span>
+          <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7" cy="7" r="4.5"></circle><line x1="10.5" y1="10.5" x2="14" y2="14"></line></svg>
+        </button>
       </div>
     </div>
-
-    {{if .SearchResults}}
-      <div class="search-results">
-        <h3 style="font-size: 14px; margin-bottom: 8px;">Search results for "{{.Query}}":</h3>
-        {{range .SearchResults}}
-          {{$filePath := .Path}}
-          <div class="search-file-group">
-            <div class="path">{{.Path}}</div>
-            {{range .Matches}}
-              <div class="search-match-line">
-                <a href="/r/{{$.Record.Slug}}/c/{{$.View.Change.Key}}/f/{{TrimSlash $filePath}}?base={{$.BaseParam}}&target={{$.TargetParam}}&mode={{$.DiffMode}}#L{{.Line}}">Line {{.Line}}:</a>
-                <span>{{.Snippet}}</span>
-              </div>
-            {{end}}
-          </div>
-        {{end}}
-      </div>
-    {{end}}
 
     <!-- Files Summary Card (shown only in File List mode) -->
     {{if ne .DiffsMode "all"}}

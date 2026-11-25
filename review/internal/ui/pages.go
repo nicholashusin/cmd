@@ -214,12 +214,6 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	var searchResults []engine.SearchFileResult
-	if query != "" {
-		searchResults, _ = engine.SearchChange(repo, c, view.TargetRev, view.BaseRev, query, true)
-	}
-
 	_, revLGTM, _ := s.d.RevMark(rec.ID, c.Key, view.TargetRev)
 	isLGTM := revLGTM || (view.Summary != nil && view.Summary.LGTM)
 	headerStatus := "active"
@@ -310,8 +304,6 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 		"StaticVersion": s.staticVersion,
 		"Record":        rec,
 		"View":          view,
-		"Query":         query,
-		"SearchResults": searchResults,
 		"BaseParam":     baseSel,
 		"TargetParam":   targetSel,
 		"IsLGTM":        isLGTM,
