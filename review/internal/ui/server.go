@@ -76,6 +76,11 @@ func NewServer(d *db.DB, cache *vcs.Cache, listenAddr string) (*Server, error) {
 		"CollapsePreview":     collapseCommentPreview,
 		"LastIndex":           func(msgs []*db.Message) int { return len(msgs) - 1 },
 		"FormatCommitMessage": FormatCommitMessage,
+		"RelTime":             func(t time.Time) string { return formatRelativeTime(t, time.Now()) },
+		"ExactTime":           formatExactTime,
+		"ISOTime":             formatISOTime,
+		"MsgEdited":           isMessageEdited,
+		"CommitTime":          commitTimestamp,
 		"ReverseSnapshots": func(snaps []*db.Snapshot) []*db.Snapshot {
 			out := make([]*db.Snapshot, len(snaps))
 			for i, s := range snaps {
@@ -551,6 +556,61 @@ func collapseCommentPreview(s string) string {
 		emitted++
 	}
 	return b.String()
+}
+
+func formatRelativeTime(t, now time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := now.Sub(t)
+	if d < time.Minute {
+		return "just now"
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm ago", int(d/time.Minute))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh ago", int(d/time.Hour))
+	}
+	if d < 14*24*time.Hour {
+		return fmt.Sprintf("%dd ago", int(d/(24*time.Hour)))
+	}
+	localT := t.Local()
+	if localT.Year() == now.Local().Year() {
+		return localT.Format("Jan 2")
+	}
+	return localT.Format("Jan 2, 2006")
+}
+
+func formatExactTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Local().Format("2006-01-02 15:04:05 MST")
+}
+
+func formatISOTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+func isMessageEdited(m *db.Message) bool {
+	if m == nil || m.Draft || m.CreatedAt.IsZero() || m.UpdatedAt.IsZero() {
+		return false
+	}
+	return m.UpdatedAt.Sub(m.CreatedAt) > 2*time.Second
+}
+
+func commitTimestamp(c *vcs.Change) time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	if !c.CommitDate.IsZero() {
+		return c.CommitDate
+	}
+	return c.Date
 }
 
 func (s *Server) getCommentCounts(repoID int64, changeKey, filePath string) (fileCounts engine.CommentCounts, changeCounts engine.CommentCounts, err error) {

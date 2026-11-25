@@ -2188,6 +2188,28 @@ td.comment-range-line mark.intra {
   font-size: 10.5px;
   color: var(--muted);
 }
+.thread-time,
+.thread-edited {
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.thread-edited {
+  font-style: italic;
+  opacity: 0.85;
+}
+.badge-round {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: var(--muted);
+  background: var(--surface-alt, rgba(128, 128, 128, 0.12));
+  border-color: var(--border);
+}
+.commit-time {
+  color: var(--muted);
+  white-space: nowrap;
+}
 .badge-xs {
   padding: 0 4px;
   font-size: 10px;
@@ -3179,12 +3201,22 @@ header.app-header.has-scope > .header-actions {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.unres-item-author {
+.unres-item-right {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   flex-shrink: 0;
+}
+.unres-item-author {
   font-size: 11.5px;
   font-weight: 500;
   color: var(--muted);
+}
+.unres-item-time {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
 }
 .unres-item-preview.markdown-body {
   font-size: 12.5px;

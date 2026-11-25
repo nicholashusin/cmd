@@ -37,7 +37,7 @@
                 <span class="badge badge-status-active">Active</span>
               {{end}}
               {{if and $sum (gt $sum.SnapshotCount 0)}}
-                <span class="badge">Snapshot {{$sum.LatestSnapshot.Num}}</span>
+                <span class="badge"{{if and $sum.LatestSnapshot (not $sum.LatestSnapshot.CreatedAt.IsZero)}} title="Snapshot {{$sum.LatestSnapshot.Num}} · {{ExactTime $sum.LatestSnapshot.CreatedAt}}"{{end}}>Snapshot {{$sum.LatestSnapshot.Num}}</span>
               {{else}}
                 <span class="badge badge-pending">Snapshot pending</span>
               {{end}}
@@ -50,6 +50,8 @@
             </div>
             <div class="commit-meta">
               <span>{{.Change.Author}}</span>
+              {{$ct := CommitTime .Change}}
+              {{if not $ct.IsZero}}<time class="commit-time rel-time" datetime="{{ISOTime $ct}}" title="{{ExactTime $ct}}">{{RelTime $ct}}</time>{{end}}
             </div>
           </li>
         {{end}}

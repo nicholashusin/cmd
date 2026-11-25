@@ -983,6 +983,7 @@
     if (document.hidden) {
       closeSSE();
     } else {
+      refreshRelativeTimes();
       await checkRemoteState();
       initSSE();
     }
@@ -4029,6 +4030,41 @@
     });
   };
 
+  function formatRelativeTime(isoStr) {
+    if (!isoStr) return '';
+    const d = new Date(isoStr);
+    const ms = d.getTime();
+    if (!Number.isFinite(ms)) return '';
+    const diffSec = Math.floor((Date.now() - ms) / 1000);
+    if (diffSec < 60) return 'just now';
+    if (diffSec < 3600) return Math.floor(diffSec / 60) + 'm ago';
+    if (diffSec < 86400) return Math.floor(diffSec / 3600) + 'h ago';
+    if (diffSec < 14 * 86400) return Math.floor(diffSec / 86400) + 'd ago';
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const now = new Date();
+    if (d.getFullYear() === now.getFullYear()) {
+      return months[d.getMonth()] + ' ' + d.getDate();
+    }
+    return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
+  }
+
+  function refreshRelativeTimes() {
+    if (document.hidden || !document.querySelectorAll) return;
+    document.querySelectorAll('time.rel-time[datetime]').forEach(el => {
+      const text = formatRelativeTime(el.getAttribute('datetime'));
+      if (text && el.textContent !== text) {
+        el.textContent = text;
+      }
+    });
+  }
+
+  if (typeof setInterval === 'function' && typeof document !== 'undefined') {
+    const relTimeTimer = setInterval(refreshRelativeTimes, 60000);
+    if (relTimeTimer && typeof relTimeTimer.unref === 'function') {
+      relTimeTimer.unref();
+    }
+  }
+
   window.publishDrafts = function(repo, change) {
     const el = document.querySelector('[data-left-rev][data-right-rev]');
     const leftRev = el ? el.getAttribute('data-left-rev') : '';
@@ -4141,7 +4177,11 @@
                 if (!Array.from(targetSel.options).some(o => o.value === val)) {
                   const opt = document.createElement('option');
                   opt.value = val;
-                  opt.textContent = 'Snapshot ' + sn.num;
+                  const rel = sn.created_at ? formatRelativeTime(sn.created_at) : '';
+                  opt.textContent = rel ? `Snapshot ${sn.num} (${rel})` : 'Snapshot ' + sn.num;
+                  if (sn.created_at) {
+                    opt.title = new Date(sn.created_at).toLocaleString();
+                  }
                   if (targetSel.insertBefore) {
                     targetSel.insertBefore(opt, targetSel.options[1] || null);
                   } else if (targetSel.appendChild) {
@@ -4158,7 +4198,11 @@
               if (!Array.from(baseSel.options).some(o => o.value === val)) {
                 const opt = document.createElement('option');
                 opt.value = val;
-                opt.textContent = 'Snapshot ' + sn.num;
+                const rel = sn.created_at ? formatRelativeTime(sn.created_at) : '';
+                opt.textContent = rel ? `Snapshot ${sn.num} (${rel})` : 'Snapshot ' + sn.num;
+                if (sn.created_at) {
+                  opt.title = new Date(sn.created_at).toLocaleString();
+                }
                 if (baseSel.appendChild) {
                   baseSel.appendChild(opt);
                 }
@@ -9700,6 +9744,11 @@
             badges += '<span class="badge badge-xs" style="margin-left: 6px; background: var(--danger); color: #fff;">stale</span>';
           }
           const authorHtml = th.author ? `<span class="unres-item-author">${escapeHtml(th.author)}</span>` : '';
+          const relTime = th.rel_time || (th.updated_at ? formatRelativeTime(th.updated_at) : '');
+          const timeHtml = relTime
+            ? `<time class="unres-item-time rel-time"${th.updated_at ? ` datetime="${escapeHtml(th.updated_at)}"` : ''}${th.exact_time ? ` title="${escapeHtml(th.exact_time)}"` : ''}>${escapeHtml(relTime)}</time>`
+            : '';
+          const rightMetaHtml = (authorHtml || timeHtml) ? `<span class="unres-item-right">${authorHtml}${timeHtml}</span>` : '';
           const previewHtml = th.preview_html
             ? th.preview_html
             : `<p class="md-p">${escapeHtml(th.preview || 'No preview')}</p>`;
@@ -9709,7 +9758,7 @@
           const snapAttr = (th.snapshot_num > 0) ? ` data-snapshot-num="${escapeHtml(th.snapshot_num)}"` : '';
           const inViewAttr = (typeof th.in_current_view === 'boolean') ? ` data-in-current-view="${th.in_current_view ? 'true' : 'false'}"` : '';
           html += `<div class="unres-item-row ${statusClass}" role="button" tabindex="0" data-thread-id="${escapeHtml(th.id)}"${msgAttr}${snapAttr}${inViewAttr} data-path="${escapeHtml(th.path)}">` +
-            `<div class="unres-item-loc-line"><span class="unres-item-loc-left"><span class="unres-item-loc">${escapeHtml(loc)}</span>${badges}</span>${authorHtml}</div>` +
+            `<div class="unres-item-loc-line"><span class="unres-item-loc-left"><span class="unres-item-loc">${escapeHtml(loc)}</span>${badges}</span>${rightMetaHtml}</div>` +
             `<div class="unres-item-preview markdown-body">${previewHtml}</div>` +
           `</div>`;
         }

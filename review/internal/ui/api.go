@@ -701,10 +701,14 @@ func (s *Server) handleAPIThreadsList(w http.ResponseWriter, r *http.Request) {
 		PreviewHTML   string `json:"preview_html"`
 		SnapshotNum   int    `json:"snapshot_num"`
 		InCurrentView bool   `json:"in_current_view"`
+		UpdatedAt     string `json:"updated_at,omitempty"`
+		RelTime       string `json:"rel_time,omitempty"`
+		ExactTime     string `json:"exact_time,omitempty"`
 		sortTime      time.Time
 		sortMsgID     int64
 	}
 
+	now := time.Now()
 	msgActivityTime := func(m *db.Message) time.Time {
 		if m.CreatedAt.After(m.UpdatedAt) {
 			return m.CreatedAt
@@ -753,6 +757,9 @@ func (s *Server) handleAPIThreadsList(w http.ResponseWriter, r *http.Request) {
 					PreviewHTML:   previewHTML,
 					SnapshotNum:   th.SnapshotNum,
 					InCurrentView: inView,
+					UpdatedAt:     formatISOTime(mt),
+					RelTime:       formatRelativeTime(mt, now),
+					ExactTime:     formatExactTime(mt),
 					sortTime:      mt,
 					sortMsgID:     m.ID,
 				})
@@ -795,6 +802,9 @@ func (s *Server) handleAPIThreadsList(w http.ResponseWriter, r *http.Request) {
 			PreviewHTML:   previewHTML,
 			SnapshotNum:   th.SnapshotNum,
 			InCurrentView: inView,
+			UpdatedAt:     formatISOTime(latestTime),
+			RelTime:       formatRelativeTime(latestTime, now),
+			ExactTime:     formatExactTime(latestTime),
 			sortTime:      latestTime,
 			sortMsgID:     latestMsgID,
 		})

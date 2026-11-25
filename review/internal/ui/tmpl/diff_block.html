@@ -19,8 +19,11 @@
       <span class="thread-loc">
         {{- if eq .StartLine 0}}file{{else if gt .CurrentStart 0}}L{{.CurrentStart}}{{if ne .CurrentStart .CurrentEnd}}–{{.CurrentEnd}}{{end}}{{else}}L{{.StartLine}}{{if ne .StartLine .EndLine}}–{{.EndLine}}{{end}}{{end -}}
       </span>
+      {{if gt .SnapshotNum 0}}<span class="badge badge-round badge-xs" title="Snapshot {{.SnapshotNum}}{{if not .SnapshotTime.IsZero}} · {{ExactTime .SnapshotTime}}{{end}}">S{{.SnapshotNum}}</span>{{end}}
       {{if .Resolved}}<span class="badge badge-reviewed badge-xs">resolved</span>{{end}}
       {{if .Stale}}<span class="badge badge-xs" style="background:#e06c75;color:#fff;">stale @ {{ShortRev .Rev}}:{{.StartLine}}</span>{{end}}
+      {{if not $first.CreatedAt.IsZero}}<time class="thread-time rel-time" datetime="{{ISOTime $first.CreatedAt}}" title="{{ExactTime $first.CreatedAt}}">{{RelTime $first.CreatedAt}}</time>{{end}}
+      {{if MsgEdited $first}}<span class="thread-edited" title="Edited {{ExactTime $first.UpdatedAt}}">edited</span>{{end}}
     </div>
     <span class="comment-collapsed-preview">{{CollapsePreview $first.Body}}</span>
     {{if $first.Draft}}
@@ -42,6 +45,10 @@
           <div class="thread-meta">
             <strong class="thread-author">{{$m.Author}}</strong>
             {{if $m.Draft}}<span class="badge badge-draft badge-xs">draft</span>{{end}}
+            {{$replyRound := $.ReplyRound $i}}
+            {{if gt $replyRound 0}}<span class="badge badge-round badge-xs" title="Replied on Snapshot {{$replyRound}}">S{{$replyRound}}</span>{{end}}
+            {{if not $m.CreatedAt.IsZero}}<time class="thread-time rel-time" datetime="{{ISOTime $m.CreatedAt}}" title="{{ExactTime $m.CreatedAt}}">{{RelTime $m.CreatedAt}}</time>{{end}}
+            {{if MsgEdited $m}}<span class="thread-edited" title="Edited {{ExactTime $m.UpdatedAt}}">edited</span>{{end}}
           </div>
           <span class="comment-collapsed-preview">{{CollapsePreview $m.Body}}</span>
           {{if $m.Draft}}

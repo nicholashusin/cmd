@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"nicholas.sh/cmd/review/internal/db"
 	"nicholas.sh/cmd/review/internal/diff"
@@ -773,11 +774,61 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 // ThreadView wraps a comment thread with re-anchored position for diff rendering.
 type ThreadView struct {
 	*db.Thread
-	CurrentStart  int  `json:"current_line"`
-	CurrentEnd    int  `json:"current_end_line"`
-	Stale         bool `json:"stale"`
-	AnchorText    string
-	EffectiveSide string `json:"-"`
+	CurrentStart   int  `json:"current_line"`
+	CurrentEnd     int  `json:"current_end_line"`
+	Stale          bool `json:"stale"`
+	AnchorText     string
+	EffectiveSide  string    `json:"-"`
+	SnapshotTime   time.Time `json:"-"`
+	ReplyRoundNums []int     `json:"-"`
+}
+
+// ReplyRound returns the snapshot number when message idx transitioned to a newer
+// snapshot round than the previous message, or 0 if it stayed in the same round.
+func (tv *ThreadView) ReplyRound(idx int) int {
+	if tv == nil || idx < 0 || idx >= len(tv.ReplyRoundNums) {
+		return 0
+	}
+	return tv.ReplyRoundNums[idx]
+}
+
+func populateRoundContext(tv *ThreadView, snaps []*db.Snapshot) {
+	if tv == nil || tv.Thread == nil || len(snaps) == 0 {
+		return
+	}
+	if tv.SnapshotNum > 0 {
+		for _, sn := range snaps {
+			if sn.Num == tv.SnapshotNum {
+				tv.SnapshotTime = sn.CreatedAt
+				break
+			}
+		}
+	}
+	if len(tv.Messages) <= 1 {
+		return
+	}
+	currRound := tv.SnapshotNum
+	var rounds []int
+	for i := 1; i < len(tv.Messages); i++ {
+		m := tv.Messages[i]
+		if m == nil || m.CreatedAt.IsZero() {
+			continue
+		}
+		msgRound := 0
+		for _, sn := range snaps {
+			if !sn.CreatedAt.IsZero() && !m.CreatedAt.Before(sn.CreatedAt) && sn.Num > msgRound {
+				msgRound = sn.Num
+			}
+		}
+		if msgRound > currRound {
+			if rounds == nil {
+				rounds = make([]int, len(tv.Messages))
+			}
+			rounds[i] = msgRound
+			currRound = msgRound
+		}
+	}
+	tv.ReplyRoundNums = rounds
 }
 
 // DisplaySide returns the diff side ("L" or "R") where this thread should render in the current view.
@@ -981,6 +1032,7 @@ func reanchorThreads(repo vcs.Repo, c *vcs.Change, snaps []*db.Snapshot, scope *
 			AnchorText:    th.AnchorLines,
 			EffectiveSide: effectiveSide,
 		}
+		populateRoundContext(tv, snaps)
 
 		if vcs.IsCommitMsgPath(th.Path) && effectiveSide == "L" && !checkCommitMsgBase() {
 			tv.Stale = true
@@ -1018,7 +1070,7 @@ func reanchorThreads(repo vcs.Repo, c *vcs.Change, snaps []*db.Snapshot, scope *
 	return views
 }
 
-func anchorThreadWithLines(th *db.Thread, effectiveSide string, leftLines, rightLines []string, forceStale bool, fileThreads []*ThreadView, leftThreads, rightThreads map[int][]*ThreadView) []*ThreadView {
+func anchorThreadWithLines(th *db.Thread, effectiveSide string, snaps []*db.Snapshot, leftLines, rightLines []string, forceStale bool, fileThreads []*ThreadView, leftThreads, rightThreads map[int][]*ThreadView) []*ThreadView {
 	tv := &ThreadView{
 		Thread:        th,
 		CurrentStart:  th.StartLine,
@@ -1027,6 +1079,7 @@ func anchorThreadWithLines(th *db.Thread, effectiveSide string, leftLines, right
 		AnchorText:    th.AnchorLines,
 		EffectiveSide: effectiveSide,
 	}
+	populateRoundContext(tv, snaps)
 
 	if forceStale {
 		tv.Stale = true
@@ -1076,7 +1129,7 @@ func ReanchorThreadsWithLines(leftLines, rightLines []string, threads []*db.Thre
 	rightThreads = make(map[int][]*ThreadView)
 
 	for _, th := range threads {
-		fileThreads = anchorThreadWithLines(th, "", leftLines, rightLines, false, fileThreads, leftThreads, rightThreads)
+		fileThreads = anchorThreadWithLines(th, "", nil, leftLines, rightLines, false, fileThreads, leftThreads, rightThreads)
 	}
 
 	return fileThreads, leftThreads, rightThreads
@@ -1097,7 +1150,7 @@ func ReanchorViewThreadsWithLines(leftLines, rightLines []string, baseRev, targe
 		}
 		addThreadCommentCounts(&counts, th)
 		forceStale := vcs.IsCommitMsgPath(th.Path) && effectiveSide == "L" && !hasCommitMsgBase
-		fileThreads = anchorThreadWithLines(th, effectiveSide, leftLines, rightLines, forceStale, fileThreads, leftThreads, rightThreads)
+		fileThreads = anchorThreadWithLines(th, effectiveSide, snaps, leftLines, rightLines, forceStale, fileThreads, leftThreads, rightThreads)
 	}
 
 	return fileThreads, leftThreads, rightThreads, counts

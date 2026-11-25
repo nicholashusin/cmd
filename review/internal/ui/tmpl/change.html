@@ -36,9 +36,11 @@
           {{end}}
           <span id="changeCommentCounts" class="comment-counts" data-repo="{{.Record.Slug}}" data-change="{{.View.Change.Key}}" data-base="{{.BaseParam}}" data-target="{{.TargetParam}}">{{template "comment_counts" .View.ChangeCounts}}</span>
         </div>
-        <div style="font-size: 12px; color: var(--muted); display: flex; gap: 12px;">
+        <div style="font-size: 12px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap;">
           <span>Author: <strong>{{.View.Change.Author}}</strong></span>
           <span>Commit: <code>{{ShortRev .View.TargetRev}}</code></span>
+          {{$ct := CommitTime .View.Change}}
+          {{if not $ct.IsZero}}<span>Updated: <time class="rel-time" datetime="{{ISOTime $ct}}" title="{{ExactTime $ct}}">{{RelTime $ct}}</time></span>{{end}}
         </div>
       </div>
     </div>
@@ -100,7 +102,7 @@
             <select name="base" onchange="this.form.submit()">
               <option value="parent" {{if eq .View.BaseSnapNum 0}}selected{{end}}>Parent</option>
               {{range .View.Snapshots}}
-                <option value="snap:{{.Num}}" {{if eq $.View.BaseSnapNum .Num}}selected{{end}}>Snapshot {{.Num}}</option>
+                <option value="snap:{{.Num}}"{{if not .CreatedAt.IsZero}} title="{{ExactTime .CreatedAt}}"{{end}} {{if eq $.View.BaseSnapNum .Num}}selected{{end}}>Snapshot {{.Num}}{{if not .CreatedAt.IsZero}} ({{RelTime .CreatedAt}}){{end}}</option>
               {{end}}
             </select>
           </label>
@@ -109,7 +111,7 @@
             <select name="target" onchange="this.form.submit()">
               <option value="live" {{if eq .View.TargetSnapNum 0}}selected{{end}}>Live Snapshot{{if .View.SnapshotPending}} (pending){{end}}</option>
               {{range ReverseSnapshots .View.Snapshots}}
-                <option value="snap:{{.Num}}" {{if eq $.View.TargetSnapNum .Num}}selected{{end}}>Snapshot {{.Num}}</option>
+                <option value="snap:{{.Num}}"{{if not .CreatedAt.IsZero}} title="{{ExactTime .CreatedAt}}"{{end}} {{if eq $.View.TargetSnapNum .Num}}selected{{end}}>Snapshot {{.Num}}{{if not .CreatedAt.IsZero}} ({{RelTime .CreatedAt}}){{end}}</option>
               {{end}}
             </select>
           </label>

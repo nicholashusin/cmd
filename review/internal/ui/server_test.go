@@ -1153,8 +1153,8 @@ func TestServerChangePageDefaultSnapshotSelection(t *testing.T) {
 	_ = resp.Body.Close()
 	body = buf.String()
 
-	if !strings.Contains(body, `<option value="snap:1" selected>Snapshot 1</option>`) {
-		t.Errorf("expected <option value=\"snap:1\" selected>Snapshot 1</option> when ?target=snap:1")
+	if !strings.Contains(body, `<option value="snap:1"`) || !strings.Contains(body, `selected>Snapshot 1`) {
+		t.Errorf("expected <option value=\"snap:1\" ... selected>Snapshot 1... when ?target=snap:1")
 	}
 	if strings.Contains(body, `<option value="live" selected>`) {
 		t.Errorf("did NOT expect live to be selected when ?target=snap:1")
@@ -22363,5 +22363,128 @@ func TestSSEScopedNotificationsAndReasons(t *testing.T) {
 	evtA, ok := readEventTimeout(rChangeA, time.Second)
 	if !ok || !strings.Contains(evtA, `"reason":"comment_reply"`) {
 		t.Fatalf("expected changeA SSE to receive comment_reply, got ok=%v evt=%q", ok, evtA)
+	}
+}
+
+func TestTimestampsAndRoundContext(t *testing.T) {
+	srv, ts, d, repoDir := setupTestServer(t)
+	defer srv.broker.Close()
+	defer ts.Close()
+	defer d.Close()
+
+	rec, err := d.EnsureRepo(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := vcs.Open(repoDir, srv.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err := repo.Changes()
+	if err != nil || len(changes) == 0 {
+		t.Fatalf("expected changes, got %v", err)
+	}
+	c := changes[0]
+
+	// Create Snapshot 1 and a thread on Snapshot 1.
+	sn1, _, err := engine.TakeSnapshot(d, repo, rec.ID, c, false)
+	if err != nil {
+		t.Fatalf("TakeSnapshot 1: %v", err)
+	}
+	th, _, err := engine.AddComment(d, repo, rec.ID, c, c.Rev, "hello.go", "R", 3, 3, "alice", "First round comment", false, false)
+	if err != nil {
+		t.Fatalf("AddComment: %v", err)
+	}
+
+	// Amend commit and create Snapshot 2 after a brief delay so Snapshot 2 CreatedAt > Snapshot 1.
+	if err := os.WriteFile(filepath.Join(repoDir, "hello.go"), []byte("package main\n\nfunc main() {\n\tprintln(\"v2\")\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "commit", "-a", "--amend", "--no-edit")
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git amend failed: %s (%v)", string(out), err)
+	}
+	srv.cache = vcs.NewCache()
+	repo, _ = vcs.Open(repoDir, srv.cache)
+	changes2, err := repo.Changes()
+	if err != nil || len(changes2) == 0 {
+		t.Fatalf("expected amended change, got %v", err)
+	}
+	c2 := changes2[0]
+	time.Sleep(15 * time.Millisecond)
+	sn2, _, err := engine.TakeSnapshot(d, repo, rec.ID, c2, false)
+	if err != nil {
+		t.Fatalf("TakeSnapshot 2: %v", err)
+	}
+	if sn1.Num != 1 || sn2.Num != 2 {
+		t.Fatalf("expected snapshot nums 1 and 2, got %d and %d", sn1.Num, sn2.Num)
+	}
+
+	// Reply after Snapshot 2 -> should be annotated with S2 round context.
+	time.Sleep(15 * time.Millisecond)
+	if _, err := d.AddMessage(th.ID, "bob", "Fixed in round 2", false); err != nil {
+		t.Fatalf("AddMessage: %v", err)
+	}
+
+	// 1. Interdiff snap:1..snap:2 shows thread card with S1 badge, reply S2 badge, timestamps, and snapshot dropdown timestamps.
+	resp, err := http.Get(fmt.Sprintf("%s/r/%s/c/%s?base=snap:1&target=snap:2&diffs=all", ts.URL, rec.Slug, c.Key))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET change failed: %v", err)
+	}
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(resp.Body)
+	_ = resp.Body.Close()
+	body := buf.String()
+
+	if !strings.Contains(body, `Snapshot 1 (just now)`) || !strings.Contains(body, `Snapshot 2 (just now)`) {
+		t.Errorf("expected relative timestamps on Snapshot dropdown options")
+	}
+	if !strings.Contains(body, `class="badge badge-round badge-xs" title="Snapshot 1`) || !strings.Contains(body, `>S1</span>`) {
+		t.Errorf("expected S1 round badge on thread header")
+	}
+	if !strings.Contains(body, `title="Replied on Snapshot 2">S2</span>`) {
+		t.Errorf("expected S2 round badge on reply posted after Snapshot 2")
+	}
+	if !strings.Contains(body, `<time class="thread-time rel-time"`) {
+		t.Errorf("expected relative timestamp element on comment messages")
+	}
+	if !strings.Contains(body, `<span>Updated: <time class="rel-time"`) {
+		t.Errorf("expected commit Updated timestamp in change header")
+	}
+
+	// 2. /api/threads/list returns updated_at / rel_time / exact_time.
+	respList, err := http.Get(fmt.Sprintf("%s/api/threads/list?repo=%s&change=%s&status=unresolved", ts.URL, rec.Slug, c.Key))
+	if err != nil || respList.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/threads/list failed: %v", err)
+	}
+	var listRes struct {
+		Threads []struct {
+			ID        int64  `json:"id"`
+			UpdatedAt string `json:"updated_at"`
+			RelTime   string `json:"rel_time"`
+			ExactTime string `json:"exact_time"`
+		} `json:"threads"`
+	}
+	if err := json.NewDecoder(respList.Body).Decode(&listRes); err != nil {
+		t.Fatal(err)
+	}
+	_ = respList.Body.Close()
+	if len(listRes.Threads) != 1 || listRes.Threads[0].UpdatedAt == "" || listRes.Threads[0].RelTime == "" || listRes.Threads[0].ExactTime == "" {
+		t.Fatalf("expected timestamp fields in /api/threads/list, got %+v", listRes.Threads)
+	}
+
+	// 3. Dashboard & repo pages render commit timestamps.
+	for _, path := range []string{"/", "/r/" + rec.Slug} {
+		rPage, err := http.Get(ts.URL + path)
+		if err != nil || rPage.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s failed: %v", path, err)
+		}
+		buf.Reset()
+		_, _ = buf.ReadFrom(rPage.Body)
+		_ = rPage.Body.Close()
+		if !strings.Contains(buf.String(), `<time class="commit-time rel-time"`) {
+			t.Errorf("expected commit-time on %s", path)
+		}
 	}
 }
