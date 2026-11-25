@@ -891,6 +891,24 @@ header.app-header.header-status-lgtm {
   color: var(--diff-del-text);
 }
 
+.badge-ws-only {
+  color: var(--muted);
+  border-color: var(--border);
+  font-weight: 400;
+}
+
+.diff-notice-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
 /* Search Results card */
 .search-results {
   background: var(--surface);

@@ -707,7 +707,7 @@ func h1ServerKeepAlivesDisabled(hs ServerConfig) bool {
 
 	leftLines := SplitLines([]byte(leftCode))
 	rightLines := SplitLines([]byte(rightCode))
-	rows := BuildDiffRows(leftLines, rightLines, LangGo)
+	rows := BuildDiffRows(leftLines, rightLines, LangGo, true)
 
 	// 1. Verify the 6 re-indented statements are paired 1-to-1 as unchanged
 	statements := []string{
@@ -813,7 +813,7 @@ func TestBuildDiffRowsWhitespace(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var changed []Row
-			for _, r := range BuildDiffRows(SplitLines([]byte(tt.left)), SplitLines([]byte(tt.right)), LangGo) {
+			for _, r := range BuildDiffRows(SplitLines([]byte(tt.left)), SplitLines([]byte(tt.right)), LangGo, true) {
 				if r.Type != RowEqual {
 					changed = append(changed, r)
 				}
@@ -821,6 +821,16 @@ func TestBuildDiffRowsWhitespace(t *testing.T) {
 			if tt.wantIntra == nil {
 				if len(changed) != 0 {
 					t.Errorf("got changed rows %+v, want none", changed)
+				}
+				// Verify ignoreWS=false still surfaces the whitespace diff.
+				var shown []Row
+				for _, r := range BuildDiffRows(SplitLines([]byte(tt.left)), SplitLines([]byte(tt.right)), LangGo, false) {
+					if r.Type != RowEqual {
+						shown = append(shown, r)
+					}
+				}
+				if len(shown) == 0 {
+					t.Errorf("ignoreWS=false: expected changed rows for %q, got none", tt.name)
 				}
 				return
 			}
@@ -963,7 +973,8 @@ func FuzzMyersDiff(f *testing.F) {
 		_ = Unified(collapsed)
 
 		// 4. Test BuildDiffRows
-		diffRows := BuildDiffRows(oldLines, newLines, LangGo)
+		diffRows := BuildDiffRows(oldLines, newLines, LangGo, true)
+		_ = BuildDiffRows(oldLines, newLines, LangGo, false)
 		assertRowSpans(diffRows)
 	})
 }

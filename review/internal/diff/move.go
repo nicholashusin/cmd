@@ -101,11 +101,17 @@ func lineSim(s1, s2 string) float64 {
 }
 
 type moveChunk struct {
-	fileIdx   int
-	hunkID    int
-	lines     []int    // 1-based line numbers
-	normLines []string // TrimSpace
-	rawLines  []string // raw line text
+	fileIdx    int
+	hunkID     int
+	lines      []int    // 1-based line numbers
+	normLines  []string // TrimSpace
+	matchLines []string // wsKeys when ignoreWS is true, otherwise normLines
+	rawLines   []string // raw line text
+}
+
+type fileWSData struct {
+	leftKeys, rightKeys []string
+	leftStrs, rightStrs [][]Span
 }
 
 type delLoc struct {
@@ -135,8 +141,9 @@ type fileLineKey struct {
 
 // DetectMoves inspects diff rows across files to detect verbatim and fuzzy/modified code moves
 // (both intra-file and cross-file). It populates MovedL and MovedR on Rows and splits any
-// unrelated RowChange rows so moved blocks stay contiguous and clean.
-func DetectMoves(files []MoveFile) {
+// unrelated RowChange rows so moved blocks stay contiguous and clean. When ignoreWS is true,
+// whitespace outside string literals is ignored when matching moved lines and highlighting deltas.
+func DetectMoves(files []MoveFile, ignoreWS bool) {
 	if len(files) == 0 {
 		return
 	}
@@ -194,21 +201,23 @@ func DetectMoves(files []MoveFile) {
 
 			if len(dLines) > 0 {
 				delChunks = append(delChunks, moveChunk{
-					fileIdx:   fileIdx,
-					hunkID:    hunkID,
-					lines:     dLines,
-					normLines: dNorms,
-					rawLines:  dRaws,
+					fileIdx:    fileIdx,
+					hunkID:     hunkID,
+					lines:      dLines,
+					normLines:  dNorms,
+					matchLines: dNorms,
+					rawLines:   dRaws,
 				})
 				totalDelLines += len(dLines)
 			}
 			if len(aLines) > 0 {
 				addChunks = append(addChunks, moveChunk{
-					fileIdx:   fileIdx,
-					hunkID:    hunkID,
-					lines:     aLines,
-					normLines: aNorms,
-					rawLines:  aRaws,
+					fileIdx:    fileIdx,
+					hunkID:     hunkID,
+					lines:      aLines,
+					normLines:  aNorms,
+					matchLines: aNorms,
+					rawLines:   aRaws,
 				})
 				totalAddLines += len(aLines)
 			}
@@ -224,9 +233,61 @@ func DetectMoves(files []MoveFile) {
 	// run DetectMoves per-file individually (intra-file only).
 	if len(files) > 1 && totalDelLines+totalAddLines > 15000 {
 		for i := range files {
-			DetectMoves(files[i : i+1])
+			DetectMoves(files[i:i+1], ignoreWS)
 		}
 		return
+	}
+
+	// Compute string-aware whitespace keys lazily, only for files participating in move detection.
+	var wsData []fileWSData
+	if ignoreWS {
+		wsData = make([]fileWSData, len(files))
+		hasDel := make([]bool, len(files))
+		hasAdd := make([]bool, len(files))
+		for _, ch := range delChunks {
+			hasDel[ch.fileIdx] = true
+		}
+		for _, ch := range addChunks {
+			hasAdd[ch.fileIdx] = true
+		}
+		for i, f := range files {
+			if !hasDel[i] && !hasAdd[i] {
+				continue
+			}
+			lang := DetectLang(f.Path)
+			if hasDel[i] {
+				wsData[i].leftKeys, wsData[i].leftStrs = wsKeys(f.LeftLines, lang)
+			}
+			if hasAdd[i] {
+				wsData[i].rightKeys, wsData[i].rightStrs = wsKeys(f.RightLines, lang)
+			}
+		}
+		for i := range delChunks {
+			ch := &delChunks[i]
+			keys := wsData[ch.fileIdx].leftKeys
+			matches := make([]string, len(ch.lines))
+			for j, ln := range ch.lines {
+				if ln > 0 && ln <= len(keys) {
+					matches[j] = keys[ln-1]
+				} else {
+					matches[j] = ch.normLines[j]
+				}
+			}
+			ch.matchLines = matches
+		}
+		for i := range addChunks {
+			ch := &addChunks[i]
+			keys := wsData[ch.fileIdx].rightKeys
+			matches := make([]string, len(ch.lines))
+			for j, ln := range ch.lines {
+				if ln > 0 && ln <= len(keys) {
+					matches[j] = keys[ln-1]
+				} else {
+					matches[j] = ch.normLines[j]
+				}
+			}
+			ch.matchLines = matches
+		}
 	}
 
 	// 2. Build inverted index of normalized significant lines and bigrams for delChunks.
@@ -235,13 +296,14 @@ func DetectMoves(files []MoveFile) {
 
 	for dIdx, chunk := range delChunks {
 		for lineIdx, norm := range chunk.normLines {
+			match := chunk.matchLines[lineIdx]
 			if isSignificantLine(norm) {
-				sigIndex[norm] = append(sigIndex[norm], delLoc{chunkIdx: dIdx, lineIdx: lineIdx})
+				sigIndex[match] = append(sigIndex[match], delLoc{chunkIdx: dIdx, lineIdx: lineIdx})
 			}
 			if lineIdx+1 < len(chunk.normLines) {
-				nextNorm := chunk.normLines[lineIdx+1]
-				if norm != "" && nextNorm != "" {
-					bigram := norm + "\n" + nextNorm
+				nextMatch := chunk.matchLines[lineIdx+1]
+				if match != "" && nextMatch != "" {
+					bigram := match + "\n" + nextMatch
 					bigramIndex[bigram] = append(bigramIndex[bigram], delLoc{chunkIdx: dIdx, lineIdx: lineIdx})
 				}
 			}
@@ -259,8 +321,9 @@ func DetectMoves(files []MoveFile) {
 		matchedDels := make(map[int]bool)
 
 		for lineIdx, norm := range aChunk.normLines {
+			match := aChunk.matchLines[lineIdx]
 			if isSignificantLine(norm) {
-				locs := sigIndex[norm]
+				locs := sigIndex[match]
 				if len(locs) <= 32 {
 					for _, loc := range locs {
 						matchedDels[loc.chunkIdx] = true
@@ -268,9 +331,9 @@ func DetectMoves(files []MoveFile) {
 				}
 			}
 			if lineIdx+1 < len(aChunk.normLines) {
-				nextNorm := aChunk.normLines[lineIdx+1]
-				if norm != "" && nextNorm != "" {
-					bigram := norm + "\n" + nextNorm
+				nextMatch := aChunk.matchLines[lineIdx+1]
+				if match != "" && nextMatch != "" {
+					bigram := match + "\n" + nextMatch
 					locs := bigramIndex[bigram]
 					if len(locs) <= 32 {
 						for _, loc := range locs {
@@ -307,8 +370,8 @@ func DetectMoves(files []MoveFile) {
 		dChunk := delChunks[pair.dIdx]
 		aChunk := addChunks[pair.aIdx]
 
-		edits := Edits(dChunk.normLines, aChunk.normLines)
-		aligned := alignChunks(dChunk.normLines, aChunk.normLines, edits)
+		edits := Edits(dChunk.matchLines, aChunk.matchLines)
+		aligned := alignChunks(dChunk.matchLines, aChunk.matchLines, edits)
 		if len(aligned) == 0 {
 			continue
 		}
@@ -436,11 +499,22 @@ func DetectMoves(files []MoveFile) {
 			} else {
 				lRaw := files[dChunk.fileIdx].LeftLines[lLine-1]
 				rRaw := files[aChunk.fileIdx].RightLines[rLine-1]
-				if strings.TrimSpace(lRaw) != strings.TrimSpace(rRaw) {
+				modified := false
+				if ignoreWS {
+					lKey := wsData[dChunk.fileIdx].leftKeys[lLine-1]
+					rKey := wsData[aChunk.fileIdx].rightKeys[rLine-1]
+					modified = lKey != rKey
+				} else {
+					modified = strings.TrimSpace(lRaw) != strings.TrimSpace(rRaw)
+				}
+				if modified {
 					info.Modified = true
 					blockModified = true
 					lSpans, _, ok := Intraline(lRaw, rRaw)
 					if ok {
+						if ignoreWS {
+							lSpans = trimWS(lRaw, wsData[dChunk.fileIdx].leftStrs[lLine-1], lSpans)
+						}
 						info.MovedIntra = lSpans
 					}
 				}
@@ -467,11 +541,22 @@ func DetectMoves(files []MoveFile) {
 			} else {
 				lRaw := files[dChunk.fileIdx].LeftLines[lLine-1]
 				rRaw := files[aChunk.fileIdx].RightLines[rLine-1]
-				if strings.TrimSpace(lRaw) != strings.TrimSpace(rRaw) {
+				modified := false
+				if ignoreWS {
+					lKey := wsData[dChunk.fileIdx].leftKeys[lLine-1]
+					rKey := wsData[aChunk.fileIdx].rightKeys[rLine-1]
+					modified = lKey != rKey
+				} else {
+					modified = strings.TrimSpace(lRaw) != strings.TrimSpace(rRaw)
+				}
+				if modified {
 					info.Modified = true
 					blockModified = true
 					_, rSpans, ok := Intraline(lRaw, rRaw)
 					if ok {
+						if ignoreWS {
+							rSpans = trimWS(rRaw, wsData[aChunk.fileIdx].rightStrs[rLine-1], rSpans)
+						}
 						info.MovedIntra = rSpans
 					}
 				}
@@ -491,7 +576,7 @@ func DetectMoves(files []MoveFile) {
 	}
 
 	// 7. Apply moves to Rows and cleanly split hunks.
-	applyMovesToFiles(files, leftMoveInfos, rightMoveInfos)
+	applyMovesToFiles(files, leftMoveInfos, rightMoveInfos, wsData)
 }
 
 func alignChunks(dNorms, aNorms []string, edits []Edit) []alignedPair {
@@ -772,9 +857,13 @@ func findCandidateBlocks(aligned []alignedPair, dChunk, aChunk moveChunk, dChunk
 	return results
 }
 
-func applyMovesToFiles(files []MoveFile, leftMoveInfos, rightMoveInfos map[fileLineKey]*MoveInfo) {
+func applyMovesToFiles(files []MoveFile, leftMoveInfos, rightMoveInfos map[fileLineKey]*MoveInfo, wsData []fileWSData) {
 	for fileIdx := range files {
 		f := &files[fileIdx]
+		var fws *fileWSData
+		if fileIdx < len(wsData) {
+			fws = &wsData[fileIdx]
+		}
 
 		// Attach MoveInfos to original rows
 		for i := range f.Rows {
@@ -897,17 +986,38 @@ func applyMovesToFiles(files []MoveFile, leftMoveInfos, rightMoveInfos map[fileL
 						common = rEnd - ri
 					}
 					for k := 0; k < common; k++ {
-						lSpans, rSpans, ok := Intraline(leftEntries[li+k].text, rightEntries[ri+k].text)
+						le := leftEntries[li+k]
+						re := rightEntries[ri+k]
+						if fws != nil && le.line > 0 && le.line <= len(fws.leftKeys) && re.line > 0 && re.line <= len(fws.rightKeys) &&
+							fws.leftKeys[le.line-1] == fws.rightKeys[re.line-1] {
+							newRows = append(newRows, Row{
+								Type:      RowEqual,
+								LeftLine:  le.line,
+								RightLine: re.line,
+								LeftText:  le.text,
+								RightText: re.text,
+							})
+							continue
+						}
+						lSpans, rSpans, ok := Intraline(le.text, re.text)
 						row := Row{
 							Type:      RowChange,
-							LeftLine:  leftEntries[li+k].line,
-							RightLine: rightEntries[ri+k].line,
-							LeftText:  leftEntries[li+k].text,
-							RightText: rightEntries[ri+k].text,
-							RebasedL:  leftEntries[li+k].rebased,
-							RebasedR:  rightEntries[ri+k].rebased,
+							LeftLine:  le.line,
+							RightLine: re.line,
+							LeftText:  le.text,
+							RightText: re.text,
+							RebasedL:  le.rebased,
+							RebasedR:  re.rebased,
 						}
 						if ok {
+							if fws != nil {
+								if le.line > 0 && le.line <= len(fws.leftStrs) {
+									lSpans = trimWS(le.text, fws.leftStrs[le.line-1], lSpans)
+								}
+								if re.line > 0 && re.line <= len(fws.rightStrs) {
+									rSpans = trimWS(re.text, fws.rightStrs[re.line-1], rSpans)
+								}
+							}
 							row.LeftIntra = lSpans
 							row.RightIntra = rSpans
 						}

@@ -15,6 +15,7 @@ type moveCacheKey struct {
 	repoRoot  string
 	baseRev   string
 	targetRev string
+	ignoreWS  bool
 }
 
 type moveFileData struct {
@@ -23,6 +24,8 @@ type moveFileData struct {
 	baseLines   []string
 	targetLines []string
 	rawRows     []diff.Row
+	added       int
+	deleted     int
 	isBinary    bool
 	isTooLarge  bool
 
@@ -31,6 +34,21 @@ type moveFileData struct {
 	scopesJSON  string
 	scopesLJSON string
 	scopesRJSON string
+}
+
+func countDiffRows(rows []diff.Row) (added, deleted int) {
+	for _, r := range rows {
+		switch r.Type {
+		case diff.RowAdd:
+			added++
+		case diff.RowDel:
+			deleted++
+		case diff.RowChange:
+			added++
+			deleted++
+		}
+	}
+	return added, deleted
 }
 
 func extractFileScopes(cleanPath string, baseData []byte, baseLines []string, targetData []byte, targetLines []string) (side, scopesJSON, scopesLJSON, scopesRJSON string) {
@@ -159,7 +177,7 @@ func (s *Server) evictMoveCache(repoRoot string) {
 	}
 }
 
-func (s *Server) peekMoveBundle(repoRoot, baseRev, targetRev string) (*MoveBundle, bool) {
+func (s *Server) peekMoveBundle(repoRoot, baseRev, targetRev string, ignoreWS bool) (*MoveBundle, bool) {
 	if s.moveCache == nil || repoRoot == "" || !vcs.IsImmutableHexRev(baseRev) || !vcs.IsImmutableHexRev(targetRev) {
 		return nil, false
 	}
@@ -167,11 +185,12 @@ func (s *Server) peekMoveBundle(repoRoot, baseRev, targetRev string) (*MoveBundl
 		repoRoot:  repoRoot,
 		baseRev:   baseRev,
 		targetRev: targetRev,
+		ignoreWS:  ignoreWS,
 	}
 	return s.moveCache.Get(key)
 }
 
-func (s *Server) getMoveBundle(repo vcs.Repo, view *engine.ChangeView) *MoveBundle {
+func (s *Server) getMoveBundle(repo vcs.Repo, view *engine.ChangeView, ignoreWS bool) *MoveBundle {
 	if repo == nil || view == nil {
 		return nil
 	}
@@ -184,6 +203,7 @@ func (s *Server) getMoveBundle(repo vcs.Repo, view *engine.ChangeView) *MoveBund
 		repoRoot:  repoRoot,
 		baseRev:   view.BaseRev,
 		targetRev: view.TargetRev,
+		ignoreWS:  ignoreWS,
 	}
 
 	if canCache && s.moveCache != nil {
@@ -192,7 +212,7 @@ func (s *Server) getMoveBundle(repo vcs.Repo, view *engine.ChangeView) *MoveBund
 		}
 	}
 
-	bundle := s.computeMoveBundle(repo, view)
+	bundle := s.computeMoveBundle(repo, view, ignoreWS)
 	if canCache && s.moveCache != nil && bundle != nil {
 		s.moveCache.Put(key, bundle)
 	}
@@ -207,7 +227,7 @@ type fileDiffResult struct {
 	moveFile   *diff.MoveFile
 }
 
-func (s *Server) computeMoveBundle(repo vcs.Repo, view *engine.ChangeView) *MoveBundle {
+func (s *Server) computeMoveBundle(repo vcs.Repo, view *engine.ChangeView, ignoreWS bool) *MoveBundle {
 	var filesToProcess []*vcs.File
 	if len(view.AllFiles) > 0 {
 		filesToProcess = view.AllFiles
@@ -254,7 +274,8 @@ func (s *Server) computeMoveBundle(repo vcs.Repo, view *engine.ChangeView) *Move
 			return
 		}
 
-		rawRows := diff.BuildDiffRows(baseLines, targetLines, diff.DetectLang(cleanPath))
+		rawRows := diff.BuildDiffRows(baseLines, targetLines, diff.DetectLang(cleanPath), ignoreWS)
+		added, deleted := countDiffRows(rawRows)
 
 		mfd := &moveFileData{
 			baseData:    baseData,
@@ -262,6 +283,8 @@ func (s *Server) computeMoveBundle(repo vcs.Repo, view *engine.ChangeView) *Move
 			baseLines:   baseLines,
 			targetLines: targetLines,
 			rawRows:     rawRows,
+			added:       added,
+			deleted:     deleted,
 		}
 		mf := &diff.MoveFile{
 			Path:       cleanPath,
@@ -326,10 +349,11 @@ func (s *Server) computeMoveBundle(repo vcs.Repo, view *engine.ChangeView) *Move
 	}
 
 	if len(moveFiles) > 0 {
-		diff.DetectMoves(moveFiles)
+		diff.DetectMoves(moveFiles, ignoreWS)
 		for i, cp := range cleanPaths {
-			if bundle.files[cp] != nil {
-				bundle.files[cp].rawRows = moveFiles[i].Rows
+			if mfd := bundle.files[cp]; mfd != nil {
+				mfd.rawRows = moveFiles[i].Rows
+				mfd.added, mfd.deleted = countDiffRows(mfd.rawRows)
 			}
 		}
 	}

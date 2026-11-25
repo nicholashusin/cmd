@@ -186,8 +186,12 @@
                 <span>{{.Path}}</span>
               </a>
               <div class="file-stats">
-                {{if gt .AddedLines 0}}<span class="lines-add">+{{.AddedLines}}</span>{{end}}
-                {{if gt .DeletedLines 0}}<span class="lines-del">&minus;{{.DeletedLines}}</span>{{end}}
+                {{if .WhitespaceOnly}}
+                  <span class="badge badge-ws-only">whitespace only</span>
+                {{else}}
+                  {{if gt .AddedLines 0}}<span class="lines-add">+{{.AddedLines}}</span>{{end}}
+                  {{if gt .DeletedLines 0}}<span class="lines-del">&minus;{{.DeletedLines}}</span>{{end}}
+                {{end}}
                 <span class="comment-counts" data-file-counts="{{TrimSlash .Path}}">{{template "comment_counts" .CommentCounts}}</span>
                 <button type="button" class="btn btn-sm file-mark-reviewed-btn {{if .Reviewed}}btn-active{{end}}"
                         data-reviewed-btn="{{TrimSlash .Path}}"
@@ -217,7 +221,9 @@
                   {{if $df.StatusCode}}<span class="file-status status-{{$df.StatusCode}}" title="{{$df.StatusTitle}}">{{$df.StatusCode}}</span>{{end}}
                   <span class="diff-file-label">
                     <span class="diff-file-name" title="{{$df.FilePath}}">{{$df.FilePath}}</span>
-                    {{if or (gt $df.Added 0) (gt $df.Deleted 0)}}
+                    {{if $df.WhitespaceOnly}}
+                      <span class="badge badge-ws-only">whitespace only</span>
+                    {{else if or (gt $df.Added 0) (gt $df.Deleted 0)}}
                       <span class="diff-file-stats">
                         {{if gt $df.Added 0}}<span class="lines-add">+{{$df.Added}}</span>{{end}}
                         {{if gt $df.Deleted 0}}<span class="lines-del">&minus;{{$df.Deleted}}</span>{{end}}

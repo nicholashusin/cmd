@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -45,6 +46,7 @@ type FileDiffData struct {
 	DiffMode           string
 	CtxParam           string
 	IsAllRebased       bool
+	WhitespaceOnly     bool
 	IsBinary           bool
 	IsTooLarge         bool
 	FileReviewed       bool
@@ -239,10 +241,31 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctxParam := r.URL.Query().Get("ctx")
+	ignoreWS := s.ignoreWhitespace()
+
+	var bundle *MoveBundle
+	if diffsParam == "all" || ignoreWS {
+		bundle = s.getMoveBundle(repo, view, ignoreWS)
+	}
+	if ignoreWS && bundle != nil {
+		for _, f := range view.Files {
+			if f == nil || f.Path == vcs.CommitMsgPath {
+				continue
+			}
+			mfd := bundle.files[strings.TrimPrefix(f.Path, "/")]
+			if mfd == nil || mfd.isBinary || mfd.isTooLarge {
+				continue
+			}
+			f.AddedLines = mfd.added
+			f.DeletedLines = mfd.deleted
+			if f.Status == vcs.FileModified && mfd.added == 0 && mfd.deleted == 0 && !bytes.Equal(mfd.baseData, mfd.targetData) {
+				f.WhitespaceOnly = true
+			}
+		}
+	}
 
 	var diffFiles []*FileDiffData
 	if diffsParam == "all" {
-		bundle := s.getMoveBundle(repo, view)
 		eagerLines := 0
 		eagerCount := 0
 		for _, f := range view.Files {
@@ -252,27 +275,28 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 			if canEager {
 				eagerLines += fileLines
 				eagerCount++
-				fd := s.buildFileDiffData(repo, rec, c, view, f.Path, fileIdx, baseSel, targetSel, diffMode, ctxParam, 25000, bundle)
+				fd := s.buildFileDiffData(repo, rec, c, view, f.Path, fileIdx, baseSel, targetSel, diffMode, ctxParam, 25000, bundle, ignoreWS)
 				diffFiles = append(diffFiles, fd)
 			} else {
 				diffFiles = append(diffFiles, &FileDiffData{
-					Lazy:          true,
-					RepoSlug:      rec.Slug,
-					ChangeKey:     c.Key,
-					LeftRev:       view.BaseRev,
-					RightRev:      view.TargetRev,
-					BaseParam:     baseSel,
-					TargetParam:   targetSel,
-					FilePath:      f.Path,
-					StatusCode:    f.StatusCode(),
-					StatusTitle:   f.StatusTitle(),
-					FileIndex:     fileIdx,
-					DiffMode:      diffMode,
-					CtxParam:      ctxParam,
-					FileReviewed:  f.Reviewed,
-					Added:         f.AddedLines,
-					Deleted:       f.DeletedLines,
-					CommentCounts: f.CommentCounts,
+					Lazy:           true,
+					RepoSlug:       rec.Slug,
+					ChangeKey:      c.Key,
+					LeftRev:        view.BaseRev,
+					RightRev:       view.TargetRev,
+					BaseParam:      baseSel,
+					TargetParam:    targetSel,
+					FilePath:       f.Path,
+					StatusCode:     f.StatusCode(),
+					StatusTitle:    f.StatusTitle(),
+					FileIndex:      fileIdx,
+					DiffMode:       diffMode,
+					CtxParam:       ctxParam,
+					FileReviewed:   f.Reviewed,
+					WhitespaceOnly: f.WhitespaceOnly,
+					Added:          f.AddedLines,
+					Deleted:        f.DeletedLines,
+					CommentCounts:  f.CommentCounts,
 				})
 			}
 		}
@@ -388,13 +412,14 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctxParam := r.URL.Query().Get("ctx")
+	ignoreWS := s.ignoreWhitespace()
 
 	// Single-file view has no row cap (maxRows: 0)
 	var bundle *MoveBundle
 	if fileIdx != -1 && vcsPath != vcs.CommitMsgPath {
-		bundle = s.getMoveBundle(repo, view)
+		bundle = s.getMoveBundle(repo, view, ignoreWS)
 	}
-	diffData := s.buildFileDiffData(repo, rec, c, view, vcsPath, fileIdx, baseSel, targetSel, diffMode, ctxParam, 0, bundle)
+	diffData := s.buildFileDiffData(repo, rec, c, view, vcsPath, fileIdx, baseSel, targetSel, diffMode, ctxParam, 0, bundle, ignoreWS)
 	if !diffData.InDiff {
 		diffData.DiffMode = "unified"
 		diffData.SingleColumn = true
@@ -625,7 +650,7 @@ func (s *Server) handleExternalFile(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change, view *engine.ChangeView, vcsPath string, fileIdx int, baseSel, targetSel, diffMode, ctxParam string, maxRows int, bundle *MoveBundle) *FileDiffData {
+func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change, view *engine.ChangeView, vcsPath string, fileIdx int, baseSel, targetSel, diffMode, ctxParam string, maxRows int, bundle *MoveBundle, ignoreWS bool) *FileDiffData {
 	data := &FileDiffData{
 		RepoSlug:    rec.Slug,
 		ChangeKey:   c.Key,
@@ -654,7 +679,7 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 	data.InDiff = matchedFile != nil
 
 	if bundle == nil && fileIdx != -1 && vcsPath != vcs.CommitMsgPath {
-		bundle = s.getMoveBundle(repo, view)
+		bundle = s.getMoveBundle(repo, view, ignoreWS)
 	}
 
 	cleanPath := strings.TrimPrefix(vcsPath, "/")
@@ -689,6 +714,10 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 		baseLines = mfd.baseLines
 		targetLines = mfd.targetLines
 		rawRows = mfd.cloneRows()
+		if ignoreWS {
+			data.Added = mfd.added
+			data.Deleted = mfd.deleted
+		}
 	} else {
 		if !(vcsPath == vcs.CommitMsgPath && !view.HasCommitMsgBase) {
 			baseData, _ = repo.Content(view.BaseRev, vcsPath)
@@ -708,7 +737,10 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 			return data
 		}
 
-		rawRows = diff.BuildDiffRows(baseLines, targetLines, lang)
+		rawRows = diff.BuildDiffRows(baseLines, targetLines, lang, ignoreWS)
+		if ignoreWS && vcsPath != vcs.CommitMsgPath {
+			data.Added, data.Deleted = countDiffRows(rawRows)
+		}
 	}
 
 	// Rebase attribution applies only when comparing two snapshots of the same change
@@ -758,6 +790,9 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 			hasChanges = true
 			break
 		}
+	}
+	if ignoreWS && !hasChanges && matchedFile != nil && matchedFile.Status == vcs.FileModified && vcsPath != vcs.CommitMsgPath && !bytes.Equal(baseData, targetData) {
+		data.WhitespaceOnly = true
 	}
 
 	if mfd != nil {

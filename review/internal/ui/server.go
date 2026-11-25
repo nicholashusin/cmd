@@ -377,6 +377,13 @@ func extractCopyHost(listenAddr string) string {
 	return net.JoinHostPort(host, port)
 }
 
+func (s *Server) ignoreWhitespace() bool {
+	if s.d == nil {
+		return true
+	}
+	return s.d.Pref("ignore_ws", "on") != "off"
+}
+
 // renderTemplate executes the named template with the provided data.
 func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 	t, ok := s.templates[name]
@@ -387,6 +394,9 @@ func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 	if m, ok := data.(map[string]any); ok {
 		if _, exists := m["CopyHost"]; !exists {
 			m["CopyHost"] = s.copyHost
+		}
+		if _, exists := m["IgnoreWSPref"]; !exists {
+			m["IgnoreWSPref"] = s.d.Pref("ignore_ws", "on")
 		}
 		if _, exists := m["SyntaxPref"]; !exists {
 			m["SyntaxPref"] = s.d.Pref("syntax", "on")

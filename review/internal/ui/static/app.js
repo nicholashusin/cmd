@@ -33,6 +33,43 @@
     }).catch(() => {});
   };
 
+  // Whitespace diff management
+  function isIgnoreWSOff() {
+    return document.documentElement.getAttribute('data-ignore-ws') === 'off';
+  }
+
+  function updateWSToggleBtn() {
+    const btn = document.getElementById('wsToggleBtn');
+    if (!btn) return;
+    const off = isIgnoreWSOff();
+    btn.textContent = off ? 'Ignore WS: Off' : 'Ignore WS: On';
+    btn.title = off ? 'Ignore Whitespace Changes' : 'Show Whitespace Changes';
+  }
+
+  window.toggleWhitespace = async function() {
+    const off = isIgnoreWSOff();
+    const next = off ? 'on' : 'off';
+    if (next === 'off') {
+      document.documentElement.setAttribute('data-ignore-ws', 'off');
+    } else {
+      document.documentElement.removeAttribute('data-ignore-ws');
+    }
+    updateWSToggleBtn();
+
+    try {
+      await fetch('/api/prefs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: 'ignore_ws', val: next })
+      });
+    } catch (e) {}
+
+    if (document.querySelector('.diff-container, .diff-all-files, .file-summary-card')) {
+      beginSelfReload();
+      window.location.reload();
+    }
+  };
+
   // Syntax highlighting management
   function isSyntaxOff() {
     return document.documentElement.getAttribute('data-syntax') === 'off';
@@ -717,6 +754,7 @@
 
   function initGlobalButtons() {
     updateThemeToggleBtn();
+    updateWSToggleBtn();
     updateSyntaxToggleBtn();
     restoreExpandedFiles();
     if (window.updateToggleAllFilesBtn) {

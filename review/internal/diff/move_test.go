@@ -77,7 +77,7 @@ func oldFoo(x int, y int) int {
 		},
 	}
 
-	DetectMoves(files)
+	DetectMoves(files, true)
 
 	resRows := files[0].Rows
 
@@ -220,7 +220,7 @@ func TestModifiedIntraFileMove(t *testing.T) {
 		},
 	}
 
-	DetectMoves(files)
+	DetectMoves(files, true)
 	resRows := files[0].Rows
 
 	var movedDels []*MoveInfo
@@ -336,7 +336,7 @@ func TestCrossFileMove(t *testing.T) {
 		},
 	}
 
-	DetectMoves(files)
+	DetectMoves(files, true)
 
 	// Check a.go
 	foundDel := false
@@ -412,7 +412,7 @@ func TestBoilerplateNegative(t *testing.T) {
 		},
 	}
 
-	DetectMoves(files)
+	DetectMoves(files, true)
 
 	for _, r := range files[0].Rows {
 		if r.MovedL != nil || r.MovedR != nil {
@@ -490,7 +490,7 @@ func TestPreservationAcrossCollapseAndUnified(t *testing.T) {
 		},
 	}
 
-	DetectMoves(files)
+	DetectMoves(files, true)
 
 	// Test Collapse
 	collapsed := Collapse(files[0].Rows, 3, nil)
@@ -612,7 +612,7 @@ func functionToMoveAround() int {
 		},
 	}
 
-	DetectMoves(files)
+	DetectMoves(files, true)
 
 	resRows := files[0].Rows
 	prevLeft := 0
@@ -826,12 +826,109 @@ func FuzzDetectMoves(f *testing.F) {
 
 		// 1-file move test
 		f1 := buildFiles(false)
-		DetectMoves(f1)
+		DetectMoves(f1, true)
 		validateFiles(f1)
 
 		// 2-file move test
 		f2 := buildFiles(true)
-		DetectMoves(f2)
+		DetectMoves(f2, false)
 		validateFiles(f2)
+	})
+}
+
+func TestDetectMovesWhitespaceIgnore(t *testing.T) {
+	// Move a struct block to another file, realigning columns on unchanged lines,
+	// changing one field name with extra spacing, and changing whitespace inside a string.
+	leftA := []string{
+		"package p",
+		"",
+		"func loadConfig() Config {",
+		"\thost    := \"localhost\" // server host",
+		"\tport    := 8080        // server port",
+		"\ttimeout := 30          // request timeout",
+		"\tbanner  := \"a b\"       // greeting",
+		"\tmaxConn := 100         // max connections",
+		"\treturn Config{host, port, timeout, banner, maxConn}",
+		"}",
+		"",
+		"var keep = 1",
+	}
+	rightA := []string{
+		"package p",
+		"",
+		"var keep = 1",
+	}
+	leftB := []string{
+		"package p",
+		"",
+		"var other = 2",
+	}
+	rightB := []string{
+		"package p",
+		"",
+		"var other = 2",
+		"",
+		"func loadConfig() Config {",
+		"\thost := \"localhost\" // server host",
+		"\tport := 8080 // server port",
+		"\treadTimeout := 30 // request timeout",
+		"\tbanner := \"a  b\" // greeting",
+		"\tmaxConn := 100 // max connections",
+		"\treturn Config{host, port, readTimeout, banner, maxConn}",
+		"}",
+	}
+
+	makeFiles := func(ignoreWS bool) []MoveFile {
+		return []MoveFile{
+			{Path: "a.go", LeftLines: leftA, RightLines: rightA, Rows: BuildDiffRows(leftA, rightA, LangGo, ignoreWS)},
+			{Path: "b.go", LeftLines: leftB, RightLines: rightB, Rows: BuildDiffRows(leftB, rightB, LangGo, ignoreWS)},
+		}
+	}
+
+	t.Run("ignoreWS=true", func(t *testing.T) {
+		files := makeFiles(true)
+		DetectMoves(files, true)
+
+		var modRightLines []string
+		for _, r := range files[1].Rows {
+			if r.MovedR == nil {
+				continue
+			}
+			if r.MovedR.Modified {
+				modRightLines = append(modRightLines, strings.TrimSpace(r.RightText))
+				// Verify ignorable whitespace isn't highlighted in MovedIntra
+				if strings.Contains(r.RightText, "readTimeout :=") {
+					var parts []string
+					for _, sp := range r.MovedR.MovedIntra {
+						parts = append(parts, r.RightText[sp.Start:sp.End])
+					}
+					for _, p := range parts {
+						if strings.Trim(p, " \t") == "" {
+							t.Errorf("unexpected whitespace-only MovedIntra %q on %q", p, r.RightText)
+						}
+					}
+				}
+			}
+		}
+		// readTimeout declaration, banner string literal whitespace change, and return statement should be Modified.
+		if len(modRightLines) != 3 {
+			t.Fatalf("expected 3 modified moved lines (readTimeout + banner string + return), got %d: %v", len(modRightLines), modRightLines)
+		}
+	})
+
+	t.Run("ignoreWS=false", func(t *testing.T) {
+		files := makeFiles(false)
+		DetectMoves(files, false)
+
+		modCount := 0
+		for _, r := range files[1].Rows {
+			if r.MovedR != nil && r.MovedR.Modified {
+				modCount++
+			}
+		}
+		// Realigned host, port, maxConn also count as modified when ignoreWS is off.
+		if modCount < 6 {
+			t.Fatalf("expected >= 6 modified moved lines with ignoreWS=false, got %d", modCount)
+		}
 	})
 }

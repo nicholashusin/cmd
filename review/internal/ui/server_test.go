@@ -11583,7 +11583,7 @@ func TestUnchangedFileDiffSkipMoveBundleAndLazyPeek(t *testing.T) {
 	}
 
 	// 2. Peek move bundle when cached vs not cached
-	if b, ok := srv.peekMoveBundle(rec.RootPath, c.Parent, c.Rev); ok || b != nil {
+	if b, ok := srv.peekMoveBundle(rec.RootPath, c.Parent, c.Rev, true); ok || b != nil {
 		t.Errorf("expected peekMoveBundle miss before caching, got %v", b)
 	}
 
@@ -11592,14 +11592,17 @@ func TestUnchangedFileDiffSkipMoveBundleAndLazyPeek(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := srv.getMoveBundle(repo, view)
+	b := srv.getMoveBundle(repo, view, true)
 	if b == nil {
 		t.Fatal("getMoveBundle returned nil")
 	}
 
-	// Now peek should hit
-	if b2, ok := srv.peekMoveBundle(rec.RootPath, view.BaseRev, view.TargetRev); !ok || b2 != b {
+	// Now peek should hit for ignoreWS=true and miss for ignoreWS=false
+	if b2, ok := srv.peekMoveBundle(rec.RootPath, view.BaseRev, view.TargetRev, true); !ok || b2 != b {
 		t.Errorf("expected peekMoveBundle hit, got ok=%v, b2=%v", ok, b2)
+	}
+	if b3, ok := srv.peekMoveBundle(rec.RootPath, view.BaseRev, view.TargetRev, false); ok || b3 != nil {
+		t.Errorf("expected peekMoveBundle miss for opposite ignoreWS, got ok=%v, b3=%v", ok, b3)
 	}
 
 	// 3. Lazy diff file endpoint hits peekMoveBundle and returns diff HTML
@@ -21962,5 +21965,102 @@ func TestWebUILiveRebaseSyncAndRealEditSnapshotPending(t *testing.T) {
 	_ = respSnap2.Body.Close()
 	if !snap2Res.Created || snap2Res.Snapshot.Num != 2 {
 		t.Fatalf("expected Snapshot 2 created after real edit, got %+v", snap2Res)
+	}
+}
+
+func TestServerWhitespaceToggleAndFiles(t *testing.T) {
+	srv, ts, d, repoDir := setupTestServer(t)
+	defer srv.broker.Close()
+	defer ts.Close()
+	defer d.Close()
+
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+		}
+	}
+
+	// Add a whitespace-only file change and a mixed file change.
+	if err := os.WriteFile(filepath.Join(repoDir, "ws_only.go"), []byte("package main\n\nfunc f() {\n\ta := 1\n\t_ = a\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "mixed.go"), []byte("package main\n\nfunc g() {\n\tx := 1\n\ty := 2\n\t_, _ = x, y\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "ws_only.go", "mixed.go")
+	run("commit", "-m", "Base commit\n\nChange-Id: Ibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+
+	// Second commit: ws_only.go changes indentation only; mixed.go changes indentation on x and value on y.
+	if err := os.WriteFile(filepath.Join(repoDir, "ws_only.go"), []byte("package main\n\nfunc f() {\n\t\ta := 1\n\t\t_ = a\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "mixed.go"), []byte("package main\n\nfunc g() {\n\t\tx := 1\n\ty := 3\n\t_, _ = x, y\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "ws_only.go", "mixed.go")
+	run("commit", "-m", "Whitespace and code change\n\nChange-Id: Icccccccccccccccccccccccccccccccccccccccc")
+
+	rec, err := d.RepoBySlug(filepath.Base(repoDir))
+	if err != nil || rec == nil {
+		t.Fatalf("RepoBySlug: %v", err)
+	}
+	changeKey := "Icccccccccccccccccccccccccccccccccccccccc"
+
+	getBody := func(url string) string {
+		resp, err := http.Get(url)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s failed: %v", url, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return string(b)
+	}
+
+	// Default: ignore_ws is on. Toggle button must be to the left of syntaxToggleBtn.
+	changeURL := fmt.Sprintf("%s/r/%s/c/%s?diffs=all&mode=unified", ts.URL, rec.Slug, changeKey)
+	bodyOn := getBody(changeURL)
+	wsIdx := strings.Index(bodyOn, `id="wsToggleBtn"`)
+	synIdx := strings.Index(bodyOn, `id="syntaxToggleBtn"`)
+	if wsIdx == -1 || synIdx == -1 || wsIdx >= synIdx {
+		t.Fatalf("expected wsToggleBtn before syntaxToggleBtn, got ws=%d syn=%d", wsIdx, synIdx)
+	}
+	if !strings.Contains(bodyOn, "Ignore WS: On") {
+		t.Errorf("expected Ignore WS: On by default")
+	}
+	if !strings.Contains(bodyOn, "whitespace only") {
+		t.Errorf("expected whitespace only badge for ws_only.go when ignore_ws is on")
+	}
+	if !strings.Contains(bodyOn, "This file only has whitespace changes.") {
+		t.Errorf("expected whitespace-only notice banner for ws_only.go")
+	}
+
+	// Also check File List mode reflects non-whitespace counts (+1 -1 for mixed.go, whitespace only for ws_only.go).
+	listBody := getBody(fmt.Sprintf("%s/r/%s/c/%s?diffs=list", ts.URL, rec.Slug, changeKey))
+	if !strings.Contains(listBody, "whitespace only") {
+		t.Errorf("expected whitespace only badge in File List mode")
+	}
+
+	// Toggle ignore_ws to off via /api/prefs -> ws_only.go now shows actual diff rows and no whitespace-only badge.
+	payload, _ := json.Marshal(map[string]string{"key": "ignore_ws", "val": "off"})
+	resp, err := http.Post(ts.URL+"/api/prefs", "application/json", bytes.NewReader(payload))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/prefs ignore_ws=off failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	bodyOff := getBody(changeURL)
+	if !strings.Contains(bodyOff, `data-ignore-ws="off"`) || !strings.Contains(bodyOff, "Ignore WS: Off") {
+		t.Errorf("expected data-ignore-ws=off and Ignore WS: Off after toggling off")
+	}
+	if strings.Contains(bodyOff, "whitespace only") {
+		t.Errorf("did not expect whitespace only badge when ignore_ws is off")
+	}
+	if strings.Contains(bodyOff, "This file only has whitespace changes.") {
+		t.Errorf("did not expect whitespace-only notice banner when ignore_ws is off")
+	}
+	if !strings.Contains(bodyOff, "row-del") || !strings.Contains(bodyOff, "row-add") {
+		t.Errorf("expected diff rows to render when ignore_ws is off")
 	}
 }

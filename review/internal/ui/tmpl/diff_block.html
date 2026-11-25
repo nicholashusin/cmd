@@ -124,6 +124,13 @@
     </div>
   {{end}}
 
+  {{if .WhitespaceOnly}}
+    <div class="diff-notice-banner">
+      <span>This file only has whitespace changes.</span>
+      <button type="button" class="btn btn-sm" onclick="toggleWhitespace()">Show whitespace</button>
+    </div>
+  {{end}}
+
   {{if .IsBinary}}
     <div style="padding: 24px; text-align: center; color: var(--muted); font-size: 14px; background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 12px;">
       Binary file changed — cannot render textual diff.

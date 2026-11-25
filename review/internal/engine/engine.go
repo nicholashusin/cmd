@@ -19,9 +19,10 @@ import (
 // ViewFile represents a file in a change view with stats and review state.
 type ViewFile struct {
 	*vcs.File
-	Reviewed      bool
-	Threads       []*db.Thread
-	CommentCounts CommentCounts
+	Reviewed       bool
+	WhitespaceOnly bool
+	Threads        []*db.Thread
+	CommentCounts  CommentCounts
 }
 
 // CommentCounts represents counts of unresolved, resolved, and draft comments.

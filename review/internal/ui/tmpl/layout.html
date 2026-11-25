@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en"{{if or (eq .ThemePref "light") (eq .ThemePref "dark")}} data-theme="{{.ThemePref}}"{{end}}{{if eq .SyntaxPref "off"}} data-syntax="off"{{end}}{{if eq .ScopeSidePref "L"}} data-scope-side="L"{{end}} data-state-sig="{{.StateSig}}">
+<html lang="en"{{if or (eq .ThemePref "light") (eq .ThemePref "dark")}} data-theme="{{.ThemePref}}"{{end}}{{if eq .IgnoreWSPref "off"}} data-ignore-ws="off"{{end}}{{if eq .SyntaxPref "off"}} data-syntax="off"{{end}}{{if eq .ScopeSidePref "L"}} data-scope-side="L"{{end}} data-state-sig="{{.StateSig}}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -60,6 +60,7 @@
     <div class="header-actions">
       <div class="header-page-actions">{{block "actions" .}}{{end}}</div>
       <div class="header-util-actions">
+        <button id="wsToggleBtn" class="btn btn-sm" onclick="toggleWhitespace()" title="{{if eq .IgnoreWSPref "off"}}Ignore Whitespace Changes{{else}}Show Whitespace Changes{{end}}">{{if eq .IgnoreWSPref "off"}}Ignore WS: Off{{else}}Ignore WS: On{{end}}</button>
         <button id="syntaxToggleBtn" class="btn btn-sm" onclick="toggleSyntax()" title="Toggle Syntax Highlighting">Syntax: On</button>
         <button id="themeToggleBtn" class="btn btn-sm" onclick="toggleTheme()" title="Toggle Theme">◐</button>
         <button class="btn btn-sm" onclick="toggleShortcutsModal()" title="Keyboard Shortcuts (?)">?</button>

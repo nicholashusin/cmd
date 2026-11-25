@@ -980,6 +980,10 @@ func (s *Server) handleAPIPrefs(w http.ResponseWriter, r *http.Request) {
 		if req.Val != "L" {
 			req.Val = "R"
 		}
+	} else if req.Key == "ignore_ws" {
+		if req.Val != "off" {
+			req.Val = "on"
+		}
 	}
 
 	if err := s.d.SetPref(req.Key, req.Val); err != nil {
@@ -1204,15 +1208,16 @@ func (s *Server) handleAPIDiffFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ignoreWS := s.ignoreWhitespace()
 	var bundle *MoveBundle
 	if vcsPath != vcs.CommitMsgPath {
-		if b, ok := s.peekMoveBundle(rec.RootPath, view.BaseRev, view.TargetRev); ok {
+		if b, ok := s.peekMoveBundle(rec.RootPath, view.BaseRev, view.TargetRev, ignoreWS); ok {
 			bundle = b
 		} else {
-			bundle = s.getMoveBundle(repo, view)
+			bundle = s.getMoveBundle(repo, view, ignoreWS)
 		}
 	}
-	fd := s.buildFileDiffData(repo, rec, c, view, vcsPath, fileIdx, baseSel, targetSel, diffMode, ctxParam, 25000, bundle)
+	fd := s.buildFileDiffData(repo, rec, c, view, vcsPath, fileIdx, baseSel, targetSel, diffMode, ctxParam, 25000, bundle, ignoreWS)
 
 	t, ok := s.templates["change.html"]
 	if !ok {
@@ -1306,11 +1311,12 @@ func (s *Server) handleAPIMovePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ignoreWS := s.ignoreWhitespace()
 	var bundle *MoveBundle
-	if b, ok := s.peekMoveBundle(rec.RootPath, view.BaseRev, view.TargetRev); ok {
+	if b, ok := s.peekMoveBundle(rec.RootPath, view.BaseRev, view.TargetRev, ignoreWS); ok {
 		bundle = b
 	} else {
-		bundle = s.getMoveBundle(repo, view)
+		bundle = s.getMoveBundle(repo, view, ignoreWS)
 	}
 	if bundle == nil {
 		respondNotFound()
