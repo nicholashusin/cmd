@@ -547,6 +547,79 @@ func TestJJConflicts(t *testing.T) {
 	}
 }
 
+func TestJJStaleWorkingCopyFallback(t *testing.T) {
+	if _, err := exec.LookPath("jj"); err != nil {
+		t.Skip("jj not installed")
+	}
+
+	mainDir := t.TempDir()
+	wsDir := filepath.Join(t.TempDir(), "ws2")
+	runJJ := func(dir string, args ...string) string {
+		cmd := exec.Command("jj", append([]string{"--config", `ui.paginate="never"`}, args...)...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("jj %v in %s failed: %s (%v)", args, dir, string(out), err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runJJ(mainDir, "git", "init", "--colocate")
+	runJJ(mainDir, "config", "set", "--repo", "user.name", "JJ Tester")
+	runJJ(mainDir, "config", "set", "--repo", "user.email", "jj@example.com")
+
+	if err := os.WriteFile(filepath.Join(mainDir, "a.txt"), []byte("v1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runJJ(mainDir, "describe", "-m", "main commit")
+	defaultChange := runJJ(mainDir, "log", "--no-graph", "-r", "@", "-T", "change_id")
+
+	// Add a second workspace and modify the default workspace's commit from it,
+	// leaving mainDir's working copy stale.
+	runJJ(mainDir, "workspace", "add", "--name", "ws2", wsDir)
+	if err := os.WriteFile(filepath.Join(wsDir, "a.txt"), []byte("v2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runJJ(wsDir, "squash", "--into", defaultChange)
+
+	// Confirm mainDir really is stale to raw jj.
+	checkCmd := exec.Command("jj", "--config", `ui.paginate="never"`, "status")
+	checkCmd.Dir = mainDir
+	checkOut, checkErr := checkCmd.CombinedOutput()
+	if checkErr == nil || !strings.Contains(strings.ToLower(string(checkOut)), "working copy is stale") {
+		t.Fatalf("expected mainDir working copy to be stale, err=%v out=%s", checkErr, string(checkOut))
+	}
+
+	repo, err := Open(mainDir, nil)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	changes, err := repo.Changes()
+	if err != nil {
+		t.Fatalf("Changes() failed on stale working copy: %v", err)
+	}
+	var found *Change
+	for _, c := range changes {
+		if c.Key == defaultChange {
+			found = c
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected change %s in Changes(), got %+v", defaultChange, changes)
+	}
+
+	// Direct Commit("@") should also fall back to --ignore-working-copy.
+	cAt, err := repo.Commit("@")
+	if err != nil {
+		t.Fatalf("Commit(@) failed on stale working copy: %v", err)
+	}
+	if cAt.Key != defaultChange {
+		t.Errorf("Commit(@).Key = %q, want %q", cAt.Key, defaultChange)
+	}
+}
+
 func TestGitDiffFilesSingleSubprocess(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

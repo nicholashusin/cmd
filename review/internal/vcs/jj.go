@@ -104,6 +104,11 @@ func (r *JJRepo) getOpID() string {
 	return sb.String()
 }
 
+func isStaleWorkingCopyErr(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && bytes.Contains(bytes.ToLower(exitErr.Stderr), []byte("working copy is stale"))
+}
+
 func (r *JJRepo) Changes() ([]*Change, error) {
 	if r.changes != nil {
 		return r.changes, nil
@@ -121,6 +126,9 @@ func (r *JJRepo) Changes() ([]*Change, error) {
 	}
 
 	out, err := r.runCmd("jj", "--config", `ui.paginate="never"`, "log", "--no-graph", "-r", "mutable()", "-T", jjLogTemplate)
+	if isStaleWorkingCopyErr(err) {
+		out, err = r.runCmd("jj", "--ignore-working-copy", "--config", `ui.paginate="never"`, "log", "--no-graph", "-r", "mutable()", "-T", jjLogTemplate)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("querying jj changes: %w", err)
 	}
@@ -221,12 +229,16 @@ func (r *JJRepo) Commit(rev string) (*Change, error) {
 		}
 	}
 
+	ignoreWC := rev != "@" && !strings.Contains(rev, "@")
 	args := []string{"--config", `ui.paginate="never"`}
-	if rev != "@" && !strings.Contains(rev, "@") {
+	if ignoreWC {
 		args = append(args, "--ignore-working-copy")
 	}
 	args = append(args, "log", "--no-graph", "-r", rev, "-T", jjLogTemplate)
 	out, err := r.runCmd("jj", args...)
+	if !ignoreWC && isStaleWorkingCopyErr(err) {
+		out, err = r.runCmd("jj", append([]string{"--ignore-working-copy"}, args...)...)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("resolving jj commit %s: %w", rev, err)
 	}
