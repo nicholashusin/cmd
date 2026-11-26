@@ -194,9 +194,28 @@ func (b *SSEBroker) InitBaseline() {
 
 // Broadcast sends an SSE message to matching connected clients.
 func (b *SSEBroker) Broadcast(event string, payload any) {
+	b.mu.Lock()
+	hasClients := len(b.clients) > 0
+	b.mu.Unlock()
+
+	if !hasClients {
+		if event == "reload" && b.d != nil {
+			dbDig := b.d.StateDigest()
+			b.mu.Lock()
+			b.lastDBDigest = dbDig
+			b.mu.Unlock()
+		}
+		return
+	}
+
 	var evtRepo, evtChange string
 	if event == "reload" {
-		sig := b.StateSignature()
+		var dbDig string
+		var parts db.StateParts
+		if b.d != nil {
+			dbDig, parts = b.d.StateDigestFor(0, "")
+		}
+		sig := buildStateSnapshot(dbDig, b.currentVCSSignature(), parts).Sig
 		m := make(map[string]any)
 		if payload != nil {
 			switch p := payload.(type) {
@@ -224,7 +243,6 @@ func (b *SSEBroker) Broadcast(event string, payload any) {
 		payload = m
 
 		if b.d != nil {
-			dbDig := b.d.StateDigest()
 			b.mu.Lock()
 			b.lastDBDigest = dbDig
 			b.mu.Unlock()
@@ -338,6 +356,12 @@ func (b *SSEBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b.mu.Lock()
+	select {
+	case <-b.stopCh:
+		b.mu.Unlock()
+		return
+	default:
+	}
 	for len(b.clientOrder) >= 64 {
 		oldest := b.clientOrder[0]
 		b.clientOrder = b.clientOrder[1:]

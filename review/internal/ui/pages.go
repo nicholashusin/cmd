@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -97,7 +98,7 @@ func (s *Server) putWSDiffStat(parent, rev string, st vcs.DiffStat) {
 	s.wsStatMu.Unlock()
 }
 
-func computeWSCommitDiffStat(repo vcs.Repo, c *vcs.Change) (vcs.DiffStat, bool) {
+func (s *Server) computeWSCommitDiffStat(repo vcs.Repo, repoRoot string, c *vcs.Change) (vcs.DiffStat, bool) {
 	if repo == nil || c == nil || c.Rev == "" || c.Empty {
 		return vcs.DiffStat{}, false
 	}
@@ -106,9 +107,16 @@ func computeWSCommitDiffStat(repo vcs.Repo, c *vcs.Change) (vcs.DiffStat, bool) 
 		return vcs.DiffStat{}, false
 	}
 
+	var cachedBundle *MoveBundle
+	if s != nil && repoRoot != "" {
+		cachedBundle, _ = s.peekMoveBundle(repoRoot, c.Parent, c.Rev, true)
+	}
+
 	var st vcs.DiffStat
 	wsOnlyFiles := 0
 	hasParent := c.Parent != "" && strings.Trim(c.Parent, "0") != ""
+
+	oider, _ := repo.(vcs.BlobOIDer)
 
 	for _, f := range files {
 		if f == nil || vcs.IsCommitMsgPath(f.Path) {
@@ -128,9 +136,35 @@ func computeWSCommitDiffStat(repo vcs.Repo, c *vcs.Change) (vcs.DiffStat, bool) 
 		}
 
 		cleanPath := strings.TrimPrefix(f.Path, "/")
+		if cachedBundle != nil {
+			if mfd := cachedBundle.files[cleanPath]; mfd != nil {
+				if mfd.isBinary {
+					continue
+				}
+				if mfd.isTooLarge {
+					st.Added += f.AddedLines
+					st.Deleted += f.DeletedLines
+					continue
+				}
+				st.Added += mfd.added
+				st.Deleted += mfd.deleted
+				if mfd.added == 0 && mfd.deleted == 0 && !bytes.Equal(mfd.baseData, mfd.targetData) {
+					wsOnlyFiles++
+				}
+				continue
+			}
+		}
+
 		basePath := f.Path
 		if f.Status == vcs.FileRenamed && f.OldPath != "" {
 			basePath = f.OldPath
+		}
+		if oider != nil && hasParent && f.Status == vcs.FileRenamed {
+			oid1, err1 := oider.BlobOID(c.Parent, basePath)
+			oid2, err2 := oider.BlobOID(c.Rev, f.Path)
+			if err1 == nil && err2 == nil && oid1 != "" && oid1 == oid2 {
+				continue
+			}
 		}
 
 		var baseData, targetData []byte
@@ -168,8 +202,7 @@ func computeWSCommitDiffStat(repo vcs.Repo, c *vcs.Change) (vcs.DiffStat, bool) 
 		if lang == diff.LangNone && basePath != f.Path {
 			lang = diff.DetectLang(basePath)
 		}
-		rows := diff.BuildDiffRows(baseLines, targetLines, lang, true)
-		added, deleted := countDiffRows(rows)
+		added, deleted := diff.CountDiffLines(baseLines, targetLines, lang, true)
 		st.Added += added
 		st.Deleted += deleted
 		if added == 0 && deleted == 0 {
@@ -183,7 +216,7 @@ func computeWSCommitDiffStat(repo vcs.Repo, c *vcs.Change) (vcs.DiffStat, bool) 
 	return st, true
 }
 
-func (s *Server) changeDiffStatsForRows(repo vcs.Repo, rows []vcs.GraphRow, ignoreWS bool) map[string]vcs.DiffStat {
+func (s *Server) changeDiffStatsForRows(repo vcs.Repo, repoRoot string, rows []vcs.GraphRow, ignoreWS bool) map[string]vcs.DiffStat {
 	if repo == nil || len(rows) == 0 {
 		return nil
 	}
@@ -218,7 +251,7 @@ func (s *Server) changeDiffStatsForRows(repo vcs.Repo, rows []vcs.GraphRow, igno
 	results := make([]vcs.DiffStat, len(misses))
 	okFlags := make([]bool, len(misses))
 	if len(misses) == 1 {
-		results[0], okFlags[0] = computeWSCommitDiffStat(repo, misses[0])
+		results[0], okFlags[0] = s.computeWSCommitDiffStat(repo, repoRoot, misses[0])
 	} else {
 		workers := min(len(misses), 4)
 		ch := make(chan int, len(misses))
@@ -232,7 +265,7 @@ func (s *Server) changeDiffStatsForRows(repo vcs.Repo, rows []vcs.GraphRow, igno
 			go func() {
 				defer wg.Done()
 				for idx := range ch {
-					results[idx], okFlags[idx] = computeWSCommitDiffStat(repo, misses[idx])
+					results[idx], okFlags[idx] = s.computeWSCommitDiffStat(repo, repoRoot, misses[idx])
 				}
 			}()
 		}
@@ -320,7 +353,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 					Record:    rec,
 					GraphRows: graphRows,
 					Summaries: sums,
-					DiffStats: s.changeDiffStatsForRows(repo, graphRows, ignoreWS),
+					DiffStats: s.changeDiffStatsForRows(repo, rec.RootPath, graphRows, ignoreWS),
 					Available: true,
 				}
 			}
@@ -364,7 +397,7 @@ func (s *Server) handleRepo(w http.ResponseWriter, r *http.Request) {
 		"Record":        rec,
 		"GraphRows":     graphRows,
 		"Summaries":     sums,
-		"DiffStats":     s.changeDiffStatsForRows(repo, graphRows, s.ignoreWhitespace()),
+		"DiffStats":     s.changeDiffStatsForRows(repo, rec.RootPath, graphRows, s.ignoreWhitespace()),
 		"StateRepo":     rec.Slug,
 	})
 }
@@ -407,12 +440,14 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 		headerStatus = "lgtm"
 	}
 
-	diffsParam := r.URL.Query().Get("diffs")
+	curDiffsPref := s.d.Pref("change_diffs", "all")
+	rawDiffsParam := r.URL.Query().Get("diffs")
+	diffsParam := rawDiffsParam
 	if diffsParam == "" {
-		diffsParam = s.d.Pref("change_diffs", "all")
+		diffsParam = curDiffsPref
 	}
-	if diffsParam == "all" || diffsParam == "list" {
-		_ = s.d.SetPref("change_diffs", diffsParam)
+	if (rawDiffsParam == "all" || rawDiffsParam == "list") && rawDiffsParam != curDiffsPref {
+		_ = s.d.SetPref("change_diffs", rawDiffsParam)
 	}
 
 	diffMode := r.URL.Query().Get("mode")
@@ -449,19 +484,23 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 
 	var diffFiles []*FileDiffData
 	if diffsParam == "all" {
+		diffFiles = make([]*FileDiffData, len(view.Files))
+		type eagerJob struct {
+			idx  int
+			path string
+		}
+		var eagerJobs []eagerJob
 		eagerLines := 0
 		eagerCount := 0
-		for _, f := range view.Files {
-			fileIdx := len(diffFiles)
+		for fileIdx, f := range view.Files {
 			fileLines := f.AddedLines + f.DeletedLines
 			canEager := (eagerCount < 12 && eagerLines+fileLines <= 1000) || (len(f.Threads) > 0 && fileLines <= 3000)
 			if canEager {
 				eagerLines += fileLines
 				eagerCount++
-				fd := s.buildFileDiffData(repo, rec, c, view, f.Path, fileIdx, baseSel, targetSel, diffMode, ctxParam, 25000, bundle, ignoreWS)
-				diffFiles = append(diffFiles, fd)
+				eagerJobs = append(eagerJobs, eagerJob{idx: fileIdx, path: f.Path})
 			} else {
-				diffFiles = append(diffFiles, &FileDiffData{
+				diffFiles[fileIdx] = &FileDiffData{
 					Lazy:           true,
 					RepoSlug:       rec.Slug,
 					ChangeKey:      c.Key,
@@ -483,8 +522,32 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 					Added:          f.AddedLines,
 					Deleted:        f.DeletedLines,
 					CommentCounts:  f.CommentCounts,
-				})
+				}
 			}
+		}
+
+		if len(eagerJobs) <= 2 {
+			for _, j := range eagerJobs {
+				diffFiles[j.idx] = s.buildFileDiffData(repo, rec, c, view, j.path, j.idx, baseSel, targetSel, diffMode, ctxParam, 25000, bundle, ignoreWS)
+			}
+		} else {
+			workers := min(len(eagerJobs), max(1, runtime.NumCPU()), 6)
+			ch := make(chan eagerJob, len(eagerJobs))
+			for _, j := range eagerJobs {
+				ch <- j
+			}
+			close(ch)
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for w := 0; w < workers; w++ {
+				go func() {
+					defer wg.Done()
+					for j := range ch {
+						diffFiles[j.idx] = s.buildFileDiffData(repo, rec, c, view, j.path, j.idx, baseSel, targetSel, diffMode, ctxParam, 25000, bundle, ignoreWS)
+					}
+				}()
+			}
+			wg.Wait()
 		}
 	}
 
@@ -964,8 +1027,10 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 		if baseParentRev != "" && targetParentRev != "" && baseParentRev != targetParentRev {
 			baseParentData, _ := repo.Content(baseParentRev, basePath)
 			targetParentData, _ := repo.Content(targetParentRev, vcsPath)
-			diff.MarkRebased(rawRows, baseData, targetData, baseParentData, targetParentData)
-			data.IsAllRebased = diff.AllRebased(rawRows)
+			if !bytes.Equal(baseParentData, targetParentData) {
+				diff.MarkRebasedLines(rawRows, baseLines, targetLines, diff.SplitLines(baseParentData), diff.SplitLines(targetParentData))
+				data.IsAllRebased = diff.AllRebased(rawRows)
+			}
 		}
 	}
 

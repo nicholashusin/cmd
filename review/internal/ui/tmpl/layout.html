@@ -61,7 +61,7 @@
       <div class="header-page-actions">{{block "actions" .}}{{end}}</div>
       <div class="header-util-actions">
         <button id="wsToggleBtn" class="btn btn-sm" onclick="toggleWhitespace()" title="{{if eq .IgnoreWSPref "off"}}Ignore Whitespace Changes{{else}}Show Whitespace Changes{{end}}">{{if eq .IgnoreWSPref "off"}}Ignore WS: Off{{else}}Ignore WS: On{{end}}</button>
-        <button id="syntaxToggleBtn" class="btn btn-sm" onclick="toggleSyntax()" title="Toggle Syntax Highlighting">Syntax: On</button>
+        <button id="syntaxToggleBtn" class="btn btn-sm" onclick="toggleSyntax()" title="Toggle Syntax Highlighting">{{if eq .SyntaxPref "off"}}Syntax: Off{{else}}Syntax: On{{end}}</button>
         <button id="themeToggleBtn" class="btn btn-sm" onclick="toggleTheme()" title="Toggle Theme">◐</button>
         <button class="btn btn-sm" onclick="toggleShortcutsModal()" title="Keyboard Shortcuts (?)">?</button>
       </div>

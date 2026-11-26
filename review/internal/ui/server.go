@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"html"
 	"html/template"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -420,12 +421,19 @@ func (w *gzipResponseWriter) Write(b []byte) (int, error) {
 }
 
 func (w *gzipResponseWriter) Flush() {
-	if !w.skipGzip && w.gz != nil {
+	if w.wroteHeader && !w.skipGzip && w.gz != nil {
 		_ = w.gz.Flush()
 	}
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		gz, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		return gz
+	},
 }
 
 func compressResponse(next http.Handler) http.Handler {
@@ -437,15 +445,18 @@ func compressResponse(next http.Handler) http.Handler {
 			return
 		}
 
-		gz := gzip.NewWriter(w)
+		gz := gzipWriterPool.Get().(*gzip.Writer)
+		gz.Reset(w)
 		gzw := &gzipResponseWriter{
 			ResponseWriter: w,
 			gz:             gz,
 		}
 		defer func() {
-			if !gzw.skipGzip {
+			if gzw.wroteHeader && !gzw.skipGzip {
 				_ = gz.Close()
 			}
+			gz.Reset(io.Discard)
+			gzipWriterPool.Put(gz)
 		}()
 		next.ServeHTTP(gzw, r)
 	})
@@ -502,9 +513,14 @@ func (s *Server) renderTemplate(w http.ResponseWriter, name string, data any) {
 			s.broker.InitBaseline()
 		}
 	}
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, data); err != nil {
+		http.Error(w, fmt.Sprintf("render template %s: %v", name, err), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = t.Execute(w, data)
+	_, _ = w.Write(buf.Bytes())
 }
 
 // Serve starts listening on listener.

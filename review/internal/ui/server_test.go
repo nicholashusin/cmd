@@ -23645,3 +23645,146 @@ func TestSecurityHostOriginPrefsAndBodyLimit(t *testing.T) {
 		t.Errorf("oversized JSON body: got %d, want 400", resp.StatusCode)
 	}
 }
+
+func TestServerPolishRegressions(t *testing.T) {
+	srv, ts, d, repoDir := setupTestServer(t)
+	defer srv.broker.Close()
+	defer ts.Close()
+	defer d.Close()
+
+	// 1. Missing thread/message returns 404 (never 500 or nil deref panic).
+	for _, tc := range []struct {
+		path string
+		body string
+	}{
+		{"/api/threads/reply", `{"thread_id":999999,"body":"x"}`},
+		{"/api/threads/resolve", `{"thread_id":999999,"resolved":true}`},
+		{"/api/threads/delete", `{"message_id":999999}`},
+		{"/api/threads/edit", `{"message_id":999999,"body":"x"}`},
+	} {
+		resp, err := http.Post(ts.URL+tc.path, "application/json", strings.NewReader(tc.body))
+		if err != nil {
+			t.Fatalf("POST %s: %v", tc.path, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("POST %s missing entity: got %d, want 404", tc.path, resp.StatusCode)
+		}
+	}
+
+	// 2. Default change page view does not mutate change_diffs pref, and Syntax: Off renders via SSR.
+	if err := d.SetPref("syntax", "off"); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := vcs.Open(repoDir, srv.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := repo.Commit("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs, _ := d.Repos()
+	if len(recs) == 0 {
+		t.Fatal("no registered repo")
+	}
+	slug := recs[0].Slug
+	resp, err := http.Get(ts.URL + "/r/" + slug + "/c/" + head.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET change page: %d", resp.StatusCode)
+	}
+	if !strings.Contains(string(bodyBytes), "Syntax: Off") {
+		t.Errorf("expected SSR 'Syntax: Off' when syntax=off pref is set")
+	}
+	if got := d.Pref("change_diffs", "__unset__"); got != "__unset__" {
+		t.Errorf("GET change page unexpectedly wrote change_diffs pref = %q", got)
+	}
+
+	// 3. Pooled gzip middleware skips empty/204 bodies and compresses normal bodies cleanly.
+	gzHandler := compressResponse(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/empty" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("hello gzip world"))
+	}))
+	recEmpty := httptest.NewRecorder()
+	reqEmpty := httptest.NewRequest("GET", "http://127.0.0.1/empty", nil)
+	reqEmpty.Header.Set("Accept-Encoding", "gzip")
+	gzHandler.ServeHTTP(recEmpty, reqEmpty)
+	if recEmpty.Code != http.StatusNoContent {
+		t.Errorf("204 gzip status = %d, want 204", recEmpty.Code)
+	}
+	if recEmpty.Body.Len() != 0 {
+		t.Errorf("204 response wrote %d gzip bytes, want 0", recEmpty.Body.Len())
+	}
+
+	recOK := httptest.NewRecorder()
+	reqOK := httptest.NewRequest("GET", "http://127.0.0.1/ok", nil)
+	reqOK.Header.Set("Accept-Encoding", "gzip")
+	gzHandler.ServeHTTP(recOK, reqOK)
+	if recOK.Header().Get("Content-Encoding") != "gzip" {
+		t.Errorf("expected Content-Encoding: gzip")
+	}
+	zr, err := gzip.NewReader(recOK.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	dec, _ := io.ReadAll(zr)
+	_ = zr.Close()
+	if string(dec) != "hello gzip world" {
+		t.Errorf("decompressed = %q, want %q", string(dec), "hello gzip world")
+	}
+
+	// 4. Unified expand preserves side="R" on blank right-side lines.
+	if err := os.WriteFile(filepath.Join(repoDir, "blank.txt"), []byte("line1\n\nline3\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "blank.txt"}, {"commit", "-m", "add blank"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s (%v)", args, string(out), err)
+		}
+	}
+	head2, err := repo.Commit("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expURL := fmt.Sprintf("%s/api/diff/expand?repo=%s&left_rev=%s&right_rev=%s&path=blank.txt&mode=unified&left_start=1&left_end=3&right_start=1&right_end=3",
+		ts.URL, url.QueryEscape(slug), url.QueryEscape(head2.Rev), url.QueryEscape(head2.Rev))
+	resp, err = http.Get(expURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expHTML, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expand status = %d", resp.StatusCode)
+	}
+	if strings.Contains(string(expHTML), `data-side="L"`) {
+		t.Errorf("unified expand misattributed blank right-side line to side L:\n%s", string(expHTML))
+	}
+
+	// 5. SSEBroker.ServeHTTP returns immediately after Close() instead of hanging.
+	broker := NewSSEBroker(d, srv.cache)
+	broker.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "http://127.0.0.1/api/events", nil)
+		broker.ServeHTTP(w, req)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("SSEBroker.ServeHTTP hung after Close()")
+	}
+}

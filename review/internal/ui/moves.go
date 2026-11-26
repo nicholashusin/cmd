@@ -107,14 +107,26 @@ type MoveBundle struct {
 }
 
 type moveCache struct {
-	mu      sync.Mutex
-	entries map[moveCacheKey]*MoveBundle
-	order   []moveCacheKey
+	mu       sync.Mutex
+	entries  map[moveCacheKey]*MoveBundle
+	order    []moveCacheKey
+	inflight map[moveCacheKey]chan struct{}
 }
 
 func newMoveCache() *moveCache {
 	return &moveCache{
-		entries: make(map[moveCacheKey]*MoveBundle),
+		entries:  make(map[moveCacheKey]*MoveBundle),
+		inflight: make(map[moveCacheKey]chan struct{}),
+	}
+}
+
+func (c *moveCache) promoteLocked(key moveCacheKey) {
+	for i, k := range c.order {
+		if k == key {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			c.order = append(c.order, key)
+			return
+		}
 	}
 }
 
@@ -126,13 +138,7 @@ func (c *moveCache) Get(key moveCacheKey) (*MoveBundle, bool) {
 	if !ok {
 		return nil, false
 	}
-	for i, k := range c.order {
-		if k == key {
-			c.order = append(c.order[:i], c.order[i+1:]...)
-			c.order = append(c.order, key)
-			break
-		}
-	}
+	c.promoteLocked(key)
 	return b, true
 }
 
@@ -142,6 +148,7 @@ func (c *moveCache) Put(key moveCacheKey, bundle *MoveBundle) {
 
 	if _, ok := c.entries[key]; ok {
 		c.entries[key] = bundle
+		c.promoteLocked(key)
 		return
 	}
 
@@ -207,8 +214,29 @@ func (s *Server) getMoveBundle(repo vcs.Repo, view *engine.ChangeView, ignoreWS 
 	}
 
 	if canCache && s.moveCache != nil {
-		if b, ok := s.moveCache.Get(key); ok {
-			return b
+		for {
+			s.moveCache.mu.Lock()
+			if b, ok := s.moveCache.entries[key]; ok {
+				s.moveCache.promoteLocked(key)
+				s.moveCache.mu.Unlock()
+				return b
+			}
+			if waitCh, busy := s.moveCache.inflight[key]; busy {
+				s.moveCache.mu.Unlock()
+				<-waitCh
+				continue
+			}
+			doneCh := make(chan struct{})
+			s.moveCache.inflight[key] = doneCh
+			s.moveCache.mu.Unlock()
+
+			defer func() {
+				s.moveCache.mu.Lock()
+				delete(s.moveCache.inflight, key)
+				s.moveCache.mu.Unlock()
+				close(doneCh)
+			}()
+			break
 		}
 	}
 
@@ -262,8 +290,13 @@ func (s *Server) computeMoveBundle(repo vcs.Repo, view *engine.ChangeView, ignor
 			basePath = f.OldPath
 		}
 
-		baseData, _ := repo.Content(view.BaseRev, basePath)
-		targetData, _ := repo.Content(view.TargetRev, f.Path)
+		var baseData, targetData []byte
+		if f.Status != vcs.FileAdded {
+			baseData, _ = repo.Content(view.BaseRev, basePath)
+		}
+		if f.Status != vcs.FileDeleted {
+			targetData, _ = repo.Content(view.TargetRev, f.Path)
+		}
 
 		if diff.IsBinary(baseData) || diff.IsBinary(targetData) {
 			results[idx] = fileDiffResult{cleanPath: cleanPath, isBinary: true}

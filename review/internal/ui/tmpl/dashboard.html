@@ -21,7 +21,7 @@
           <h2><a href="/r/{{.Record.Slug}}">{{.Record.Slug}}</a></h2>
           <span class="repo-path">{{.Record.RootPath}}</span>
           {{if not .Available}}
-            <span class="badge" style="color: #cf222e; border-color: #cf222e;">missing on disk</span>
+            <span class="badge" style="color: var(--danger); border-color: var(--danger);">missing on disk</span>
           {{end}}
         </div>
         <div>

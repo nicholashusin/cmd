@@ -1,8 +1,11 @@
 package ui
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -31,6 +34,10 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+func isNotFoundErr(err error) bool {
+	return errors.Is(err, sql.ErrNoRows)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -363,6 +370,10 @@ func (s *Server) handleAPIThreadsReply(w http.ResponseWriter, r *http.Request) {
 
 	th, err := s.d.ThreadByID(req.ThreadID)
 	if err != nil {
+		if isNotFoundErr(err) {
+			http.Error(w, "thread not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -396,7 +407,15 @@ func (s *Server) handleAPIThreadsReply(w http.ResponseWriter, r *http.Request) {
 
 	th, err = s.d.ThreadByID(req.ThreadID)
 	if err != nil {
+		if isNotFoundErr(err) {
+			http.Error(w, "thread not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if th == nil {
+		http.Error(w, "thread not found", http.StatusNotFound)
 		return
 	}
 
@@ -437,11 +456,23 @@ func (s *Server) handleAPIThreadsEdit(w http.ResponseWriter, r *http.Request) {
 
 	msg, th, err := s.d.EditMessage(req.MessageID, req.Body)
 	if err != nil {
+		if isNotFoundErr(err) {
+			http.Error(w, "message not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if msg == nil || th == nil {
+		http.Error(w, "message not found", http.StatusNotFound)
 		return
 	}
 	if req.Resolved != nil {
 		if err := s.d.SetResolved(th.ID, *req.Resolved); err != nil {
+			if isNotFoundErr(err) {
+				http.Error(w, "thread not found", http.StatusNotFound)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -495,11 +526,23 @@ func (s *Server) handleAPIThreadsDelete(w http.ResponseWriter, r *http.Request) 
 
 	th, err := s.d.ThreadForMessage(req.MessageID)
 	if err != nil {
+		if isNotFoundErr(err) {
+			http.Error(w, "message not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if th == nil {
+		http.Error(w, "message not found", http.StatusNotFound)
 		return
 	}
 
 	if err := s.d.DeleteDraftMessage(req.MessageID); err != nil {
+		if isNotFoundErr(err) {
+			http.Error(w, "message not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -565,13 +608,25 @@ func (s *Server) handleAPIThreadsResolve(w http.ResponseWriter, r *http.Request)
 	}
 
 	if err := s.d.SetResolved(req.ThreadID, req.Resolved); err != nil {
+		if isNotFoundErr(err) {
+			http.Error(w, "thread not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	th, err := s.d.ThreadByID(req.ThreadID)
 	if err != nil {
+		if isNotFoundErr(err) {
+			http.Error(w, "thread not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if th == nil {
+		http.Error(w, "thread not found", http.StatusNotFound)
 		return
 	}
 
@@ -633,8 +688,7 @@ func (s *Server) handleAPIThreadsList(w http.ResponseWriter, r *http.Request) {
 	if targetSel != "" && targetSel != "live" {
 		isLiveTarget = false
 		if strings.HasPrefix(targetSel, "snap:") {
-			var num int
-			if _, err := fmt.Sscanf(targetSel, "snap:%d", &num); err == nil {
+			if num, err := strconv.Atoi(strings.TrimPrefix(targetSel, "snap:")); err == nil && num > 0 {
 				for _, sn := range snaps {
 					if sn.Num == num {
 						targetRev = sn.Rev
@@ -650,8 +704,7 @@ func (s *Server) handleAPIThreadsList(w http.ResponseWriter, r *http.Request) {
 
 	baseRev := c.Parent
 	if strings.HasPrefix(baseSel, "snap:") {
-		var num int
-		if _, err := fmt.Sscanf(baseSel, "snap:%d", &num); err == nil {
+		if num, err := strconv.Atoi(strings.TrimPrefix(baseSel, "snap:")); err == nil && num > 0 {
 			for _, sn := range snaps {
 				if sn.Num == num {
 					baseRev = sn.Rev
@@ -1029,6 +1082,9 @@ func (s *Server) handleAPIReposForget(w http.ResponseWriter, r *http.Request) {
 	if s.sym != nil {
 		s.sym.Evict(rec.RootPath)
 	}
+	if s.cache != nil {
+		s.cache.Evict(rec.RootPath)
+	}
 	s.evictMoveCache(rec.RootPath)
 
 	s.broker.Broadcast("reload", map[string]any{"reason": "repo_forget", "repo": req.Repo})
@@ -1220,7 +1276,7 @@ func (s *Server) handleAPIDiffExpand(w http.ResponseWriter, r *http.Request) {
 		if mode == "unified" {
 			displayHTML := rightHTML
 			uSide := "R"
-			if displayHTML == "" || rLine == 0 {
+			if rLine == 0 {
 				displayHTML = leftHTML
 				uSide = "L"
 			}
@@ -1289,11 +1345,7 @@ func (s *Server) handleAPIDiffFile(w http.ResponseWriter, r *http.Request) {
 	ignoreWS := s.ignoreWhitespace()
 	var bundle *MoveBundle
 	if vcsPath != vcs.CommitMsgPath {
-		if b, ok := s.peekMoveBundle(rec.RootPath, view.BaseRev, view.TargetRev, ignoreWS); ok {
-			bundle = b
-		} else {
-			bundle = s.getMoveBundle(repo, view, ignoreWS)
-		}
+		bundle = s.getMoveBundle(repo, view, ignoreWS)
 	}
 	fd := s.buildFileDiffData(repo, rec, c, view, vcsPath, fileIdx, baseSel, targetSel, diffMode, ctxParam, 25000, bundle, ignoreWS)
 
@@ -1306,9 +1358,14 @@ func (s *Server) handleAPIDiffFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var buf bytes.Buffer
+	if err := t.ExecuteTemplate(&buf, "diff_block", fd); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = t.ExecuteTemplate(w, "diff_block", fd)
+	_, _ = w.Write(buf.Bytes())
 }
 
 type movePreviewLine struct {
@@ -1390,12 +1447,7 @@ func (s *Server) handleAPIMovePreview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ignoreWS := s.ignoreWhitespace()
-	var bundle *MoveBundle
-	if b, ok := s.peekMoveBundle(rec.RootPath, view.BaseRev, view.TargetRev, ignoreWS); ok {
-		bundle = b
-	} else {
-		bundle = s.getMoveBundle(repo, view, ignoreWS)
-	}
+	bundle := s.getMoveBundle(repo, view, ignoreWS)
 	if bundle == nil {
 		respondNotFound()
 		return
