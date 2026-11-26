@@ -16,11 +16,34 @@ type RepoRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+func sanitizeRepoSlug(raw string) string {
+	raw = strings.ToLower(raw)
+	var b strings.Builder
+	b.Grow(len(raw))
+	lastDash := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' {
+			b.WriteByte(c)
+			lastDash = (c == '-')
+		} else if !lastDash && b.Len() > 0 {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	slug := strings.Trim(b.String(), "-.")
+	if slug == "" {
+		return "repo"
+	}
+	return slug
+}
+
 // EnsureRepo ensures that the repository at rootPath exists in the database.
 // If it does not exist, it creates a new record assigning a unique slug (e.g. base, base.1, ...).
 func (d *DB) EnsureRepo(rootPath string) (*RepoRecord, error) {
 	cleanPath := filepath.Clean(rootPath)
 
+	// Fast read path without starting a write transaction.
 	var rec RepoRecord
 	err := d.db.QueryRow("SELECT id, slug, root_path, created_at FROM repos WHERE root_path = ?", cleanPath).
 		Scan(&rec.ID, &rec.Slug, &rec.RootPath, &rec.CreatedAt)
@@ -31,18 +54,28 @@ func (d *DB) EnsureRepo(rootPath string) (*RepoRecord, error) {
 		return nil, fmt.Errorf("checking repo %s: %w", cleanPath, err)
 	}
 
-	baseSlug := filepath.Base(cleanPath)
-	if baseSlug == "" || baseSlug == "/" || baseSlug == "." {
-		baseSlug = "repo"
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, err
 	}
-	// Sanitize slug
-	baseSlug = strings.ToLower(baseSlug)
+	defer tx.Rollback()
+
+	err = tx.QueryRow("SELECT id, slug, root_path, created_at FROM repos WHERE root_path = ?", cleanPath).
+		Scan(&rec.ID, &rec.Slug, &rec.RootPath, &rec.CreatedAt)
+	if err == nil {
+		return &rec, nil
+	}
+	if err != sql.ErrNoRows {
+		return nil, fmt.Errorf("checking repo %s: %w", cleanPath, err)
+	}
+
+	baseSlug := sanitizeRepoSlug(filepath.Base(cleanPath))
 
 	candidate := baseSlug
 	idx := 1
 	for {
 		var exists int
-		err := d.db.QueryRow("SELECT COUNT(*) FROM repos WHERE slug = ?", candidate).Scan(&exists)
+		err := tx.QueryRow("SELECT COUNT(*) FROM repos WHERE slug = ?", candidate).Scan(&exists)
 		if err != nil {
 			return nil, err
 		}
@@ -54,19 +87,16 @@ func (d *DB) EnsureRepo(rootPath string) (*RepoRecord, error) {
 	}
 
 	now := time.Now().UTC()
-	res, err := d.db.Exec("INSERT INTO repos (slug, root_path, created_at) VALUES (?, ?, ?)", candidate, cleanPath, now)
+	res, err := tx.Exec("INSERT INTO repos (slug, root_path, created_at) VALUES (?, ?, ?)", candidate, cleanPath, now)
 	if err != nil {
-		// In case of race condition
-		err2 := d.db.QueryRow("SELECT id, slug, root_path, created_at FROM repos WHERE root_path = ?", cleanPath).
-			Scan(&rec.ID, &rec.Slug, &rec.RootPath, &rec.CreatedAt)
-		if err2 == nil {
-			return &rec, nil
-		}
 		return nil, fmt.Errorf("inserting repo %s: %w", cleanPath, err)
 	}
 
 	id, err := res.LastInsertId()
 	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -113,8 +143,9 @@ func (d *DB) RepoByID(id int64) (*RepoRecord, error) {
 
 // RepoBySlug finds a repository record by its slug or by its root path.
 func (d *DB) RepoBySlug(slugOrPath string) (*RepoRecord, error) {
+	cleanPath := filepath.Clean(slugOrPath)
 	var r RepoRecord
-	err := d.db.QueryRow("SELECT id, slug, root_path, created_at FROM repos WHERE slug = ? OR root_path = ?", slugOrPath, slugOrPath).
+	err := d.db.QueryRow("SELECT id, slug, root_path, created_at FROM repos WHERE slug = ? OR root_path = ? OR root_path = ?", slugOrPath, slugOrPath, cleanPath).
 		Scan(&r.ID, &r.Slug, &r.RootPath, &r.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil

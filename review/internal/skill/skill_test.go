@@ -65,6 +65,19 @@ func TestSkillRun(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(projectDir, ".gemini", "skills", "review", "SKILL.md")); err != nil {
 		t.Errorf("expected SKILL.md in project directory")
 	}
+
+	// Relative -o joins against workDir and works alongside -print.
+	buf.Reset()
+	relWork := t.TempDir()
+	if err := Run([]string{"-print", "-o", "nested/skill"}, &buf, relWork); err != nil {
+		t.Fatalf("Run -print -o failed: %v", err)
+	}
+	if !strings.Contains(buf.String(), "Review Skill") {
+		t.Errorf("expected skill markdown printed when -print combined with -o")
+	}
+	if _, err := os.Stat(filepath.Join(relWork, "nested", "skill", "SKILL.md")); err != nil {
+		t.Errorf("expected SKILL.md installed relative to workDir: %v", err)
+	}
 }
 
 func TestDefaultInstallPaths(t *testing.T) {

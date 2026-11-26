@@ -1965,3 +1965,101 @@ func TestSecurityRevAndPathContainment(t *testing.T) {
 		t.Errorf("extractGitKey failed valid trailer: got %q", got)
 	}
 }
+
+func TestCatFileEdgeCasesAndCacheEvict(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	run("init", "-b", "main")
+	run("config", "user.name", "Tester")
+	run("config", "user.email", "tester@example.com")
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "main.go")
+	run("commit", "-m", "init")
+	headSHA := run("rev-parse", "HEAD")
+	treeSHA := run("rev-parse", "HEAD^{tree}")
+	blobSHA := run("rev-parse", "HEAD:main.go")
+
+	cache := NewCache()
+	defer cache.Close()
+	repo, err := Open(dir, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitDir := filepath.Join(dir, ".git")
+	cf, err := cache.catFile(gitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. ReadBlob must reject non-blob objects (tree).
+	if _, err := cf.ReadBlob(treeSHA); err == nil {
+		t.Errorf("ReadBlob(treeSHA) succeeded, want error")
+	}
+	// Process should still be healthy after rejecting tree.
+	data, err := cf.ReadBlob(blobSHA)
+	if err != nil || string(data) != "package main\n" {
+		t.Errorf("ReadBlob(blobSHA) = (%q, %v), want package main", string(data), err)
+	}
+
+	// 2. StreamBlobs rejects invalid OIDs before writing to pipe, keeping pipe synced.
+	blobRepo := repo.(GoBlobRepo)
+	if err := blobRepo.StreamBlobs([]string{blobSHA, "bad\noid"}, func(int, string, []byte) {}); err == nil {
+		t.Errorf("StreamBlobs with newline OID succeeded, want error")
+	}
+	gotCount := 0
+	if err := blobRepo.StreamBlobs([]string{blobSHA}, func(_ int, oid string, b []byte) {
+		if oid == blobSHA && string(b) == "package main\n" {
+			gotCount++
+		}
+	}); err != nil || gotCount != 1 {
+		t.Errorf("StreamBlobs after rejected call failed: err=%v count=%d", err, gotCount)
+	}
+
+	// 3. Cache.Evict must not close a CatFileBatch still referenced by another repo root.
+	otherRoot := filepath.Join(t.TempDir(), "wt")
+	cache.registerRepo(otherRoot, gitDir)
+	cf2, err := cache.catFile(gitDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cf2 != cf {
+		t.Fatalf("expected shared CatFileBatch for identical gitDir")
+	}
+	cache.Evict(dir)
+	if data, err := cf2.ReadBlob(blobSHA); err != nil || string(data) != "package main\n" {
+		t.Errorf("shared CatFileBatch broke after evicting first root: (%q, %v)", string(data), err)
+	}
+
+	// 4. StalePinsForSnapshots marks pins stale for an active change with 0 snapshots,
+	//    and PrunePinsForSnapshots deletes them via batch deletion.
+	if err := repo.Pin("k1/snap-1", headSHA); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Pin("k1/snap-2", headSHA); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := StalePinsForSnapshots(repo, map[string]bool{"k1": true}, map[string]map[int]bool{})
+	if err != nil || len(stale) != 2 {
+		t.Errorf("StalePinsForSnapshots active-with-0-snaps = (%v, %v), want 2 stale pins", stale, err)
+	}
+	pruned, err := PrunePinsForSnapshots(repo, map[string]bool{}, nil)
+	if err != nil {
+		t.Fatalf("PrunePinsForSnapshots: %v", err)
+	}
+	if len(pruned) != 2 {
+		t.Errorf("expected 2 pruned pins, got %v", pruned)
+	}
+	if rem, err := repo.ListPins(); err != nil || len(rem) != 0 {
+		t.Errorf("expected 0 remaining pins, got %v (err=%v)", rem, err)
+	}
+}

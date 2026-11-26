@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -210,25 +211,37 @@ func (d *DB) Pref(key, fallback string) string {
 	return val
 }
 
-// SetPref stores a user preference value without invalidating the cached StateDigest.
-func (d *DB) SetPref(key, val string) error {
+// execNonSemantic runs a write to a non-semantic table (prefs, form_drafts) inside a
+// transaction and advances lastTotalChanges atomically when no semantic write intervened.
+func (d *DB) execNonSemantic(query string, args ...any) error {
 	d.digestMu.Lock()
 	defer d.digestMu.Unlock()
 
-	var beforeTC int64
-	beforeErr := d.db.QueryRow("SELECT total_changes()").Scan(&beforeTC)
-
-	_, err := d.db.Exec("INSERT INTO prefs (key, val) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET val = excluded.val", key, val)
+	tx, err := d.db.Begin()
 	if err != nil {
 		return err
 	}
-	if d.digestValid && beforeErr == nil && beforeTC == d.lastTotalChanges {
-		var afterTC int64
-		if err := d.db.QueryRow("SELECT total_changes()").Scan(&afterTC); err == nil {
-			d.lastTotalChanges = afterTC
-		}
+	defer tx.Rollback()
+
+	var beforeTC int64
+	beforeErr := tx.QueryRow("SELECT total_changes()").Scan(&beforeTC)
+	if _, err := tx.Exec(query, args...); err != nil {
+		return err
+	}
+	var afterTC int64
+	afterErr := tx.QueryRow("SELECT total_changes()").Scan(&afterTC)
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if d.digestValid && beforeErr == nil && afterErr == nil && beforeTC == d.lastTotalChanges {
+		d.lastTotalChanges = afterTC
 	}
 	return nil
+}
+
+// SetPref stores a user preference value without invalidating the cached StateDigest.
+func (d *DB) SetPref(key, val string) error {
+	return d.execNonSemantic("INSERT INTO prefs (key, val) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET val = excluded.val", key, val)
 }
 
 func shortSHA(sum [32]byte) string {
@@ -267,9 +280,9 @@ func (d *DB) StateDigestFor(repoID int64, changeKey string) (string, StateParts)
 			d.db.QueryRow("PRAGMA data_version").Scan(&afterDV) == nil &&
 			afterTC == totalChanges && afterDV == dataVersion {
 			d.digestMu.Lock()
-			newer := !d.digestValid || totalChanges > d.lastTotalChanges || dataVersion > d.lastDataVersion
 			same := d.digestValid && totalChanges == d.lastTotalChanges && dataVersion == d.lastDataVersion
-			if newer {
+			stale := d.digestValid && ((dataVersion < d.lastDataVersion) || (dataVersion == d.lastDataVersion && totalChanges < d.lastTotalChanges))
+			if !same && !stale {
 				d.digestCache = make(map[stateDigestKey]cachedStateDigest)
 				d.lastTotalChanges = totalChanges
 				d.lastDataVersion = dataVersion
@@ -294,14 +307,23 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 	hMarks := sha256.New()
 	queryFailed := false
 
+	tx, txErr := d.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	var q interface {
+		Query(query string, args ...any) (*sql.Rows, error)
+	} = d.db
+	if txErr == nil {
+		defer tx.Rollback()
+		q = tx
+	}
+
 	// 1. repos
 	if changeKey == "" {
 		var rows *sql.Rows
 		var err error
 		if repoID == 0 {
-			rows, err = d.db.Query("SELECT id, slug, root_path FROM repos ORDER BY id")
+			rows, err = q.Query("SELECT id, slug, root_path FROM repos ORDER BY id")
 		} else {
-			rows, err = d.db.Query("SELECT id, slug, root_path FROM repos WHERE id = ? ORDER BY id", repoID)
+			rows, err = q.Query("SELECT id, slug, root_path FROM repos WHERE id = ? ORDER BY id", repoID)
 		}
 		if err == nil {
 			for rows.Next() {
@@ -309,6 +331,8 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 				var slug, rootPath string
 				if err := rows.Scan(&id, &slug, &rootPath); err == nil {
 					fmt.Fprintf(hRepos, "repo:%d:%s:%s\n", id, slug, rootPath)
+				} else {
+					queryFailed = true
 				}
 			}
 			if rows.Err() != nil {
@@ -326,11 +350,11 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 		var err error
 		switch {
 		case repoID == 0:
-			rows, err = d.db.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots ORDER BY id")
+			rows, err = q.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots ORDER BY id")
 		case changeKey == "":
-			rows, err = d.db.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots WHERE repo_id = ? ORDER BY id", repoID)
+			rows, err = q.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots WHERE repo_id = ? ORDER BY id", repoID)
 		default:
-			rows, err = d.db.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots WHERE repo_id = ? AND change_key = ? ORDER BY id", repoID, changeKey)
+			rows, err = q.Query("SELECT id, repo_id, change_key, num, rev, parent_rev FROM snapshots WHERE repo_id = ? AND change_key = ? ORDER BY id", repoID, changeKey)
 		}
 		if err == nil {
 			for rows.Next() {
@@ -340,6 +364,8 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 				var rev, parentRev string
 				if err := rows.Scan(&id, &rID, &ck, &num, &rev, &parentRev); err == nil {
 					fmt.Fprintf(hSnaps, "snap:%d:%d:%s:%d:%s:%s\n", id, rID, ck, num, rev, parentRev)
+				} else {
+					queryFailed = true
 				}
 			}
 			if rows.Err() != nil {
@@ -357,11 +383,11 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 		var err error
 		switch {
 		case repoID == 0:
-			rows, err = d.db.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads ORDER BY id")
+			rows, err = q.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads ORDER BY id")
 		case changeKey == "":
-			rows, err = d.db.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads WHERE repo_id = ? ORDER BY id", repoID)
+			rows, err = q.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads WHERE repo_id = ? ORDER BY id", repoID)
 		default:
-			rows, err = d.db.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads WHERE repo_id = ? AND change_key = ? ORDER BY id", repoID, changeKey)
+			rows, err = q.Query("SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved FROM threads WHERE repo_id = ? AND change_key = ? ORDER BY id", repoID, changeKey)
 		}
 		if err == nil {
 			for rows.Next() {
@@ -374,6 +400,8 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 				var resolved bool
 				if err := rows.Scan(&id, &rID, &ck, &rev, &snapNum, &path, &side, &startLine, &endLine, &startCol, &endCol, &resolved); err == nil {
 					fmt.Fprintf(hComments, "thread:%d:%d:%s:%s:%d:%s:%s:%d:%d:%d:%d:%t\n", id, rID, ck, rev, snapNum, path, side, startLine, endLine, startCol, endCol, resolved)
+				} else {
+					queryFailed = true
 				}
 			}
 			if rows.Err() != nil {
@@ -391,11 +419,11 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 		var err error
 		switch {
 		case repoID == 0:
-			rows, err = d.db.Query("SELECT id, thread_id, author, draft, body FROM messages ORDER BY id")
+			rows, err = q.Query("SELECT id, thread_id, author, draft, body FROM messages ORDER BY id")
 		case changeKey == "":
-			rows, err = d.db.Query("SELECT m.id, m.thread_id, m.author, m.draft, m.body FROM messages m JOIN threads t ON m.thread_id = t.id WHERE t.repo_id = ? ORDER BY m.id", repoID)
+			rows, err = q.Query("SELECT m.id, m.thread_id, m.author, m.draft, m.body FROM messages m JOIN threads t ON m.thread_id = t.id WHERE t.repo_id = ? ORDER BY m.id", repoID)
 		default:
-			rows, err = d.db.Query("SELECT m.id, m.thread_id, m.author, m.draft, m.body FROM messages m JOIN threads t ON m.thread_id = t.id WHERE t.repo_id = ? AND t.change_key = ? ORDER BY m.id", repoID, changeKey)
+			rows, err = q.Query("SELECT m.id, m.thread_id, m.author, m.draft, m.body FROM messages m JOIN threads t ON m.thread_id = t.id WHERE t.repo_id = ? AND t.change_key = ? ORDER BY m.id", repoID, changeKey)
 		}
 		if err == nil {
 			for rows.Next() {
@@ -405,6 +433,8 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 				var body string
 				if err := rows.Scan(&id, &threadID, &author, &draft, &body); err == nil {
 					fmt.Fprintf(hComments, "msg:%d:%d:%s:%t:%s\n", id, threadID, author, draft, body)
+				} else {
+					queryFailed = true
 				}
 			}
 			if rows.Err() != nil {
@@ -422,11 +452,11 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 		var err error
 		switch {
 		case repoID == 0:
-			rows, err = d.db.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE reviewed = 1 ORDER BY repo_id, change_key, rev, path")
+			rows, err = q.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE reviewed = 1 ORDER BY repo_id, change_key, rev, path")
 		case changeKey == "":
-			rows, err = d.db.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE repo_id = ? AND reviewed = 1 ORDER BY change_key, rev, path", repoID)
+			rows, err = q.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE repo_id = ? AND reviewed = 1 ORDER BY change_key, rev, path", repoID)
 		default:
-			rows, err = d.db.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE repo_id = ? AND change_key = ? AND reviewed = 1 ORDER BY rev, path", repoID, changeKey)
+			rows, err = q.Query("SELECT repo_id, change_key, rev, path FROM file_marks WHERE repo_id = ? AND change_key = ? AND reviewed = 1 ORDER BY rev, path", repoID, changeKey)
 		}
 		if err == nil {
 			for rows.Next() {
@@ -434,6 +464,8 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 				var ck, rev, path string
 				if err := rows.Scan(&rID, &ck, &rev, &path); err == nil {
 					fmt.Fprintf(hMarks, "file_mark:%d:%s:%s:%s\n", rID, ck, rev, path)
+				} else {
+					queryFailed = true
 				}
 			}
 			if rows.Err() != nil {
@@ -451,11 +483,11 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 		var err error
 		switch {
 		case repoID == 0:
-			rows, err = d.db.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE reviewed = 1 OR lgtm = 1 ORDER BY repo_id, change_key, rev")
+			rows, err = q.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE reviewed = 1 OR lgtm = 1 ORDER BY repo_id, change_key, rev")
 		case changeKey == "":
-			rows, err = d.db.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE repo_id = ? AND (reviewed = 1 OR lgtm = 1) ORDER BY change_key, rev", repoID)
+			rows, err = q.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE repo_id = ? AND (reviewed = 1 OR lgtm = 1) ORDER BY change_key, rev", repoID)
 		default:
-			rows, err = d.db.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE repo_id = ? AND change_key = ? AND (reviewed = 1 OR lgtm = 1) ORDER BY rev", repoID, changeKey)
+			rows, err = q.Query("SELECT repo_id, change_key, rev, reviewed, lgtm FROM rev_marks WHERE repo_id = ? AND change_key = ? AND (reviewed = 1 OR lgtm = 1) ORDER BY rev", repoID, changeKey)
 		}
 		if err == nil {
 			for rows.Next() {
@@ -464,6 +496,8 @@ func (d *DB) computeStateDigest(repoID int64, changeKey string) (string, StatePa
 				var reviewed, lgtm bool
 				if err := rows.Scan(&rID, &ck, &rev, &reviewed, &lgtm); err == nil {
 					fmt.Fprintf(hMarks, "rev_mark:%d:%s:%s:%t:%t\n", rID, ck, rev, reviewed, lgtm)
+				} else {
+					queryFailed = true
 				}
 			}
 			if rows.Err() != nil {

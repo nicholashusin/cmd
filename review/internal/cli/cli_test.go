@@ -882,3 +882,81 @@ func TestCLISnapshotTargetAndGCRedundantSnapshots(t *testing.T) {
 		}
 	})
 }
+
+func TestCLIEdgeCases(t *testing.T) {
+	env, dbFile, repoDir := setupTestCLIEnv(t)
+
+	// 1. comments -json with zero comments emits "[]", never "null".
+	env.Stdout.(*bytes.Buffer).Reset()
+	if err := env.Run([]string{"comments", "-json", "-db", dbFile}); err != nil {
+		t.Fatalf("comments -json failed: %v", err)
+	}
+	if got := strings.TrimSpace(env.Stdout.(*bytes.Buffer).String()); got != "[]" {
+		t.Errorf("empty comments -json = %q, want %q", got, "[]")
+	}
+
+	// 2. add rejects invalid -side and malformed line ranges.
+	if err := env.Run([]string{"add", "-side", "X", "-db", dbFile, "HEAD", "hello.txt:1", "hi"}); err == nil {
+		t.Errorf("expected error for invalid -side X")
+	}
+	if err := env.Run([]string{"add", "-db", dbFile, "HEAD", "hello.txt:10-5", "hi"}); err == nil {
+		t.Errorf("expected error for reversed line range 10-5")
+	}
+	if err := env.Run([]string{"add", "-db", dbFile, "HEAD", "hello.txt:0", "hi"}); err == nil {
+		t.Errorf("expected error for line 0")
+	}
+
+	// 3. unresolve error message says "unresolve" and validates all IDs before mutating.
+	if err := env.Run([]string{"add", "-db", dbFile, "HEAD", "hello.txt:1", "comment 1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.Run([]string{"unresolve", "-db", dbFile}); err == nil || !strings.Contains(err.Error(), "unresolve") {
+		t.Errorf("expected unresolve usage error, got %v", err)
+	}
+	if err := env.Run([]string{"resolve", "-db", dbFile, "1", "notanint"}); err == nil {
+		t.Fatalf("expected error for invalid second thread ID")
+	}
+	// Thread 1 must still be open since validation happened before mutation.
+	d, err := db.Open(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	th, err := d.ThreadByID(1)
+	d.Close()
+	if err != nil || th == nil || th.Resolved {
+		t.Errorf("thread #1 was mutated despite invalid second ID: %+v (err=%v)", th, err)
+	}
+
+	// 4. forget works from a subdirectory of the repo.
+	subDir := filepath.Join(repoDir, "sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	subEnv := &Env{
+		Stdin:   strings.NewReader(""),
+		Stdout:  &bytes.Buffer{},
+		Stderr:  &bytes.Buffer{},
+		WorkDir: subDir,
+	}
+	if err := subEnv.Run([]string{"forget", "-db", dbFile}); err != nil {
+		t.Fatalf("forget from subdir failed: %v", err)
+	}
+	if out := subEnv.Stdout.(*bytes.Buffer).String(); !strings.Contains(out, "Forgot repository") {
+		t.Errorf("expected forget from subdir to find repo root, got: %s", out)
+	}
+
+	// 5. search does not create DB or register repo.
+	unusedDB := filepath.Join(t.TempDir(), "should-not-exist.db")
+	env.Stdout.(*bytes.Buffer).Reset()
+	if err := env.Run([]string{"search", "-db", unusedDB, "line 2"}); err != nil {
+		t.Fatalf("search failed: %v", err)
+	}
+	if _, err := os.Stat(unusedDB); !os.IsNotExist(err) {
+		t.Errorf("review search unexpectedly created DB %s", unusedDB)
+	}
+
+	// 6. subcommand -h returns nil (exit 0), not flag.ErrHelp error.
+	if err := env.Run([]string{"comments", "-h"}); err != nil {
+		t.Errorf("comments -h returned error %v, want nil", err)
+	}
+}

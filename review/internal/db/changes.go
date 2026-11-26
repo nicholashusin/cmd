@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -548,16 +549,26 @@ func (d *DB) AddMessage(threadID int64, author, body string, draft bool) (*Messa
 
 // EditMessage updates the body of a message.
 func (d *DB) EditMessage(msgID int64, body string) (*Message, *Thread, error) {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+
 	now := time.Now().UTC()
 	var threadID int64
-	err := d.db.QueryRow("SELECT thread_id FROM messages WHERE id = ?", msgID).Scan(&threadID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("message %d not found: %w", msgID, err)
+	if err := tx.QueryRow("SELECT thread_id FROM messages WHERE id = ?", msgID).Scan(&threadID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, fmt.Errorf("message %d not found: %w", msgID, err)
+		}
+		return nil, nil, fmt.Errorf("looking up message %d: %w", msgID, err)
 	}
 
-	_, err = d.db.Exec("UPDATE messages SET body = ?, updated_at = ? WHERE id = ?", body, now, msgID)
-	if err != nil {
+	if _, err := tx.Exec("UPDATE messages SET body = ?, updated_at = ? WHERE id = ?", body, now, msgID); err != nil {
 		return nil, nil, fmt.Errorf("updating message: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
 	}
 
 	th, err := d.ThreadByID(threadID)
@@ -571,6 +582,9 @@ func (d *DB) EditMessage(msgID int64, body string) (*Message, *Thread, error) {
 			updatedMsg = m
 			break
 		}
+	}
+	if updatedMsg == nil {
+		return nil, nil, fmt.Errorf("message %d not found after update: %w", msgID, sql.ErrNoRows)
 	}
 
 	return updatedMsg, th, nil
@@ -589,7 +603,10 @@ func (d *DB) DeleteDraftMessage(msgID int64) error {
 	var isDraft int
 	err = tx.QueryRow("SELECT thread_id, draft FROM messages WHERE id = ?", msgID).Scan(&threadID, &isDraft)
 	if err != nil {
-		return fmt.Errorf("message %d not found: %w", msgID, err)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("message %d not found: %w", msgID, err)
+		}
+		return fmt.Errorf("looking up message %d: %w", msgID, err)
 	}
 	if isDraft != 1 {
 		return fmt.Errorf("cannot delete published message %d", msgID)
@@ -600,9 +617,13 @@ func (d *DB) DeleteDraftMessage(msgID int64) error {
 	}
 
 	var remaining int
-	_ = tx.QueryRow("SELECT COUNT(*) FROM messages WHERE thread_id = ?", threadID).Scan(&remaining)
+	if err := tx.QueryRow("SELECT COUNT(*) FROM messages WHERE thread_id = ?", threadID).Scan(&remaining); err != nil {
+		return fmt.Errorf("counting remaining messages: %w", err)
+	}
 	if remaining == 0 {
-		_, _ = tx.Exec("DELETE FROM threads WHERE id = ?", threadID)
+		if _, err := tx.Exec("DELETE FROM threads WHERE id = ?", threadID); err != nil {
+			return fmt.Errorf("deleting empty thread: %w", err)
+		}
 	}
 
 	return tx.Commit()
@@ -623,7 +644,7 @@ func (d *DB) SetResolved(threadID int64, resolved bool) error {
 		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("thread %d not found", threadID)
+		return fmt.Errorf("thread %d not found: %w", threadID, sql.ErrNoRows)
 	}
 	return nil
 }
@@ -822,7 +843,7 @@ func (d *DB) ThreadsForChanges(repoID int64, changeKeys []string) (map[string][]
 		SELECT id, repo_id, change_key, rev, snapshot_num, path, side, start_line, end_line, start_col, end_col, resolved, anchor_lines, created_at
 		FROM threads
 		WHERE repo_id = ? AND change_key IN (`+inClause+`)
-		ORDER BY start_line ASC, id ASC
+		ORDER BY path ASC, start_line ASC, id ASC
 	`, args...)
 	if err != nil {
 		return nil, err
@@ -830,7 +851,6 @@ func (d *DB) ThreadsForChanges(repoID int64, changeKeys []string) (map[string][]
 	defer rows.Close()
 
 	threadMap := make(map[int64]*Thread)
-	var threadIDs []int64
 
 	for rows.Next() {
 		var th Thread
@@ -841,30 +861,22 @@ func (d *DB) ThreadsForChanges(repoID int64, changeKeys []string) (map[string][]
 		th.Resolved = (resolvedInt == 1)
 		result[th.ChangeKey] = append(result[th.ChangeKey], &th)
 		threadMap[th.ID] = &th
-		threadIDs = append(threadIDs, th.ID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	if len(threadIDs) == 0 {
+	if len(threadMap) == 0 {
 		return result, nil
 	}
 
-	mPlaceholders := make([]string, len(threadIDs))
-	mArgs := make([]any, len(threadIDs))
-	for i, id := range threadIDs {
-		mPlaceholders[i] = "?"
-		mArgs[i] = id
-	}
-	mInClause := strings.Join(mPlaceholders, ",")
-
 	mRows, err := d.db.Query(`
-		SELECT id, thread_id, author, body, draft, created_at, updated_at
-		FROM messages
-		WHERE thread_id IN (`+mInClause+`)
-		ORDER BY id ASC
-	`, mArgs...)
+		SELECT m.id, m.thread_id, m.author, m.body, m.draft, m.created_at, m.updated_at
+		FROM messages m
+		JOIN threads t ON m.thread_id = t.id
+		WHERE t.repo_id = ? AND t.change_key IN (`+inClause+`)
+		ORDER BY m.id ASC
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1109,7 +1121,9 @@ func (d *DB) SetRevMark(repoID int64, changeKey, rev string, reviewed, lgtm *boo
 			curLGTM = 1
 		} else {
 			curLGTM = 0
-			_, _ = tx.Exec(`UPDATE rev_marks SET lgtm = 0, updated_at = ? WHERE repo_id = ? AND change_key = ?`, now, repoID, changeKey)
+			if _, err := tx.Exec(`UPDATE rev_marks SET lgtm = 0, updated_at = ? WHERE repo_id = ? AND change_key = ?`, now, repoID, changeKey); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1143,129 +1157,11 @@ func (d *DB) RevMark(repoID int64, changeKey, rev string) (reviewed bool, lgtm b
 
 // RepoSummaries computes summary statistics for all changes in repoID using 4 efficient batched queries.
 func (d *DB) RepoSummaries(repoID int64) (map[string]*ChangeSummary, error) {
-	summaries := make(map[string]*ChangeSummary)
-
-	getSummary := func(key string) *ChangeSummary {
-		if s, ok := summaries[key]; ok {
-			return s
-		}
-		s := &ChangeSummary{ChangeKey: key}
-		summaries[key] = s
-		return s
-	}
-
-	// 1. Snapshot counts and latest snapshot
-	sRows, err := d.db.Query(`
-		SELECT s.id, s.repo_id, s.change_key, s.num, s.rev, s.parent_rev, s.created_at
-		FROM snapshots s
-		WHERE s.repo_id = ?
-		ORDER BY s.change_key ASC, s.num DESC
-	`, repoID)
+	multi, err := d.RepoSummariesMulti([]int64{repoID})
 	if err != nil {
-		return nil, fmt.Errorf("loading snapshot summaries: %w", err)
-	}
-	defer sRows.Close()
-
-	for sRows.Next() {
-		var s Snapshot
-		if err := sRows.Scan(&s.ID, &s.RepoID, &s.ChangeKey, &s.Num, &s.Rev, &s.ParentRev, &s.CreatedAt); err != nil {
-			return nil, err
-		}
-		sum := getSummary(s.ChangeKey)
-		sum.SnapshotCount++
-		if sum.LatestSnapshot == nil {
-			sum.LatestSnapshot = &s
-		}
-	}
-	if err := sRows.Err(); err != nil {
 		return nil, err
 	}
-
-	// 2. Rev marks (reviewed, lgtm)
-	mRows, err := d.db.Query(`
-		SELECT change_key, reviewed, lgtm
-		FROM rev_marks
-		WHERE repo_id = ?
-	`, repoID)
-	if err != nil {
-		return nil, fmt.Errorf("loading rev mark summaries: %w", err)
-	}
-	defer mRows.Close()
-
-	for mRows.Next() {
-		var key string
-		var rInt, lInt int
-		if err := mRows.Scan(&key, &rInt, &lInt); err != nil {
-			return nil, err
-		}
-		sum := getSummary(key)
-		if rInt == 1 {
-			sum.Reviewed = true
-		}
-		if lInt == 1 {
-			sum.LGTM = true
-		}
-	}
-	if err := mRows.Err(); err != nil {
-		return nil, err
-	}
-
-	// 3. Thread counts (open vs resolved)
-	tRows, err := d.db.Query(`
-		SELECT change_key, resolved, COUNT(*)
-		FROM threads
-		WHERE repo_id = ?
-		GROUP BY change_key, resolved
-	`, repoID)
-	if err != nil {
-		return nil, fmt.Errorf("loading thread summaries: %w", err)
-	}
-	defer tRows.Close()
-
-	for tRows.Next() {
-		var key string
-		var resolvedInt, count int
-		if err := tRows.Scan(&key, &resolvedInt, &count); err != nil {
-			return nil, err
-		}
-		sum := getSummary(key)
-		if resolvedInt == 1 {
-			sum.ResolvedThreads += count
-		} else {
-			sum.OpenThreads += count
-		}
-	}
-	if err := tRows.Err(); err != nil {
-		return nil, err
-	}
-
-	// 4. Draft message counts
-	dRows, err := d.db.Query(`
-		SELECT t.change_key, COUNT(*)
-		FROM messages m
-		JOIN threads t ON m.thread_id = t.id
-		WHERE t.repo_id = ? AND m.draft = 1
-		GROUP BY t.change_key
-	`, repoID)
-	if err != nil {
-		return nil, fmt.Errorf("loading draft summaries: %w", err)
-	}
-	defer dRows.Close()
-
-	for dRows.Next() {
-		var key string
-		var count int
-		if err := dRows.Scan(&key, &count); err != nil {
-			return nil, err
-		}
-		sum := getSummary(key)
-		sum.DraftCount = count
-	}
-	if err := dRows.Err(); err != nil {
-		return nil, err
-	}
-
-	return summaries, nil
+	return multi[repoID], nil
 }
 
 // RepoSummariesMulti computes summary statistics for all changes across multiple repos using 4 batched queries.
@@ -1540,11 +1436,17 @@ func (d *DB) PruneChanges(repoID int64, keepKeys map[string]bool) ([]string, err
 	defer tx.Rollback()
 
 	for _, k := range toPrune {
-		_, _ = tx.Exec("DELETE FROM snapshots WHERE repo_id = ? AND change_key = ?", repoID, k)
-		_, _ = tx.Exec("DELETE FROM threads WHERE repo_id = ? AND change_key = ?", repoID, k)
-		_, _ = tx.Exec("DELETE FROM file_marks WHERE repo_id = ? AND change_key = ?", repoID, k)
-		_, _ = tx.Exec("DELETE FROM rev_marks WHERE repo_id = ? AND change_key = ?", repoID, k)
-		_, _ = tx.Exec("DELETE FROM form_drafts WHERE repo_id = ? AND change_key = ?", repoID, k)
+		for _, q := range []string{
+			"DELETE FROM snapshots WHERE repo_id = ? AND change_key = ?",
+			"DELETE FROM threads WHERE repo_id = ? AND change_key = ?",
+			"DELETE FROM file_marks WHERE repo_id = ? AND change_key = ?",
+			"DELETE FROM rev_marks WHERE repo_id = ? AND change_key = ?",
+			"DELETE FROM form_drafts WHERE repo_id = ? AND change_key = ?",
+		} {
+			if _, err := tx.Exec(q, repoID, k); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1579,18 +1481,11 @@ func (d *DB) SaveFormDraft(repoID int64, changeKey, draftKey, targetPath, side s
 	if strings.TrimSpace(content) == "" {
 		return d.DeleteFormDraft(repoID, changeKey, draftKey)
 	}
-	d.digestMu.Lock()
-	defer d.digestMu.Unlock()
-
-	var beforeTC int64
-	beforeErr := d.db.QueryRow("SELECT total_changes()").Scan(&beforeTC)
-
 	unresolvedInt := 0
 	if unresolved {
 		unresolvedInt = 1
 	}
-
-	_, err := d.db.Exec(`
+	return d.execNonSemantic(`
 		INSERT INTO form_drafts (repo_id, change_key, draft_key, target_path, side, line, end_line, start_col, end_col, unresolved, thread_id, message_id, content, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
 		ON CONFLICT(repo_id, change_key, draft_key) DO UPDATE SET
@@ -1606,79 +1501,21 @@ func (d *DB) SaveFormDraft(repoID int64, changeKey, draftKey, targetPath, side s
 			content = excluded.content,
 			updated_at = CURRENT_TIMESTAMP
 	`, repoID, changeKey, draftKey, targetPath, side, line, endLine, startCol, endCol, unresolvedInt, threadID, messageID, content)
-	if err != nil {
-		return err
-	}
-	if d.digestValid && beforeErr == nil && beforeTC == d.lastTotalChanges {
-		var afterTC int64
-		if err := d.db.QueryRow("SELECT total_changes()").Scan(&afterTC); err == nil {
-			d.lastTotalChanges = afterTC
-		}
-	}
-	return nil
 }
 
 // DeleteFormDraft removes a single form draft by its draft key.
 func (d *DB) DeleteFormDraft(repoID int64, changeKey, draftKey string) error {
-	d.digestMu.Lock()
-	defer d.digestMu.Unlock()
-
-	var beforeTC int64
-	beforeErr := d.db.QueryRow("SELECT total_changes()").Scan(&beforeTC)
-
-	_, err := d.db.Exec("DELETE FROM form_drafts WHERE repo_id = ? AND change_key = ? AND draft_key = ?", repoID, changeKey, draftKey)
-	if err != nil {
-		return err
-	}
-	if d.digestValid && beforeErr == nil && beforeTC == d.lastTotalChanges {
-		var afterTC int64
-		if err := d.db.QueryRow("SELECT total_changes()").Scan(&afterTC); err == nil {
-			d.lastTotalChanges = afterTC
-		}
-	}
-	return nil
+	return d.execNonSemantic("DELETE FROM form_drafts WHERE repo_id = ? AND change_key = ? AND draft_key = ?", repoID, changeKey, draftKey)
 }
 
 // DeleteFormDraftsForThread removes all form drafts associated with a thread.
 func (d *DB) DeleteFormDraftsForThread(repoID int64, changeKey, threadID string) error {
-	d.digestMu.Lock()
-	defer d.digestMu.Unlock()
-
-	var beforeTC int64
-	beforeErr := d.db.QueryRow("SELECT total_changes()").Scan(&beforeTC)
-
-	_, err := d.db.Exec("DELETE FROM form_drafts WHERE repo_id = ? AND change_key = ? AND thread_id = ?", repoID, changeKey, threadID)
-	if err != nil {
-		return err
-	}
-	if d.digestValid && beforeErr == nil && beforeTC == d.lastTotalChanges {
-		var afterTC int64
-		if err := d.db.QueryRow("SELECT total_changes()").Scan(&afterTC); err == nil {
-			d.lastTotalChanges = afterTC
-		}
-	}
-	return nil
+	return d.execNonSemantic("DELETE FROM form_drafts WHERE repo_id = ? AND change_key = ? AND thread_id = ?", repoID, changeKey, threadID)
 }
 
 // DeleteFormDraftForMessage removes all form drafts associated with an edit of a message.
 func (d *DB) DeleteFormDraftForMessage(repoID int64, changeKey, messageID string) error {
-	d.digestMu.Lock()
-	defer d.digestMu.Unlock()
-
-	var beforeTC int64
-	beforeErr := d.db.QueryRow("SELECT total_changes()").Scan(&beforeTC)
-
-	_, err := d.db.Exec("DELETE FROM form_drafts WHERE repo_id = ? AND change_key = ? AND message_id = ?", repoID, changeKey, messageID)
-	if err != nil {
-		return err
-	}
-	if d.digestValid && beforeErr == nil && beforeTC == d.lastTotalChanges {
-		var afterTC int64
-		if err := d.db.QueryRow("SELECT total_changes()").Scan(&afterTC); err == nil {
-			d.lastTotalChanges = afterTC
-		}
-	}
-	return nil
+	return d.execNonSemantic("DELETE FROM form_drafts WHERE repo_id = ? AND change_key = ? AND message_id = ?", repoID, changeKey, messageID)
 }
 
 // FormDraftsForChange returns all saved form drafts for a given change in a repository.

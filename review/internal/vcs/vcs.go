@@ -30,7 +30,10 @@ func cleanIdentity(s string) string {
 	return strings.TrimSpace(s)
 }
 
-const emptyTreeSHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+const (
+	emptyTreeSHA    = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+	emptyTreeSHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+)
 
 // FileStatus represents file modification status in a diff.
 type FileStatus int
@@ -391,38 +394,38 @@ func (c *Cache) catFile(gitDir string) (*CatFileBatch, error) {
 	return cf, nil
 }
 
-// Evict clears cached resources for a repository root and closes background cat-file processes.
+// Evict clears cached resources for a repository root and closes background cat-file processes
+// no longer referenced by any remaining registered workspace.
 func (c *Cache) Evict(root string) {
 	if c == nil {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	root = filepath.Clean(root)
+	var toClose []*CatFileBatch
 
+	c.mu.Lock()
 	isPrefix := func(k string) bool {
 		return k == root || strings.HasPrefix(k, root+string(filepath.Separator))
 	}
 
-	var evictedGitDirs []string
+	evictedGitDirs := make(map[string]bool)
 	for r, gd := range c.repoGitDirs {
 		if isPrefix(r) {
-			evictedGitDirs = append(evictedGitDirs, gd)
+			evictedGitDirs[gd] = true
 			delete(c.repoGitDirs, r)
 		}
 	}
+	stillReferenced := make(map[string]bool)
+	for _, gd := range c.repoGitDirs {
+		stillReferenced[gd] = true
+	}
 
 	for k, cf := range c.catfiles {
-		evict := isPrefix(k)
-		if !evict {
-			for _, gd := range evictedGitDirs {
-				if k == gd {
-					evict = true
-					break
-				}
-			}
+		if stillReferenced[k] {
+			continue
 		}
-		if evict {
-			_ = cf.Close()
+		if isPrefix(k) || evictedGitDirs[k] {
+			toClose = append(toClose, cf)
 			delete(c.catfiles, k)
 		}
 	}
@@ -436,6 +439,11 @@ func (c *Cache) Evict(root string) {
 			delete(c.repoUsers, k)
 		}
 	}
+	c.mu.Unlock()
+
+	for _, cf := range toClose {
+		_ = cf.Close()
+	}
 }
 
 // Close terminates all active subprocesses held by the cache.
@@ -443,11 +451,16 @@ func (c *Cache) Close() {
 	if c == nil {
 		return
 	}
+	var toClose []*CatFileBatch
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for k, cf := range c.catfiles {
-		_ = cf.Close()
+		toClose = append(toClose, cf)
 		delete(c.catfiles, k)
+	}
+	c.mu.Unlock()
+
+	for _, cf := range toClose {
+		_ = cf.Close()
 	}
 }
 
@@ -541,16 +554,34 @@ func (c *Cache) WatchSignature(roots []string) string {
 			if fi, err := os.Stat(headFile); err == nil {
 				fmt.Fprintf(h, ":head:%d:%d", fi.Size(), fi.ModTime().UnixNano())
 			}
-			// refs/heads
-			refsDir := filepath.Join(realGitDir, "refs", "heads")
-			if entries, err := os.ReadDir(refsDir); err == nil {
-				for _, e := range entries {
-					h.Write([]byte(e.Name()))
-					if fi, err := e.Info(); err == nil {
-						fmt.Fprintf(h, ":%d", fi.ModTime().UnixNano())
+			// Worktrees store refs/heads and packed-refs under commondir.
+			commonDir := realGitDir
+			if raw, err := os.ReadFile(filepath.Join(realGitDir, "commondir")); err == nil {
+				if cd := strings.TrimSpace(string(raw)); cd != "" {
+					if !filepath.IsAbs(cd) {
+						cd = filepath.Join(realGitDir, cd)
 					}
+					commonDir = filepath.Clean(cd)
 				}
 			}
+			if fi, err := os.Stat(filepath.Join(commonDir, "packed-refs")); err == nil {
+				fmt.Fprintf(h, ":packed:%d:%d", fi.Size(), fi.ModTime().UnixNano())
+			}
+			// refs/heads (recursive for nested branch names like user/feat/bar)
+			refsDir := filepath.Join(commonDir, "refs", "heads")
+			_ = filepath.WalkDir(refsDir, func(p string, d fs.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return nil
+				}
+				rel, rErr := filepath.Rel(refsDir, p)
+				if rErr == nil {
+					h.Write([]byte(rel))
+				}
+				if fi, iErr := d.Info(); iErr == nil {
+					fmt.Fprintf(h, ":%d", fi.ModTime().UnixNano())
+				}
+				return nil
+			})
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -705,6 +736,39 @@ func deletePinRef(gitDir, ref string) error {
 	return cmd.Run()
 }
 
+func deletePinRefsBatch(gitDir string, refs []string) ([]string, error) {
+	if gitDir == "" || len(refs) == 0 {
+		return nil, nil
+	}
+	var valid []string
+	var stdin strings.Builder
+	for _, ref := range refs {
+		if !isSafePinRef(ref) {
+			continue
+		}
+		valid = append(valid, ref)
+		stdin.WriteString("delete ")
+		stdin.WriteString(ref)
+		stdin.WriteByte('\n')
+	}
+	if len(valid) == 0 {
+		return nil, nil
+	}
+	cmd := exec.Command("git", "--git-dir="+gitDir, "--no-optional-locks", "update-ref", "--stdin")
+	cmd.Stdin = strings.NewReader(stdin.String())
+	if err := cmd.Run(); err != nil {
+		// Fallback to individual deletes so one missing/locked ref doesn't block the rest.
+		var deleted []string
+		for _, ref := range valid {
+			if deletePinRef(gitDir, ref) == nil {
+				deleted = append(deleted, ref)
+			}
+		}
+		return deleted, nil
+	}
+	return valid, nil
+}
+
 func gitDiffFiles(gitDir, workDir, baseRev, targetRev string) ([]*File, error) {
 	files := []*File{
 		{
@@ -715,7 +779,11 @@ func gitDiffFiles(gitDir, workDir, baseRev, targetRev string) ([]*File, error) {
 
 	bRev := baseRev
 	if bRev == "" || strings.Trim(bRev, "0") == "" {
-		bRev = emptyTreeSHA
+		if len(targetRev) == 64 && isHexString(targetRev) {
+			bRev = emptyTreeSHA256
+		} else {
+			bRev = emptyTreeSHA
+		}
 	} else if err := ValidateRev(bRev); err != nil {
 		return files, err
 	}
@@ -728,6 +796,9 @@ func gitDiffFiles(gitDir, workDir, baseRev, targetRev string) ([]*File, error) {
 	var args []string
 	if gitDir != "" {
 		args = append(args, "--git-dir="+gitDir)
+	}
+	if targetRev == "working" && workDir != "" {
+		args = append(args, "--work-tree="+workDir)
 	}
 	args = append(args, "--no-optional-locks", "diff", "--raw", "--numstat", "-M", "-z", bRev)
 
@@ -801,7 +872,7 @@ func gitDiffFiles(gitDir, workDir, baseRev, targetRev string) ([]*File, error) {
 				fileMap[path] = f
 			}
 		} else {
-			tabs := bytes.Split(p, []byte{'\t'})
+			tabs := bytes.SplitN(p, []byte{'\t'}, 3)
 			if len(tabs) >= 3 {
 				addStr := string(tabs[0])
 				delStr := string(tabs[1])
@@ -1009,35 +1080,39 @@ func gitListDir(cache *Cache, gitDir, workDir, rev, dirPath string) ([]string, e
 	return []string{}, nil
 }
 
+func walkWorkingGoFiles(workDir string) ([]string, error) {
+	var goFiles []string
+	err := filepath.WalkDir(workDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path != workDir && shouldSkipGoDir(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		name := d.Name()
+		if strings.HasSuffix(name, ".go") && name[0] != '.' && name[0] != '_' {
+			rel, err := filepath.Rel(workDir, path)
+			if err == nil {
+				goFiles = append(goFiles, filepath.ToSlash(rel))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(goFiles)
+	return goFiles, nil
+}
+
 // gitListGoFiles recursively lists repo-relative .go files at rev,
 // skipping directories matching shouldSkipGoDir.
 func gitListGoFiles(cache *Cache, gitDir, workDir, rev string) ([]string, error) {
 	if (rev == "" || rev == "working") && workDir != "" {
-		var goFiles []string
-		err := filepath.WalkDir(workDir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() {
-				if path != workDir && shouldSkipGoDir(d.Name()) {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			name := d.Name()
-			if strings.HasSuffix(name, ".go") && name[0] != '.' && name[0] != '_' {
-				rel, err := filepath.Rel(workDir, path)
-				if err == nil {
-					goFiles = append(goFiles, filepath.ToSlash(rel))
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		slices.Sort(goFiles)
-		return goFiles, nil
+		return walkWorkingGoFiles(workDir)
 	}
 
 	if gitDir != "" && rev != "" && rev != "working" {

@@ -64,7 +64,7 @@ func (r GraphRow) SVG() template.HTML {
 	return template.HTML(sb.String())
 }
 
-// BuildGraph arranges changes topologically and renders visual DAG graph lines,
+// BuildGraph preserves the input change order and renders visual DAG graph lines,
 // bridging parent-child relationships across filtered-out / hidden commits.
 func BuildGraph(changes []*Change, visible func(*Change) bool) []GraphRow {
 	if len(changes) == 0 {
@@ -100,8 +100,8 @@ func BuildGraph(changes []*Change, visible func(*Change) bool) []GraphRow {
 	}
 
 	type visibleNode struct {
-		c          *Change
-		parentRevs []string
+		c         *Change
+		parentRev string
 	}
 
 	var visibleNodes []visibleNode
@@ -109,14 +109,11 @@ func BuildGraph(changes []*Change, visible func(*Change) bool) []GraphRow {
 		if !isVisible(c) {
 			continue
 		}
-		var parents []string
+		var parentRev string
 		if c.Parent != "" {
-			vp := findVisibleParent(c.Parent)
-			if vp != "" {
-				parents = append(parents, vp)
-			}
+			parentRev = findVisibleParent(c.Parent)
 		}
-		visibleNodes = append(visibleNodes, visibleNode{c: c, parentRevs: parents})
+		visibleNodes = append(visibleNodes, visibleNode{c: c, parentRev: parentRev})
 	}
 
 	if len(visibleNodes) == 0 {
@@ -174,10 +171,10 @@ func BuildGraph(changes []*Change, visible func(*Change) bool) []GraphRow {
 		}
 
 		// Update lanes for parents of this commit
-		if len(node.parentRevs) == 0 {
+		if node.parentRev == "" {
 			nextLanes[laneIdx] = ""
 		} else {
-			p0 := node.parentRevs[0]
+			p0 := node.parentRev
 			// Check if p0 is already in another lane
 			targetLane := -1
 			for i, l := range activeLanes {
@@ -193,35 +190,6 @@ func BuildGraph(changes []*Change, visible func(*Change) bool) []GraphRow {
 			} else {
 				nextLanes[laneIdx] = p0
 				bottomEdges = append(bottomEdges, [2]int{laneIdx, laneIdx})
-			}
-
-			// Additional parents
-			for _, pOther := range node.parentRevs[1:] {
-				otherTarget := -1
-				for i, l := range activeLanes {
-					if l == pOther {
-						otherTarget = i
-						break
-					}
-				}
-				if otherTarget != -1 {
-					bottomEdges = append(bottomEdges, [2]int{laneIdx, otherTarget})
-				} else {
-					// Allocate new lane
-					newLane := -1
-					for i, l := range nextLanes {
-						if l == "" {
-							newLane = i
-							nextLanes[i] = pOther
-							break
-						}
-					}
-					if newLane == -1 {
-						newLane = len(nextLanes)
-						nextLanes = append(nextLanes, pOther)
-					}
-					bottomEdges = append(bottomEdges, [2]int{laneIdx, newLane})
-				}
 			}
 		}
 

@@ -2,6 +2,7 @@ package skill
 
 import (
 	_ "embed"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -53,12 +54,20 @@ func Run(args []string, stdout io.Writer, workDir string) error {
 	outDir := fs.String("o", "", "Install skill to a specific directory")
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 
-	if *printFlag || (!*installFlag && !*projectFlag && *outDir == "") {
-		_, err := stdout.Write(skillDoc)
-		return err
+	anyInstall := *installFlag || *projectFlag || *outDir != ""
+	if *printFlag || !anyInstall {
+		if _, err := stdout.Write(skillDoc); err != nil {
+			return err
+		}
+		if !anyInstall {
+			return nil
+		}
 	}
 
 	if *projectFlag {
@@ -71,7 +80,11 @@ func Run(args []string, stdout io.Writer, workDir string) error {
 	}
 
 	if *outDir != "" {
-		path, err := Install(*outDir)
+		target := *outDir
+		if !filepath.IsAbs(target) && workDir != "" {
+			target = filepath.Join(workDir, target)
+		}
+		path, err := Install(target)
 		if err != nil {
 			return err
 		}
@@ -80,13 +93,20 @@ func Run(args []string, stdout io.Writer, workDir string) error {
 
 	if *installFlag {
 		paths := DefaultInstallPaths()
+		if len(paths) == 0 {
+			return errors.New("could not determine default skill install paths")
+		}
+		var errs []error
 		for _, p := range paths {
 			installedPath, err := Install(p)
 			if err != nil {
-				fmt.Fprintf(stdout, "Failed installing to %s: %v\n", p, err)
+				errs = append(errs, err)
 			} else {
 				fmt.Fprintf(stdout, "Installed review skill to %s\n", installedPath)
 			}
+		}
+		if err := errors.Join(errs...); err != nil {
+			return err
 		}
 	}
 

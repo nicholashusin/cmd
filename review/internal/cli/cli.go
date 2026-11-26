@@ -9,9 +9,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -160,6 +162,32 @@ func resolveChange(repo vcs.Repo, arg string) (*vcs.Change, error) {
 	return repo.Commit(arg)
 }
 
+func (e *Env) newFlagSet(name string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(e.Stderr)
+	return fs
+}
+
+func parseFlags(fs *flag.FlagSet, args []string) (help bool, err error) {
+	err = fs.Parse(args)
+	if errors.Is(err, flag.ErrHelp) {
+		return true, nil
+	}
+	return false, err
+}
+
+func isInteractiveStdin(r io.Reader) bool {
+	f, ok := r.(*os.File)
+	if !ok {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 func (e *Env) readText(args []string) (string, error) {
 	if len(args) > 0 {
 		return strings.Join(args, " "), nil
@@ -172,15 +200,14 @@ func (e *Env) readText(args []string) (string, error) {
 }
 
 func (e *Env) cmdDefault(args []string) error {
-	fs := flag.NewFlagSet("review", flag.ContinueOnError)
-	fs.SetOutput(e.Stderr)
+	fs := e.newFlagSet("review")
 
 	addrFlag := fs.String("a", "", "Server listen address (e.g. localhost:2626)")
 	noBrowser := fs.Bool("n", false, "Do not open browser")
 	dbPath := fs.String("db", "", "Database path")
 	foreground := fs.Bool("foreground", false, "Run in foreground (internal)")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -200,16 +227,32 @@ func (e *Env) cmdDefault(args []string) error {
 	}
 	cmdCache.Close()
 
+	configDir := daemon.ConfigDir(d.Path())
+	info, _ := daemon.GetServerInfo(configDir)
+	running := info != nil && daemon.IsAlive(info.PID)
+
+	if !*foreground && running {
+		if *addrFlag != "" && daemon.DialAddr(*addrFlag) != daemon.DialAddr(info.Addr) {
+			fmt.Fprintf(e.Stderr, "review: server already running at %s; use 'review restart -a %s' to change address\n", info.Addr, *addrFlag)
+		}
+		displayHost := daemon.DialAddr(info.Addr)
+		serverURL := fmt.Sprintf("http://%s", displayHost)
+		if repoSlug != "" {
+			serverURL = fmt.Sprintf("http://%s/r/%s", displayHost, url.PathEscape(repoSlug))
+		}
+		fmt.Fprintf(e.Stdout, "review server already running at %s\n", serverURL)
+		if !*noBrowser {
+			openBrowser(serverURL)
+		}
+		return nil
+	}
+
 	var configuredAddr string
 	if *addrFlag != "" {
 		_ = d.SetPref("listen_addr", *addrFlag)
 		configuredAddr = *addrFlag
-	} else {
-		configDir := daemon.ConfigDir(d.Path())
-		info, _ := daemon.GetServerInfo(configDir)
-		if info == nil || !daemon.IsAlive(info.PID) {
-			configuredAddr = d.Pref("listen_addr", "")
-		}
+	} else if !running {
+		configuredAddr = d.Pref("listen_addr", "")
 	}
 
 	listenAddr := configuredAddr
@@ -219,22 +262,6 @@ func (e *Env) cmdDefault(args []string) error {
 
 	if *foreground {
 		return e.runServer(d, listenAddr, configuredAddr)
-	}
-
-	// Check if already running
-	configDir := daemon.ConfigDir(d.Path())
-	info, _ := daemon.GetServerInfo(configDir)
-	if info != nil && daemon.IsAlive(info.PID) {
-		displayHost := daemon.DialAddr(info.Addr)
-		serverURL := fmt.Sprintf("http://%s", displayHost)
-		if repoSlug != "" {
-			serverURL = fmt.Sprintf("http://%s/r/%s", displayHost, repoSlug)
-		}
-		fmt.Fprintf(e.Stdout, "review server already running at %s\n", serverURL)
-		if !*noBrowser {
-			openBrowser(serverURL)
-		}
-		return nil
 	}
 
 	// Self-start background daemon
@@ -252,7 +279,7 @@ func (e *Env) cmdDefault(args []string) error {
 	displayHost := daemon.DialAddr(info.Addr)
 	serverURL := fmt.Sprintf("http://%s", displayHost)
 	if repoSlug != "" {
-		serverURL = fmt.Sprintf("http://%s/r/%s", displayHost, repoSlug)
+		serverURL = fmt.Sprintf("http://%s/r/%s", displayHost, url.PathEscape(repoSlug))
 	}
 	fmt.Fprintf(e.Stdout, "review server started at %s (pid %d)\n", serverURL, info.PID)
 	if !*noBrowser {
@@ -343,9 +370,9 @@ func (e *Env) runServer(d *db.DB, listenAddr, configuredAddr string) error {
 }
 
 func (e *Env) cmdStop(args []string) error {
-	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	fs := e.newFlagSet("stop")
 	dbPath := fs.String("db", "", "Database path")
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -363,11 +390,11 @@ func (e *Env) cmdStop(args []string) error {
 }
 
 func (e *Env) cmdRestart(args []string) error {
-	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
+	fs := e.newFlagSet("restart")
 	addrFlag := fs.String("a", "", "Server listen address")
 	noBrowser := fs.Bool("n", false, "Do not open browser")
 	dbPath := fs.String("db", "", "Database path")
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -388,10 +415,10 @@ func (e *Env) cmdRestart(args []string) error {
 }
 
 func (e *Env) cmdSnapshot(args []string) error {
-	fs := flag.NewFlagSet("snapshot", flag.ContinueOnError)
+	fs := e.newFlagSet("snapshot")
 	noPin := fs.Bool("nopin", false, "Do not pin revision in VCS")
 	dbPath := fs.String("db", "", "Database path")
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -469,9 +496,9 @@ func (e *Env) cmdSnapshot(args []string) error {
 }
 
 func (e *Env) cmdSnapshots(args []string) error {
-	fs := flag.NewFlagSet("snapshots", flag.ContinueOnError)
+	fs := e.newFlagSet("snapshots")
 	dbPath := fs.String("db", "", "Database path")
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -532,7 +559,7 @@ func (e *Env) cmdSnapshots(args []string) error {
 }
 
 func (e *Env) cmdComments(args []string) error {
-	fs := flag.NewFlagSet("comments", flag.ContinueOnError)
+	fs := e.newFlagSet("comments")
 	jsonOutput := fs.Bool("json", false, "Output JSON")
 	showAll := fs.Bool("all", false, "Include resolved comments")
 	includeDrafts := fs.Bool("drafts", false, "Include unpublished draft comments")
@@ -540,7 +567,7 @@ func (e *Env) cmdComments(args []string) error {
 	snapNum := fs.Int("s", -1, "Filter by snapshot number")
 	dbPath := fs.String("db", "", "Database path")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -569,14 +596,13 @@ func (e *Env) cmdComments(args []string) error {
 		if err != nil {
 			return err
 		}
-		// Iterate over all non-working pending changes, ordered oldest-to-newest
-		// changes from repo.Changes() is top-down (newest first).
-		// Reverse it so ancestors come before descendants.
+		// Iterate over pending changes oldest-to-newest so ancestors come before descendants.
 		for i := len(changes) - 1; i >= 0; i-- {
 			c := changes[i]
-			if !c.Working && !c.Empty {
-				targetChanges = append(targetChanges, c)
+			if c.Working && c.Empty {
+				continue
 			}
+			targetChanges = append(targetChanges, c)
 		}
 	}
 
@@ -612,7 +638,7 @@ func (e *Env) cmdComments(args []string) error {
 	}
 
 	linesCache := make(map[string][]string)
-	var allOutputs []commentOutput
+	allOutputs := []commentOutput{}
 	for _, c := range targetChanges {
 		threads := threadsByChange[c.Key]
 		if len(threads) == 0 {
@@ -737,14 +763,14 @@ func (e *Env) cmdComments(args []string) error {
 }
 
 func (e *Env) cmdAdd(args []string) error {
-	fs := flag.NewFlagSet("add", flag.ContinueOnError)
+	fs := e.newFlagSet("add")
 	fromFlag := fs.String("from", "", "Comment author name (default reviewer)")
 	sideFlag := fs.String("side", "R", "Diff side (R or L)")
 	draftFlag := fs.Bool("draft", false, "Save comment as unpublished draft")
 	dbPath := fs.String("db", "", "Database path")
 	snapFlag := fs.Int("s", 0, "Snapshot number")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -754,6 +780,16 @@ func (e *Env) cmdAdd(args []string) error {
 
 	changeArg := fs.Arg(0)
 	targetSpec := fs.Arg(1)
+	filePath, startLine, endLine, err := parseFileSpec(targetSpec)
+	if err != nil {
+		return err
+	}
+
+	side := strings.ToUpper(strings.TrimSpace(*sideFlag))
+	if side != "L" && side != "R" {
+		return fmt.Errorf("invalid -side %q: must be L or R", *sideFlag)
+	}
+
 	text, err := e.readText(fs.Args()[2:])
 	if err != nil {
 		return err
@@ -779,8 +815,6 @@ func (e *Env) cmdAdd(args []string) error {
 		return fmt.Errorf("resolving change %s: %w", changeArg, err)
 	}
 
-	filePath, startLine, endLine := parseFileSpec(targetSpec)
-
 	author := *fromFlag
 	if author == "" {
 		author = repo.User()
@@ -789,10 +823,6 @@ func (e *Env) cmdAdd(args []string) error {
 		author = "reviewer"
 	}
 
-	side := strings.ToUpper(*sideFlag)
-	if side != "L" && side != "R" {
-		side = "R"
-	}
 	if vcs.IsCommitMsgPath(filePath) {
 		filePath = vcs.CommitMsgPath
 		side = "R"
@@ -839,36 +869,49 @@ func (e *Env) cmdAdd(args []string) error {
 	return nil
 }
 
-func parseFileSpec(spec string) (path string, startLine, endLine int) {
+func parseFileSpec(spec string) (path string, startLine, endLine int, err error) {
 	idx := strings.LastIndexByte(spec, ':')
 	if idx == -1 {
-		return spec, 0, 0
+		return spec, 0, 0, nil
 	}
 	linePart := spec[idx+1:]
 	rangeParts := strings.Split(linePart, "-")
 	n1, err1 := strconv.Atoi(rangeParts[0])
-	if err1 != nil || n1 <= 0 {
-		return spec, 0, 0
+	if err1 != nil {
+		// Treat non-numeric suffixes (e.g. colons in file names) as file-level specs
+		// unless they look like malformed numeric ranges.
+		if len(rangeParts) == 1 && (linePart == "" || (linePart[0] < '0' || linePart[0] > '9')) {
+			return spec, 0, 0, nil
+		}
+		return "", 0, 0, fmt.Errorf("invalid line specification in %q", spec)
+	}
+	if n1 <= 0 {
+		return "", 0, 0, fmt.Errorf("invalid line number %d in %q: must be positive", n1, spec)
+	}
+	if len(rangeParts) > 2 {
+		return "", 0, 0, fmt.Errorf("invalid line range in %q", spec)
 	}
 	path = spec[:idx]
 	startLine = n1
 	endLine = n1
-	if len(rangeParts) > 1 {
-		if n2, err2 := strconv.Atoi(rangeParts[1]); err2 == nil && n2 >= startLine {
-			endLine = n2
+	if len(rangeParts) == 2 {
+		n2, err2 := strconv.Atoi(rangeParts[1])
+		if err2 != nil || n2 < startLine {
+			return "", 0, 0, fmt.Errorf("invalid line range in %q", spec)
 		}
+		endLine = n2
 	}
-	return path, startLine, endLine
+	return path, startLine, endLine, nil
 }
 
 func (e *Env) cmdReply(args []string) error {
-	fs := flag.NewFlagSet("reply", flag.ContinueOnError)
+	fs := e.newFlagSet("reply")
 	fromFlag := fs.String("from", "agent", "Reply author name")
 	draftFlag := fs.Bool("draft", false, "Save reply as draft")
 	resolveFlag := fs.Bool("resolve", false, "Mark thread resolved")
 	dbPath := fs.String("db", "", "Database path")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -881,7 +924,14 @@ func (e *Env) cmdReply(args []string) error {
 		return fmt.Errorf("invalid thread ID %q: %w", fs.Arg(0), err)
 	}
 
-	text, _ := e.readText(fs.Args()[1:])
+	var text string
+	textArgs := fs.Args()[1:]
+	if len(textArgs) > 0 || !*resolveFlag || !isInteractiveStdin(e.Stdin) {
+		text, err = e.readText(textArgs)
+		if err != nil {
+			return err
+		}
+	}
 	if text == "" && !*resolveFlag {
 		return fmt.Errorf("reply text required (or use -resolve)")
 	}
@@ -932,10 +982,10 @@ func (e *Env) cmdReply(args []string) error {
 }
 
 func (e *Env) cmdEdit(args []string) error {
-	fs := flag.NewFlagSet("edit", flag.ContinueOnError)
+	fs := e.newFlagSet("edit")
 	dbPath := fs.String("db", "", "Database path")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -980,15 +1030,28 @@ func (e *Env) cmdEdit(args []string) error {
 }
 
 func (e *Env) cmdResolve(args []string, resolve bool) error {
-	fs := flag.NewFlagSet("resolve", flag.ContinueOnError)
+	name := "resolve"
+	if !resolve {
+		name = "unresolve"
+	}
+	fs := e.newFlagSet(name)
 	dbPath := fs.String("db", "", "Database path")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
 	if fs.NArg() == 0 {
-		return fmt.Errorf("usage: review %s <thread-id>...", fs.Name())
+		return fmt.Errorf("usage: review %s <thread-id>...", name)
+	}
+
+	ids := make([]int64, 0, fs.NArg())
+	for _, arg := range fs.Args() {
+		id, err := strconv.ParseInt(arg, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid thread ID %q: %w", arg, err)
+		}
+		ids = append(ids, id)
 	}
 
 	d, err := e.openDB(*dbPath)
@@ -999,11 +1062,7 @@ func (e *Env) cmdResolve(args []string, resolve bool) error {
 
 	var notifyRepo, notifyChange string
 	var multipleChanges bool
-	for _, arg := range fs.Args() {
-		id, err := strconv.ParseInt(arg, 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid thread ID %q: %w", arg, err)
-		}
+	for _, id := range ids {
 		if err := d.SetResolved(id, resolve); err != nil {
 			return err
 		}
@@ -1032,10 +1091,10 @@ func (e *Env) cmdResolve(args []string, resolve bool) error {
 }
 
 func (e *Env) cmdPublish(args []string) error {
-	fs := flag.NewFlagSet("publish", flag.ContinueOnError)
+	fs := e.newFlagSet("publish")
 	dbPath := fs.String("db", "", "Database path")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -1080,11 +1139,11 @@ func (e *Env) cmdPublish(args []string) error {
 }
 
 func (e *Env) cmdSearch(args []string) error {
-	fs := flag.NewFlagSet("search", flag.ContinueOnError)
+	fs := e.newFlagSet("search")
 	ciFlag := fs.Bool("i", false, "Case-insensitive search")
-	dbPath := fs.String("db", "", "Database path")
+	_ = fs.String("db", "", "Database path (unused)")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -1093,17 +1152,12 @@ func (e *Env) cmdSearch(args []string) error {
 	}
 
 	query := fs.Arg(0)
-	d, err := e.openDB(*dbPath)
+	cache := vcs.NewCache()
+	defer cache.Close()
+	repo, err := vcs.Open(e.WorkDir, cache)
 	if err != nil {
 		return err
 	}
-	defer d.Close()
-
-	repo, _, closeRepo, err := e.openRepo(d)
-	if err != nil {
-		return err
-	}
-	defer closeRepo()
 
 	var target *vcs.Change
 	if fs.NArg() > 1 {
@@ -1149,10 +1203,10 @@ func (e *Env) cmdSearch(args []string) error {
 }
 
 func (e *Env) cmdForget(args []string) error {
-	fs := flag.NewFlagSet("forget", flag.ContinueOnError)
+	fs := e.newFlagSet("forget")
 	dbPath := fs.String("db", "", "Database path")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 
@@ -1166,32 +1220,60 @@ func (e *Env) cmdForget(args []string) error {
 	if fs.NArg() > 0 {
 		targets = fs.Args()
 	} else {
-		targets = append(targets, e.WorkDir)
+		target := e.WorkDir
+		cache := vcs.NewCache()
+		if repo, err := vcs.Open(e.WorkDir, cache); err == nil {
+			target = repo.Root()
+		}
+		cache.Close()
+		targets = append(targets, target)
 	}
 
+	forgotten := 0
 	for _, t := range targets {
 		rec, err := d.ForgetRepo(t)
 		if err != nil {
 			return err
 		}
+		if rec == nil && (t == "." || t == ".." || strings.ContainsAny(t, `/\`)) {
+			candidate := t
+			if !filepath.IsAbs(candidate) {
+				candidate = filepath.Join(e.WorkDir, candidate)
+			}
+			candidate = filepath.Clean(candidate)
+			cache := vcs.NewCache()
+			if repo, err := vcs.Open(candidate, cache); err == nil {
+				candidate = repo.Root()
+			}
+			cache.Close()
+			if candidate != t {
+				rec, err = d.ForgetRepo(candidate)
+				if err != nil {
+					return err
+				}
+			}
+		}
 		if rec != nil {
+			forgotten++
 			fmt.Fprintf(e.Stdout, "Forgot repository %s (%s)\n", rec.Slug, rec.RootPath)
 		} else {
 			fmt.Fprintf(e.Stdout, "Repository %s was not tracked.\n", t)
 		}
 	}
 
-	daemon.NotifyEvent(d.Path(), "repo_forget", "", "")
+	if forgotten > 0 {
+		daemon.NotifyEvent(d.Path(), "repo_forget", "", "")
+	}
 	return nil
 }
 
 func (e *Env) cmdGC(args []string) error {
-	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
+	fs := e.newFlagSet("gc")
 	dryRun := fs.Bool("dry-run", false, "Print what would be cleaned up without modifying anything")
 	keepMissing := fs.Bool("keep-missing", false, "Do not forget repositories whose directory no longer exists")
 	dbPath := fs.String("db", "", "Database path")
 
-	if err := fs.Parse(args); err != nil {
+	if help, err := parseFlags(fs, args); err != nil || help {
 		return err
 	}
 

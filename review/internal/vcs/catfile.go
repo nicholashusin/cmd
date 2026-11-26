@@ -117,6 +117,9 @@ func (c *CatFileBatch) readResponseLocked() (objType, hexSHA string, data []byte
 	if strings.HasSuffix(line, "missing") {
 		return "", "", nil, os.ErrNotExist
 	}
+	if strings.HasSuffix(line, " ambiguous") {
+		return "", "", nil, fmt.Errorf("ambiguous git object: %s", line)
+	}
 
 	parts := strings.Split(line, " ")
 	if len(parts) < 3 {
@@ -125,7 +128,10 @@ func (c *CatFileBatch) readResponseLocked() (objType, hexSHA string, data []byte
 
 	size, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
-		return "", "", nil, abort(fmt.Errorf("parsing object size: %w", err))
+		return "", "", nil, abort(fmt.Errorf("parsing object size %q: %w", parts[2], err))
+	}
+	if size < 0 {
+		return "", "", nil, abort(fmt.Errorf("negative object size %q", parts[2]))
 	}
 
 	buf := make([]byte, size)
@@ -165,17 +171,31 @@ func (c *CatFileBatch) readObjectLocked(spec string) (objType, hexSHA string, da
 	return c.readResponseLocked()
 }
 
+const maxCachedRevFlags = 4096
+
+func (c *CatFileBatch) markKnownTreeLocked(rev string) {
+	if !IsImmutableHexRev(rev) {
+		return
+	}
+	if len(c.knownTrees) >= maxCachedRevFlags {
+		c.knownTrees = make(map[string]bool)
+	}
+	c.knownTrees[rev] = true
+}
+
 func (c *CatFileBatch) hasTreeLocked(rev string) bool {
 	if rev == "" {
 		return false
 	}
-	if ok, seen := c.knownTrees[rev]; seen {
-		return ok
+	if IsImmutableHexRev(rev) {
+		if ok, seen := c.knownTrees[rev]; seen {
+			return ok
+		}
 	}
 	objType, _, _, err := c.readObjectLocked(rev + "^{tree}")
 	ok := (err == nil && objType == "tree")
 	if ok {
-		c.knownTrees[rev] = true
+		c.markKnownTreeLocked(rev)
 	}
 	return ok
 }
@@ -191,10 +211,15 @@ func (c *CatFileBatch) HasTree(rev string) bool {
 // conflicts. The Git tree of such a commit holds every side of the conflict
 // under .jjconflict-* directories, so its files can't be read from Git as is.
 func (c *CatFileBatch) JJConflict(rev string) bool {
+	if rev == "" || rev == "working" || strings.Trim(rev, "0") == "" {
+		return false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if conflict, ok := c.jjConflicts[rev]; ok {
-		return conflict
+	if IsImmutableHexRev(rev) {
+		if conflict, ok := c.jjConflicts[rev]; ok {
+			return conflict
+		}
 	}
 	objType, _, data, err := c.readObjectLocked(rev)
 	if err != nil {
@@ -203,17 +228,26 @@ func (c *CatFileBatch) JJConflict(rev string) bool {
 	header, _, _ := bytes.Cut(data, []byte("\n\n"))
 	conflict := objType == "commit" && bytes.Contains(header, []byte("\njj:trees "))
 	if IsImmutableHexRev(rev) {
+		if len(c.jjConflicts) >= maxCachedRevFlags {
+			c.jjConflicts = make(map[string]bool)
+		}
 		c.jjConflicts[rev] = conflict
 	}
 	return conflict
 }
 
-// ReadBlob retrieves the raw bytes of an object (e.g. "rev:path" or blob SHA).
+// ReadBlob retrieves the raw bytes of a blob object (e.g. "rev:path" or blob SHA).
 func (c *CatFileBatch) ReadBlob(spec string) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_, _, buf, err := c.readObjectLocked(spec)
-	return buf, err
+	objType, _, buf, err := c.readObjectLocked(spec)
+	if err != nil {
+		return nil, err
+	}
+	if objType != "blob" {
+		return nil, os.ErrNotExist
+	}
+	return buf, nil
 }
 
 // ErrRevNotInGit is returned when a requested revision does not exist in the Git object store.
@@ -254,40 +288,24 @@ func (c *CatFileBatch) BlobOID(rev, cleanPath string) (string, error) {
 		}
 		return "", err
 	}
-	c.knownTrees[rev] = true
+	c.markKnownTreeLocked(rev)
 	if objType != "tree" {
 		return "", os.ErrNotExist
 	}
 
 	hashLen := len(hexSHA) / 2
-	if hashLen != 20 && hashLen != 32 {
-		hashLen = 20
-	}
-
-	pos := 0
-	for pos < len(buf) {
-		sp := bytes.IndexByte(buf[pos:], ' ')
-		if sp == -1 {
+	raw := buf
+	for len(raw) > 0 {
+		mode, name, entrySHA, rest, ok := nextGitTreeEntry(raw, hashLen)
+		if !ok {
 			break
 		}
-		mode := string(buf[pos : pos+sp])
-		pos += sp + 1
-		nul := bytes.IndexByte(buf[pos:], 0)
-		if nul == -1 {
-			break
-		}
-		name := string(buf[pos : pos+nul])
-		rawOIDStart := pos + nul + 1
-		pos = rawOIDStart + hashLen
-		if pos > len(buf) {
-			break
-		}
+		raw = rest
 		if name == baseName {
 			if mode == "40000" || mode == "040000" || mode == "160000" {
 				return "", os.ErrNotExist
 			}
-			rawOID := buf[rawOIDStart : rawOIDStart+hashLen]
-			return hex.EncodeToString(rawOID), nil
+			return entrySHA, nil
 		}
 	}
 	return "", os.ErrNotExist
@@ -316,34 +334,20 @@ func (c *CatFileBatch) ListTree(rev, cleanDir string) ([]string, error) {
 		}
 		return nil, err
 	}
-	c.knownTrees[rev] = true
+	c.markKnownTreeLocked(rev)
 	if objType != "tree" {
 		return []string{}, nil
 	}
 
 	hashLen := len(hexSHA) / 2
-	if hashLen != 20 && hashLen != 32 {
-		hashLen = 20
-	}
-
 	names := []string{}
-	pos := 0
-	for pos < len(buf) {
-		sp := bytes.IndexByte(buf[pos:], ' ')
-		if sp == -1 {
+	raw := buf
+	for len(raw) > 0 {
+		mode, name, _, rest, ok := nextGitTreeEntry(raw, hashLen)
+		if !ok {
 			break
 		}
-		mode := string(buf[pos : pos+sp])
-		pos += sp + 1
-		nul := bytes.IndexByte(buf[pos:], 0)
-		if nul == -1 {
-			break
-		}
-		name := string(buf[pos : pos+nul])
-		pos += nul + 1 + hashLen
-		if pos > len(buf) {
-			break
-		}
+		raw = rest
 		if mode != "40000" && mode != "040000" && mode != "160000" {
 			names = append(names, name)
 		}
@@ -426,7 +430,7 @@ func parseSubtree(buf []byte, hexSHA string) cachedSubtree {
 			// Submodule gitlink: skip
 		} else if name != "" {
 			st.allFiles = append(st.allFiles, treeChild{name: name, oid: entrySHA})
-			if strings.HasSuffix(name, ".go") && name[0] != '.' && name[0] != '_' {
+			if mode != "120000" && strings.HasSuffix(name, ".go") && name[0] != '.' && name[0] != '_' {
 				st.goFiles = append(st.goFiles, treeChild{name: name, oid: entrySHA})
 			}
 		}
@@ -459,7 +463,7 @@ func (c *CatFileBatch) listTreeBlobs(rev string, goOnly bool) ([]GoFileBlob, err
 		}
 		return nil, err
 	}
-	c.knownTrees[rev] = true
+	c.markKnownTreeLocked(rev)
 	if objType != "tree" {
 		c.mu.Unlock()
 		return nil, os.ErrNotExist
@@ -576,6 +580,14 @@ func (c *CatFileBatch) listTreeBlobs(rev string, goOnly bool) ([]GoFileBlob, err
 			// Pipeline all reads
 			for _, oid := range uniqueOIDs {
 				objType, hexSHA, buf, err := c.readResponseLocked()
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
+					if !c.closed.Load() {
+						c.closed.Store(true)
+						c.proc.close()
+					}
+					c.mu.Unlock()
+					return nil, err
+				}
 				resultsByOID[oid] = &queryResult{
 					buf:     buf,
 					hexSHA:  hexSHA,
@@ -643,6 +655,12 @@ func (c *CatFileBatch) ListGoFiles(rev string) ([]string, error) {
 
 // StreamBlobs streams raw blob contents for the given slice of hexadecimal OIDs in pipelined chunks.
 func (c *CatFileBatch) StreamBlobs(oids []string, visit func(idx int, oid string, data []byte)) error {
+	for _, oid := range oids {
+		if oid == "" || strings.ContainsAny(oid, "\r\n") {
+			return fmt.Errorf("invalid oid %q", oid)
+		}
+	}
+
 	const chunkSize = 128
 	for start := 0; start < len(oids); start += chunkSize {
 		end := min(start+chunkSize, len(oids))
@@ -664,10 +682,6 @@ func (c *CatFileBatch) StreamBlobs(oids []string, visit func(idx int, oid string
 
 		// Write all OIDs in chunk
 		for _, oid := range chunk {
-			if strings.ContainsAny(oid, "\r\n") {
-				c.mu.Unlock()
-				return fmt.Errorf("invalid oid with newline")
-			}
 			if _, err := io.WriteString(c.stdinBuf, oid+"\n"); err != nil {
 				c.closed.Store(true)
 				c.proc.close()
@@ -686,6 +700,10 @@ func (c *CatFileBatch) StreamBlobs(oids []string, visit func(idx int, oid string
 		for k, oid := range chunk {
 			_, _, data, err := c.readResponseLocked()
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				if !c.closed.Load() {
+					c.closed.Store(true)
+					c.proc.close()
+				}
 				c.mu.Unlock()
 				return err
 			}
@@ -741,7 +759,7 @@ func (c *CatFileBatch) ReadDirGoFiles(rev, dir string) ([]GoFileBlobContent, err
 		c.mu.Unlock()
 		return nil, err
 	}
-	c.knownTrees[rev] = true
+	c.markKnownTreeLocked(rev)
 	c.mu.Unlock()
 	if objType != "tree" {
 		return nil, os.ErrNotExist
@@ -764,7 +782,7 @@ func (c *CatFileBatch) ReadDirGoFiles(rev, dir string) ([]GoFileBlobContent, err
 			break
 		}
 		raw = rest
-		if mode == "40000" || mode == "040000" || mode == "160000" {
+		if mode == "40000" || mode == "040000" || mode == "160000" || mode == "120000" {
 			continue
 		}
 		if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {

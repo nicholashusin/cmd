@@ -32,11 +32,9 @@ func StalePinsForSnapshots(repo Repo, activeKeys map[string]bool, validSnapNums 
 			continue
 		}
 		if validSnapNums != nil && len(parts) >= 4 && strings.HasPrefix(parts[3], "snap-") {
-			if validMap, ok := validSnapNums[key]; ok {
-				if n, err := strconv.Atoi(strings.TrimPrefix(parts[3], "snap-")); err == nil {
-					if !validMap[n] {
-						stale = append(stale, pin)
-					}
+			if n, err := strconv.Atoi(strings.TrimPrefix(parts[3], "snap-")); err == nil {
+				if !validSnapNums[key][n] {
+					stale = append(stale, pin)
 				}
 			}
 		}
@@ -51,12 +49,22 @@ func PrunePins(repo Repo, activeKeys map[string]bool) ([]string, error) {
 	return PrunePinsForSnapshots(repo, activeKeys, nil)
 }
 
+type batchPinDeleter interface {
+	DeletePinsBatch(refs []string) ([]string, error)
+}
+
 // PrunePinsForSnapshots removes stale refs/reviewed/<key>/* pins for changes that are no
 // longer pending or snapshot numbers that are no longer valid in validSnapNums.
 func PrunePinsForSnapshots(repo Repo, activeKeys map[string]bool, validSnapNums map[string]map[int]bool) ([]string, error) {
 	stale, err := StalePinsForSnapshots(repo, activeKeys, validSnapNums)
 	if err != nil {
 		return nil, err
+	}
+	if len(stale) == 0 {
+		return nil, nil
+	}
+	if bd, ok := repo.(batchPinDeleter); ok {
+		return bd.DeletePinsBatch(stale)
 	}
 
 	var deleted []string

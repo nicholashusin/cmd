@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -596,6 +597,10 @@ func TestThreadsForChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	th1Early, _, err := d.AddThread(r.ID, "c1", "rev1", 0, "file1.go", "R", 3, 3, "anchor0", "alice", "msg 0", false)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	th2, _, err := d.AddThread(r.ID, "c1", "rev1", 0, "file2.go", "R", 5, 5, "anchor2", "carol", "msg 2", true)
 	if err != nil {
@@ -612,12 +617,13 @@ func TestThreadsForChanges(t *testing.T) {
 		t.Fatalf("ThreadsForChanges err: %v", err)
 	}
 
-	if len(res["c1"]) != 2 {
-		t.Errorf("expected 2 threads for c1, got %d", len(res["c1"]))
+	if len(res["c1"]) != 3 {
+		t.Errorf("expected 3 threads for c1, got %d", len(res["c1"]))
 	} else {
-		// Verify start_line ordering: file2.go (line 5) before file1.go (line 10)
-		if res["c1"][0].ID != th2.ID || res["c1"][1].ID != th1.ID {
-			t.Errorf("expected start_line ascending ordering for c1 threads")
+		// Verify path ASC, start_line ASC ordering (matching ThreadsForChange).
+		if res["c1"][0].ID != th1Early.ID || res["c1"][1].ID != th1.ID || res["c1"][2].ID != th2.ID {
+			t.Errorf("expected path ASC, start_line ASC ordering for c1 threads, got [%d, %d, %d]",
+				res["c1"][0].ID, res["c1"][1].ID, res["c1"][2].ID)
 		}
 		// Verify messages on th1
 		var th1Res *Thread
@@ -927,5 +933,41 @@ func TestOpenSpecialPathAndPermissions(t *testing.T) {
 				t.Errorf("expected db file mode 0600, got %o", perm)
 			}
 		}
+	}
+}
+
+func TestEnsureRepoSlugSanitizationAndLookup(t *testing.T) {
+	d, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	base := t.TempDir()
+	p := filepath.Join(base, "my repo #1")
+	rec, err := d.EnsureRepo(p)
+	if err != nil {
+		t.Fatalf("EnsureRepo: %v", err)
+	}
+	if strings.ContainsAny(rec.Slug, " #/?") {
+		t.Errorf("slug %q contains unsafe URL characters", rec.Slug)
+	}
+	// Trailing slash path lookup must match via filepath.Clean.
+	got, err := d.RepoBySlug(p + string(filepath.Separator))
+	if err != nil || got == nil || got.ID != rec.ID {
+		t.Fatalf("RepoBySlug with trailing slash = (%+v, %v), want ID %d", got, err, rec.ID)
+	}
+
+	// Non-semantic pref/draft updates must not invalidate StateDigestFor.
+	before, _ := d.StateDigestFor(rec.ID, "")
+	if err := d.SetPref("theme", "dark"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SaveFormDraft(rec.ID, "c1", "k1", "a.go", "R", 1, 1, 0, 0, true, "", "", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := d.StateDigestFor(rec.ID, "")
+	if after != before {
+		t.Errorf("StateDigestFor changed across non-semantic mutations: %s -> %s", before, after)
 	}
 }

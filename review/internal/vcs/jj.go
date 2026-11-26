@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,6 +27,7 @@ type JJRepo struct {
 	gitDir      string
 	cache       *Cache
 	user        string
+	mu          sync.Mutex
 	changes     []*Change
 }
 
@@ -48,10 +49,12 @@ func openJJ(root, mainRepoDir string, cache *Cache) (*JJRepo, error) {
 		} else {
 			if target, err := os.ReadFile(gitTarget); err == nil {
 				t := strings.TrimSpace(string(target))
-				if !filepath.IsAbs(t) {
-					t = filepath.Clean(filepath.Join(filepath.Dir(gitTarget), t))
+				if t != "" {
+					if !filepath.IsAbs(t) {
+						t = filepath.Clean(filepath.Join(filepath.Dir(gitTarget), t))
+					}
+					r.gitDir = t
 				}
-				r.gitDir = t
 			}
 		}
 	}
@@ -112,9 +115,13 @@ func isStaleWorkingCopyErr(err error) bool {
 }
 
 func (r *JJRepo) Changes() ([]*Change, error) {
+	r.mu.Lock()
 	if r.changes != nil {
-		return r.changes, nil
+		cached := r.changes
+		r.mu.Unlock()
+		return cached, nil
 	}
+	r.mu.Unlock()
 
 	opID := r.getOpID()
 	if opID != "" && r.cache != nil {
@@ -122,7 +129,9 @@ func (r *JJRepo) Changes() ([]*Change, error) {
 		entry, ok := r.cache.jjChanges[r.root]
 		r.cache.mu.Unlock()
 		if ok && entry.opID == opID && time.Since(entry.at) < jjCacheTTL {
+			r.mu.Lock()
 			r.changes = entry.changes
+			r.mu.Unlock()
 			return entry.changes, nil
 		}
 	}
@@ -144,7 +153,9 @@ func (r *JJRepo) Changes() ([]*Change, error) {
 		}
 	}
 
+	r.mu.Lock()
 	r.changes = changes
+	r.mu.Unlock()
 	opID = r.getOpID()
 	if opID != "" && r.cache != nil {
 		r.cache.mu.Lock()
@@ -227,10 +238,14 @@ func (r *JJRepo) Commit(rev string) (*Change, error) {
 	}
 	changes, err := r.Changes()
 	if err == nil {
-		for _, c := range changes {
-			if strings.HasPrefix(c.Rev, rev) || strings.HasPrefix(c.Key, rev) {
-				return c, nil
+		if rev == "@" {
+			for _, c := range changes {
+				if c != nil && c.Current {
+					return c, nil
+				}
 			}
+		} else if c := ResolveChange(changes, rev); c != nil {
+			return c, nil
 		}
 	}
 
@@ -248,9 +263,17 @@ func (r *JJRepo) Commit(rev string) (*Change, error) {
 		return nil, fmt.Errorf("resolving jj commit %s: %w", rev, err)
 	}
 
-	raw := bytes.TrimRight(out, "\x1e\n")
-	if c, ok := r.parseChangeRecord(raw); ok {
-		return c, nil
+	var matched []*Change
+	for _, rec := range bytes.Split(out, []byte("\x1e")) {
+		if c, ok := r.parseChangeRecord(rec); ok {
+			matched = append(matched, c)
+		}
+	}
+	if len(matched) == 1 {
+		return matched[0], nil
+	}
+	if len(matched) > 1 {
+		return nil, fmt.Errorf("revset %s matched %d commits", rev, len(matched))
 	}
 	return nil, fmt.Errorf("commit %s not found", rev)
 }
@@ -309,6 +332,9 @@ func (r *JJRepo) Files(baseRev, targetRev string) ([]*File, error) {
 // conflicted reports whether rev has unresolved conflicts, whose files Git
 // can't read.
 func (r *JJRepo) conflicted(rev string) bool {
+	if rev == "" || rev == "working" || strings.Trim(rev, "0") == "" {
+		return false
+	}
 	cf, err := r.cache.catFile(r.gitDir)
 	return err == nil && cf.JJConflict(rev)
 }
@@ -324,7 +350,7 @@ func (r *JJRepo) ListDir(rev, dirPath string) ([]string, error) {
 	if err := ValidateRev(rev); err != nil {
 		return nil, err
 	}
-	if r.gitDir != "" {
+	if r.gitDir != "" && !r.conflicted(rev) {
 		names, err := gitListDir(r.cache, r.gitDir, r.root, rev, dirPath)
 		if err == nil && names != nil {
 			return names, nil
@@ -344,7 +370,7 @@ func (r *JJRepo) ListDir(rev, dirPath string) ([]string, error) {
 		return nil, nil
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(outBytes)), "\n")
+	lines := strings.Split(strings.TrimRight(string(outBytes), "\r\n"), "\n")
 	var names []string
 	prefix := cleanDir
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
@@ -352,7 +378,7 @@ func (r *JJRepo) ListDir(rev, dirPath string) ([]string, error) {
 	}
 
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
+		line = strings.TrimRight(line, "\r")
 		if line == "" {
 			continue
 		}
@@ -371,45 +397,25 @@ func (r *JJRepo) ListDir(rev, dirPath string) ([]string, error) {
 }
 
 func (r *JJRepo) ListGoFiles(rev string) ([]string, error) {
-	if r.gitDir != "" {
+	if (rev == "" || rev == "working") && r.root != "" {
+		if goFiles, err := walkWorkingGoFiles(r.root); err == nil {
+			return goFiles, nil
+		}
+	}
+	if rev != "" && rev != "working" {
+		if err := ValidateRev(rev); err != nil {
+			return nil, err
+		}
+	}
+	if r.gitDir != "" && !r.conflicted(rev) {
 		files, err := gitListGoFiles(r.cache, r.gitDir, r.root, rev)
 		if err == nil && files != nil {
 			return files, nil
 		}
 	}
 
-	if (rev == "" || rev == "working") && r.root != "" {
-		var goFiles []string
-		err := filepath.WalkDir(r.root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() {
-				if path != r.root && shouldSkipGoDir(d.Name()) {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			name := d.Name()
-			if strings.HasSuffix(name, ".go") && name[0] != '.' && name[0] != '_' {
-				rel, err := filepath.Rel(r.root, path)
-				if err == nil {
-					goFiles = append(goFiles, filepath.ToSlash(rel))
-				}
-			}
-			return nil
-		})
-		if err == nil {
-			slices.Sort(goFiles)
-			return goFiles, nil
-		}
-	}
-
 	args := []string{"--ignore-working-copy", "--config", `ui.paginate="never"`, "file", "list"}
 	if rev != "" && rev != "working" {
-		if err := ValidateRev(rev); err != nil {
-			return nil, err
-		}
 		args = append(args, "-r="+rev)
 	}
 
@@ -418,10 +424,10 @@ func (r *JJRepo) ListGoFiles(rev string) ([]string, error) {
 		return nil, err
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(outBytes)), "\n")
+	lines := strings.Split(strings.TrimRight(string(outBytes), "\r\n"), "\n")
 	var goFiles []string
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
+		line = strings.TrimRight(line, "\r")
 		if line == "" {
 			continue
 		}
@@ -504,6 +510,10 @@ func (r *JJRepo) DeletePin(ref string) error {
 	return deletePinRef(r.gitDir, ref)
 }
 
+func (r *JJRepo) DeletePinsBatch(refs []string) ([]string, error) {
+	return deletePinRefsBatch(r.gitDir, refs)
+}
+
 func parseJJTimestamp(s string) time.Time {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -553,7 +563,7 @@ func (r *JJRepo) ListGoFileBlobs(rev string) ([]GoFileBlob, error) {
 	if rev == "" || rev == "working" {
 		return nil, os.ErrNotExist
 	}
-	if r.gitDir != "" {
+	if r.gitDir != "" && !r.conflicted(rev) {
 		cf, err := r.cache.catFile(r.gitDir)
 		if err == nil {
 			return cf.ListGoFileBlobs(rev)
@@ -567,7 +577,7 @@ func (r *JJRepo) ListAllFileBlobs(rev string) ([]GoFileBlob, error) {
 	if rev == "" || rev == "working" {
 		return nil, os.ErrNotExist
 	}
-	if r.gitDir != "" {
+	if r.gitDir != "" && !r.conflicted(rev) {
 		cf, err := r.cache.catFile(r.gitDir)
 		if err == nil {
 			return cf.ListAllFileBlobs(rev)
@@ -589,7 +599,7 @@ func (r *JJRepo) StreamBlobs(oids []string, visit func(idx int, oid string, data
 
 // ReadDirGoFiles implements DirGoBlobRepo for JJRepo when backed by gitDir.
 func (r *JJRepo) ReadDirGoFiles(rev, dir string) ([]GoFileBlobContent, error) {
-	if rev == "" || rev == "working" || r.gitDir == "" {
+	if rev == "" || rev == "working" || r.gitDir == "" || r.conflicted(rev) {
 		return nil, fmt.Errorf("ReadDirGoFiles not supported on %s", rev)
 	}
 	cf, err := r.cache.catFile(r.gitDir)

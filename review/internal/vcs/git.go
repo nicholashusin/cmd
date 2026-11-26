@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,7 +18,9 @@ type GitRepo struct {
 	gitDir  string
 	cache   *Cache
 	user    string
+	mu      sync.Mutex
 	headSHA string
+	dirty   bool
 	changes []*Change
 }
 
@@ -62,36 +65,42 @@ func (r *GitRepo) Changes() ([]*Change, error) {
 	if out, err := r.runCmd("--no-optional-locks", "rev-parse", "HEAD"); err == nil {
 		headSHA = strings.TrimSpace(string(out))
 	}
+	statusOut, _ := r.runCmd("--no-optional-locks", "status", "--porcelain", "-uno")
+	dirty := len(bytes.TrimSpace(statusOut)) > 0
 
-	if r.changes != nil && r.headSHA == headSHA {
-		return r.changes, nil
+	r.mu.Lock()
+	if r.changes != nil && r.headSHA == headSHA && r.dirty == dirty {
+		cached := r.changes
+		r.mu.Unlock()
+		return cached, nil
 	}
+	r.mu.Unlock()
 
 	revRange := ""
 	if _, err := r.runCmd("--no-optional-locks", "rev-parse", "--verify", "-q", "@{upstream}"); err == nil {
 		revRange = "@{upstream}..HEAD"
 	}
 
-	refsOut, _ := r.runCmd("--no-optional-locks", "for-each-ref", "--format=%(refname)",
-		"refs/remotes/origin/HEAD",
-		"refs/remotes/origin/main",
-		"refs/remotes/origin/master")
-	hasOriginHEAD := false
-	hasOriginMain := false
-	hasOriginMaster := false
-	for _, ref := range strings.Split(string(refsOut), "\n") {
-		ref = strings.TrimSpace(ref)
-		switch ref {
-		case "refs/remotes/origin/HEAD":
-			hasOriginHEAD = true
-		case "refs/remotes/origin/main":
-			hasOriginMain = true
-		case "refs/remotes/origin/master":
-			hasOriginMaster = true
-		}
-	}
-
 	if revRange == "" {
+		refsOut, _ := r.runCmd("--no-optional-locks", "for-each-ref", "--format=%(refname)",
+			"refs/remotes/origin/HEAD",
+			"refs/remotes/origin/main",
+			"refs/remotes/origin/master")
+		hasOriginHEAD := false
+		hasOriginMain := false
+		hasOriginMaster := false
+		for _, ref := range strings.Split(string(refsOut), "\n") {
+			ref = strings.TrimSpace(ref)
+			switch ref {
+			case "refs/remotes/origin/HEAD":
+				hasOriginHEAD = true
+			case "refs/remotes/origin/main":
+				hasOriginMain = true
+			case "refs/remotes/origin/master":
+				hasOriginMaster = true
+			}
+		}
+
 		if hasOriginHEAD {
 			revRange = "origin/HEAD..HEAD"
 		} else if hasOriginMain {
@@ -122,8 +131,7 @@ func (r *GitRepo) Changes() ([]*Change, error) {
 	var changes []*Change
 
 	// Synthetic working copy change if dirty
-	statusOut, _ := r.runCmd("--no-optional-locks", "status", "--porcelain")
-	if len(bytes.TrimSpace(statusOut)) > 0 && headSHA != "" {
+	if dirty && headSHA != "" {
 		changes = append(changes, &Change{
 			Key:     "working",
 			Rev:     "working",
@@ -216,14 +224,20 @@ func (r *GitRepo) Changes() ([]*Change, error) {
 		addMissingParent(rc.parent)
 	}
 	if len(missingParents) > 0 {
-		if pOut, err := r.runCmd(append([]string{"--no-optional-locks", "log", "--no-walk", "--format=%H%x1f%s"}, missingParents...)...); err == nil {
+		if pOut, err := r.runCmd(append([]string{"--no-optional-locks", "log", "--no-walk", "--format=%H%x1f%T%x1f%s"}, missingParents...)...); err == nil {
 			for _, line := range bytes.Split(pOut, []byte("\n")) {
-				parts := bytes.SplitN(line, []byte("\x1f"), 2)
-				if len(parts) == 2 {
+				parts := bytes.SplitN(line, []byte("\x1f"), 3)
+				if len(parts) == 3 {
 					psha := strings.TrimSpace(string(parts[0]))
-					psubj := strings.TrimSpace(string(parts[1]))
-					if psha != "" && psubj != "" {
-						subjectBySHA[psha] = psubj
+					ptree := strings.TrimSpace(string(parts[1]))
+					psubj := strings.TrimSpace(string(parts[2]))
+					if psha != "" {
+						if ptree != "" {
+							trees[psha] = ptree
+						}
+						if psubj != "" {
+							subjectBySHA[psha] = psubj
+						}
 					}
 				}
 			}
@@ -282,8 +296,11 @@ func (r *GitRepo) Changes() ([]*Change, error) {
 		changes[0].ParentSubject = subjectBySHA[changes[0].Parent]
 	}
 
+	r.mu.Lock()
 	r.headSHA = headSHA
+	r.dirty = dirty
 	r.changes = changes
+	r.mu.Unlock()
 	return changes, nil
 }
 
@@ -348,15 +365,18 @@ func (r *GitRepo) Commit(rev string) (*Change, error) {
 	if err := ValidateRev(rev); err != nil {
 		return nil, err
 	}
-	if r.changes != nil {
-		for _, c := range r.changes {
+	r.mu.Lock()
+	cachedChanges := r.changes
+	r.mu.Unlock()
+	if cachedChanges != nil {
+		for _, c := range cachedChanges {
 			if c != nil && !c.Working && c.Rev == rev {
 				return c, nil
 			}
 		}
 		var match *Change
 		matches := 0
-		for _, c := range r.changes {
+		for _, c := range cachedChanges {
 			if c == nil || c.Working {
 				continue
 			}
@@ -411,7 +431,7 @@ func (r *GitRepo) Commit(rev string) (*Change, error) {
 
 	parentSubject := ""
 	if parent != "" && strings.Trim(parent, "0") != "" {
-		for _, ch := range r.changes {
+		for _, ch := range cachedChanges {
 			if ch != nil && ch.Rev == parent {
 				if firstLine := strings.TrimSpace(strings.Split(ch.Message, "\n")[0]); firstLine != "" {
 					parentSubject = firstLine
@@ -477,8 +497,12 @@ func (r *GitRepo) Content(rev, path string) ([]byte, error) {
 	if err != nil {
 		out, err := r.runCmd("--no-optional-locks", "show", rev+":"+cleanPath)
 		if err != nil {
-			if strings.Contains(err.Error(), "does not exist") || strings.Contains(err.Error(), "fatal: path") || strings.Contains(err.Error(), "exists on disk, but not in") {
-				return nil, os.ErrNotExist
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				stderr := string(exitErr.Stderr)
+				if strings.Contains(stderr, "does not exist") || strings.Contains(stderr, "fatal: path") || strings.Contains(stderr, "exists on disk, but not in") {
+					return nil, os.ErrNotExist
+				}
 			}
 			return nil, err
 		}
@@ -497,6 +521,10 @@ func (r *GitRepo) ListPins() ([]string, error) {
 
 func (r *GitRepo) DeletePin(ref string) error {
 	return deletePinRef(r.gitDir, ref)
+}
+
+func (r *GitRepo) DeletePinsBatch(refs []string) ([]string, error) {
+	return deletePinRefsBatch(r.gitDir, refs)
 }
 
 // BlobOID implements BlobOIDer for GitRepo.

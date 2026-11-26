@@ -2164,12 +2164,14 @@ func runGC(d *db.DB, repos []*db.RepoRecord, dryRun, keepMissing bool, openRepo 
 			sort.Strings(sortedActiveKeys)
 
 			validSnapNums := make(map[string]map[int]bool, len(sortedActiveKeys))
+			snapLoadFailed := false
 			var pins []string
 			pinsLoaded := false
 
 			for _, key := range sortedActiveKeys {
 				snaps, err := d.Snapshots(rec.ID, key)
 				if err != nil {
+					snapLoadFailed = true
 					continue
 				}
 				if len(snaps) == 0 {
@@ -2295,13 +2297,15 @@ func runGC(d *db.DB, repos []*db.RepoRecord, dryRun, keepMissing bool, openRepo 
 			}
 
 			// 5. Prune VCS pins (for non-pending changes and invalid/pruned snapshot numbers)
-			if dryRun {
-				stalePins, _ := vcs.StalePinsForSnapshots(repo, activeKeys, validSnapNums)
-				report.PrunedPins = append(report.PrunedPins, stalePins...)
-			} else {
-				prunedPins, err := vcs.PrunePinsForSnapshots(repo, activeKeys, validSnapNums)
-				if err == nil {
-					report.PrunedPins = append(report.PrunedPins, prunedPins...)
+			if !snapLoadFailed {
+				if dryRun {
+					stalePins, _ := vcs.StalePinsForSnapshots(repo, activeKeys, validSnapNums)
+					report.PrunedPins = append(report.PrunedPins, stalePins...)
+				} else {
+					prunedPins, err := vcs.PrunePinsForSnapshots(repo, activeKeys, validSnapNums)
+					if err == nil {
+						report.PrunedPins = append(report.PrunedPins, prunedPins...)
+					}
 				}
 			}
 		}()
