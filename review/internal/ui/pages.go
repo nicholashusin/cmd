@@ -39,6 +39,8 @@ type FileDiffData struct {
 	RightRev           string
 	BaseParam          string
 	TargetParam        string
+	BaseDesc           string
+	TargetDesc         string
 	FilePath           string
 	OldPath            string
 	StatusCode         string
@@ -467,6 +469,8 @@ func (s *Server) handleChange(w http.ResponseWriter, r *http.Request) {
 					RightRev:       view.TargetRev,
 					BaseParam:      baseSel,
 					TargetParam:    targetSel,
+					BaseDesc:       view.BaseDesc,
+					TargetDesc:     view.TargetDesc,
 					FilePath:       f.Path,
 					OldPath:        f.OldPath,
 					StatusCode:     f.StatusCode(),
@@ -756,6 +760,8 @@ func (s *Server) handleExternalFile(w http.ResponseWriter, r *http.Request) {
 		InDiff:       false,
 		BaseParam:    baseSel,
 		TargetParam:  targetSel,
+		BaseDesc:     view.BaseDesc,
+		TargetDesc:   view.TargetDesc,
 	}
 
 	requestedMode := r.URL.Query().Get("mode")
@@ -844,6 +850,8 @@ func (s *Server) buildFileDiffData(repo vcs.Repo, rec *db.RepoRecord, c *vcs.Cha
 		RightRev:    view.TargetRev,
 		BaseParam:   baseSel,
 		TargetParam: targetSel,
+		BaseDesc:    view.BaseDesc,
+		TargetDesc:  view.TargetDesc,
 		FilePath:    vcsPath,
 		FileIndex:   fileIdx,
 		DiffMode:    diffMode,

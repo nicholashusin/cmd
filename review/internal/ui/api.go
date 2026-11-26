@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -1520,8 +1521,46 @@ func (s *Server) buildSymbolLookupRequest(r *http.Request, needBothRevs bool) (r
 	baseSel := q.Get("base")
 	targetSel := q.Get("target")
 
+	var symTarget *gosym.SymbolTarget
+	if symKind := q.Get("sym_kind"); symKind != "" {
+		symDir := filepath.ToSlash(q.Get("sym_dir"))
+		if symDir != "" {
+			cd := path.Clean(symDir)
+			if strings.HasPrefix(cd, "..") || strings.HasPrefix(cd, "/") {
+				return req, false, 0, ""
+			}
+			if cd == "." {
+				cd = ""
+			}
+			symDir = cd
+		}
+		symOrigin := ""
+		if rawOrigin := q.Get("sym_origin"); rawOrigin != "" {
+			co := filepath.Clean(rawOrigin)
+			if !strings.HasPrefix(co, "..") && !filepath.IsAbs(co) {
+				symOrigin = filepath.ToSlash(co)
+			}
+		}
+		symTarget = &gosym.SymbolTarget{
+			InRepo:  q.Get("sym_in_repo") == "1" || q.Get("sym_in_repo") == "true",
+			Dir:     symDir,
+			Pkg:     q.Get("sym_pkg"),
+			PkgName: q.Get("sym_pkg_name"),
+			Name:    q.Get("sym_name"),
+			Owner:   q.Get("sym_owner"),
+			Kind:    symKind,
+			IsTest:  q.Get("sym_is_test") == "1" || q.Get("sym_is_test") == "true",
+			Origin:  symOrigin,
+		}
+		if symTarget.Name == "" {
+			return req, false, 0, ""
+		}
+	}
+
 	cleanPath := ""
-	if pkgParam != "" && pkgFile != "" {
+	if symTarget != nil {
+		cleanPath = symTarget.Origin
+	} else if pkgParam != "" && pkgFile != "" {
 		if !strings.HasSuffix(pkgFile, ".go") || filepath.Base(pkgFile) != pkgFile || strings.Contains(pkgFile, "..") {
 			return req, false, 0, ""
 		}
@@ -1620,6 +1659,7 @@ func (s *Server) buildSymbolLookupRequest(r *http.Request, needBothRevs bool) (r
 		PkgImportPath: pkgParam,
 		PkgFile:       pkgFile,
 		Site:          q.Get("site") == "1",
+		Symbol:        symTarget,
 	}, true, 0, ""
 }
 

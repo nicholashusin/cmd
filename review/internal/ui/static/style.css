@@ -1348,6 +1348,69 @@ mark.ident-occ-mark {
   color: var(--link);
 }
 
+.sym-ver-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.sym-ver-chip.sym-ver-toggle {
+  appearance: none;
+  cursor: pointer;
+}
+
+.sym-ver-chip.sym-ver-toggle:hover {
+  border-color: var(--link);
+  color: var(--link);
+}
+
+.sym-ver-chip.sym-ver-toggle:hover .sym-ver-swap {
+  opacity: 1;
+}
+
+.sym-ver-swap {
+  font-family: var(--font-sans);
+  font-size: 9.5px;
+  font-weight: 400;
+  opacity: 0.72;
+}
+
+.sym-ver-notice {
+  position: absolute;
+  top: 38px;
+  left: 10px;
+  max-width: calc(100% - 20px);
+  z-index: 20;
+  padding: 5px 10px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.35;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  white-space: normal;
+  word-break: break-word;
+  transition: opacity 0.25s ease;
+}
+
+.sym-ver-notice.sym-ver-notice-fade {
+  opacity: 0;
+}
+
 .sym-popup-loc {
   font-family: var(--font-mono);
   font-size: 11px;

@@ -114,7 +114,9 @@
      data-file-path="{{TrimSlash .FilePath}}"{{if .OldPath}}
      data-left-path="{{TrimSlash .OldPath}}"{{end}}
      data-left-rev="{{.LeftRev}}"
-     data-right-rev="{{.RightRev}}"
+     data-right-rev="{{.RightRev}}"{{if .BaseDesc}}
+     data-base-desc="{{.BaseDesc}}"{{end}}{{if .TargetDesc}}
+     data-target-desc="{{.TargetDesc}}"{{end}}
      data-diff-mode="{{.DiffMode}}"{{if .NextUnreviewedFile}}
      data-next-unreviewed="{{TrimSlash .NextUnreviewedFile}}"{{end}}{{if .ReadOnly}}
      data-readonly="true"{{end}}{{if .ExtPkg}}

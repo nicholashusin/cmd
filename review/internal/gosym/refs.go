@@ -51,12 +51,13 @@ type Reference struct {
 
 // RefsResult contains all references found for a symbol.
 type RefsResult struct {
-	Found         bool        `json:"found"`
-	SymbolName    string      `json:"symbol_name,omitempty"`
-	Signature     string      `json:"signature,omitempty"`
-	SignatureHTML string      `json:"signature_html,omitempty"`
-	Refs          []Reference `json:"refs,omitempty"`
-	Truncated     bool        `json:"truncated,omitempty"`
+	Found         bool          `json:"found"`
+	SymbolName    string        `json:"symbol_name,omitempty"`
+	Signature     string        `json:"signature,omitempty"`
+	SignatureHTML string        `json:"signature_html,omitempty"`
+	SymTarget     *SymbolTarget `json:"sym_target,omitempty"`
+	Refs          []Reference   `json:"refs,omitempty"`
+	Truncated     bool          `json:"truncated,omitempty"`
 }
 
 type targetIdentity struct {
@@ -816,6 +817,7 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 		SymbolName:    symName,
 		Signature:     sig,
 		SignatureHTML: sigHTML,
+		SymTarget:     buildSymbolTarget(req, target),
 	}
 
 	defPos := target.loader.positionFor(target.obj, target.rootPkg)

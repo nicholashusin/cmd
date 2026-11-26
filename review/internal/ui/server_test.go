@@ -23023,3 +23023,554 @@ func TestDashboardAndRepoCommitDiffStats(t *testing.T) {
 		}
 	}
 }
+
+func TestUI_PopupVersionChip(t *testing.T) {
+	srv, ts, d, repoDir := setupTestServer(t)
+	defer srv.broker.Close()
+	defer ts.Close()
+	defer d.Close()
+
+	rec, err := d.EnsureRepo(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := vcs.Open(repoDir, srv.cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes, err := repo.Changes()
+	if err != nil || len(changes) == 0 {
+		t.Fatalf("expected changes, got %v", err)
+	}
+	c := changes[0]
+
+	// 1. Server renders data-base-desc and data-target-desc on both change overview and diff block.
+	for _, urlPath := range []string{
+		fmt.Sprintf("/r/%s/c/%s?diffs=all", rec.Slug, c.Key),
+		fmt.Sprintf("/r/%s/c/%s/f/hello.go", rec.Slug, c.Key),
+	} {
+		resp, err := http.Get(ts.URL + urlPath)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s failed: status=%v err=%v", urlPath, resp.StatusCode, err)
+		}
+		b, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		html := string(b)
+		if !strings.Contains(html, `data-base-desc="Parent"`) || !strings.Contains(html, `data-target-desc="Live Snapshot"`) {
+			t.Errorf("GET %s missing data-base-desc/data-target-desc attributes", urlPath)
+		}
+	}
+
+	// 2. Verify /api/symbol supports semantic sym_* cross-version lookup.
+	symURL := fmt.Sprintf("%s/api/symbol?repo=%s&change=%s&side=R&sym_kind=func&sym_name=main&sym_in_repo=1&sym_pkg_name=main", ts.URL, rec.Slug, c.Key)
+	symResp, err := http.Get(symURL)
+	if err != nil || symResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s failed: status=%v err=%v", symURL, symResp.StatusCode, err)
+	}
+	symBody, err := io.ReadAll(symResp.Body)
+	_ = symResp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(symBody), `"found":true`) || !strings.Contains(string(symBody), `"sym_target"`) {
+		t.Errorf("expected semantic /api/symbol lookup for main to succeed with sym_target, got: %s", string(symBody))
+	}
+
+	// 3. Verify popup version chips & interactive Base <-> Target switching across all views via Node.
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+
+	script := `
+const fs = require("fs");
+const vm = require("vm");
+const code = fs.readFileSync("static/app.js", "utf8");
+
+function runScenario(opts) {
+  opts = opts || {};
+  const isChangePage = !!opts.isChangePage;
+  const leftRev = opts.leftRev !== undefined ? opts.leftRev : "11111111aaaa";
+  const rightRev = opts.rightRev !== undefined ? opts.rightRev : "22222222bbbb";
+  const baseDesc = opts.baseDesc !== undefined ? opts.baseDesc : "Snapshot 1";
+  const targetDesc = opts.targetDesc !== undefined ? opts.targetDesc : "Live Snapshot";
+  function makeEl(tag) {
+    const listeners = {};
+    const attrs = {};
+    const el = {
+      tagName: (tag || "DIV").toUpperCase(),
+      id: "",
+      className: "",
+      _innerHTML: "",
+      value: "",
+      style: {},
+      children: [],
+      parentElement: null,
+      isConnected: true,
+      offsetWidth: 0,
+      offsetHeight: 320,
+      classList: {
+        add(...cls) {
+          const set = new Set((el.className || "").split(/\s+/).filter(Boolean));
+          cls.forEach(c => set.add(c));
+          el.className = Array.from(set).join(" ");
+        },
+        remove(...cls) {
+          const set = new Set((el.className || "").split(/\s+/).filter(Boolean));
+          cls.forEach(c => set.delete(c));
+          el.className = Array.from(set).join(" ");
+        },
+        contains(c) { return (el.className || "").split(/\s+/).includes(c); },
+      },
+      setAttribute(k, v) { attrs[k] = String(v); },
+      getAttribute(k) { return k in attrs ? attrs[k] : null; },
+      hasAttribute(k) { return k in attrs; },
+      appendChild(ch) { ch.parentElement = el; el.children.push(ch); return ch; },
+      remove() {
+        el.isConnected = false;
+        if (el.parentElement) {
+          const idx = el.parentElement.children.indexOf(el);
+          if (idx !== -1) el.parentElement.children.splice(idx, 1);
+        }
+      },
+      focus() {},
+      blur() {},
+      addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+      dispatch(type, evt) { (listeners[type] || []).forEach(fn => fn(evt)); },
+      closest(sel) {
+        let cur = el;
+        const parts = sel.split(",").map(s => s.trim());
+        while (cur) {
+          for (const p of parts) {
+            if (p.startsWith(".") && cur.classList && cur.classList.contains(p.slice(1))) return cur;
+            if (p.startsWith("[") && p.endsWith("]")) {
+              const inner = p.slice(1, -1);
+              const eq = inner.indexOf("=");
+              if (eq !== -1) {
+                const k = inner.slice(0, eq);
+                const v = inner.slice(eq + 1).replace(/^"|"$/g, "");
+                if (cur.getAttribute && cur.getAttribute(k) === v) return cur;
+              } else if (cur.hasAttribute && cur.hasAttribute(inner)) {
+                return cur;
+              }
+            }
+          }
+          cur = cur.parentElement;
+        }
+        return null;
+      },
+      querySelector(sel) {
+        if (sel === ".sym-popup-header" && this._innerHTML.includes("sym-popup-header")) {
+          if (!this._hdr) {
+            this._hdr = makeEl("DIV");
+            this._hdr.className = "sym-popup-header";
+            this._hdr.offsetHeight = 32;
+            this._hdr.parentElement = this;
+          }
+          return this._hdr;
+        }
+        if (sel === ".cs-search-input" && this._innerHTML.includes("cs-search-input")) {
+          if (!this._csInput) {
+            this._csInput = makeEl("INPUT");
+            this._csInput.className = "cs-search-input";
+            this._csInput.value = "Server";
+            this._csInput.parentElement = this;
+          }
+          return this._csInput;
+        }
+        if (sel === ".cs-results" && this._innerHTML.includes("cs-results")) {
+          if (!this._csResults) {
+            this._csResults = makeEl("DIV");
+            this._csResults.className = "cs-results";
+            this._csResults.parentElement = this;
+          }
+          return this._csResults;
+        }
+        for (const ch of this.children) {
+          const found = ch.querySelector(sel);
+          if (found) return found;
+        }
+        return null;
+      },
+      querySelectorAll() { return []; },
+    };
+    Object.defineProperty(el, "innerHTML", {
+      get() { return el._innerHTML; },
+      set(v) { el._innerHTML = String(v || ""); el._hdr = null; el._csInput = null; el._csResults = null; },
+    });
+    return el;
+  }
+
+  const body = makeEl("BODY");
+  const docEl = makeEl("HTML");
+  docEl.setAttribute("data-state-repo", "myrepo");
+  if (isChangePage) docEl.setAttribute("data-state-change", "chg1");
+
+  const overviewEl = makeEl("DIV");
+  overviewEl.className = "change-overview";
+  overviewEl.setAttribute("data-left-rev", leftRev);
+  overviewEl.setAttribute("data-right-rev", rightRev);
+  overviewEl.setAttribute("data-base-desc", baseDesc);
+  overviewEl.setAttribute("data-target-desc", targetDesc);
+
+  const fetchedURLs = [];
+  const doc = {
+    documentElement: docEl,
+    body,
+    hidden: false,
+    activeElement: body,
+    createElement: makeEl,
+    getElementById: () => null,
+    querySelector(sel) {
+      if (isChangePage && sel === ".change-overview") return overviewEl;
+      return null;
+    },
+    querySelectorAll: () => [],
+    addEventListener() {},
+  };
+
+  const win = {
+    document: doc,
+    location: isChangePage
+      ? { pathname: "/r/myrepo/c/chg1", search: "?base=snap:1&target=live", hash: "", href: "" }
+      : { pathname: "/r/myrepo", search: "", hash: "", href: "" },
+    innerWidth: 1280,
+    innerHeight: 800,
+    scrollX: 0,
+    scrollY: 0,
+    URLSearchParams,
+    AbortController,
+    localStorage: { getItem: () => null, setItem() {} },
+    addEventListener() {},
+    fetch: async (url) => {
+      fetchedURLs.push(url);
+      if (opts.fetchImpl) {
+        return opts.fetchImpl(url);
+      }
+      if (url.startsWith("/api/file/preview")) {
+        const sp = new URLSearchParams(url.split("?")[1] || "");
+        const p = sp.get("path") || "hello.go";
+        const side = sp.get("side") || "R";
+        const line = parseInt(sp.get("line") || "1", 10);
+        if (p === "only_in_target.go" && side === "L") {
+          return { ok: true, json: async () => ({ found: false }) };
+        }
+        const effLine = (p === "hello.go" && side === "R" && line > 12) ? 12 : line;
+        return {
+          ok: true,
+          json: async () => ({
+            found: true,
+            in_repo: true,
+            def_path: p,
+            display_path: p,
+            def_line: effLine,
+            snippet: [{ line: effLine, html: "// line " + effLine, active: true }],
+          }),
+        };
+      }
+      if (url.startsWith("/api/symbol/refs?")) {
+        const sp = new URLSearchParams(url.split("?")[1] || "");
+        const name = sp.get("sym_name") || "Server";
+        const side = sp.get("side") || "R";
+        if (name === "OnlyInTarget" && side === "L") {
+          return { ok: true, json: async () => ({ found: false }) };
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            found: true,
+            symbol_name: name,
+            sym_target: { in_repo: true, dir: "", pkg: "example.com/p", pkg_name: "p", name, kind: "type" },
+            refs: [{ path: "hello.go", display: "hello.go", in_repo: true, group: "change", line: side === "L" ? 4 : 9, col: 1, line_html: "Server" }],
+          }),
+        };
+      }
+      if (url.startsWith("/api/symbol/impls?")) {
+        const sp = new URLSearchParams(url.split("?")[1] || "");
+        const name = sp.get("sym_name") || "Runner";
+        return {
+          ok: true,
+          json: async () => ({
+            found: true,
+            direction: "implementations",
+            symbol_name: name,
+            sym_target: { in_repo: true, dir: "", pkg: "example.com/p", pkg_name: "p", name, kind: "type" },
+            implementations: [],
+          }),
+        };
+      }
+      if (url.startsWith("/api/symbol?")) {
+        const sp = new URLSearchParams(url.split("?")[1] || "");
+        const side = sp.get("side") || "R";
+        const symName = sp.get("sym_name") || "";
+        const line = parseInt(sp.get("line") || "0", 10);
+        if (symName === "OnlyInTarget" && side === "L") {
+          return { ok: true, json: async () => ({ found: false }) };
+        }
+        if (line === 99) {
+          return {
+            ok: true,
+            json: async () => ({
+              found: true,
+              in_repo: true,
+              def_path: "hello.go",
+              display_path: "hello.go",
+              def_line: 99,
+              symbol_name: "localVar",
+              snippet: [{ line: 99, html: "localVar := 1", active: true }],
+            }),
+          };
+        }
+        if (line === 50) {
+          return {
+            ok: true,
+            json: async () => ({
+              found: true,
+              in_repo: true,
+              def_path: "hello.go",
+              display_path: "hello.go",
+              def_line: 50,
+              symbol_name: "OnlyInTarget",
+              can_refs: true,
+              sym_target: { in_repo: true, dir: "", pkg: "example.com/p", pkg_name: "p", name: "OnlyInTarget", kind: "func" },
+              snippet: [{ line: 50, html: "func OnlyInTarget() {}", active: true }],
+            }),
+          };
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            found: true,
+            in_repo: true,
+            def_path: "hello.go",
+            display_path: "hello.go",
+            def_line: side === "L" ? 3 : 8,
+            symbol_name: symName || "Server",
+            can_refs: true,
+            can_impls: true,
+            sym_target: { in_repo: true, dir: "", pkg: "example.com/p", pkg_name: "p", name: symName || "Server", kind: "type" },
+            snippet: [{ line: side === "L" ? 3 : 8, html: "type Server struct{}", active: true }],
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({ query: "Server", files: [], symbols: [], comments: [], code: [], total_code: 0 }),
+      };
+    },
+  };
+  win.window = win;
+
+  const ctx = vm.createContext({
+    window: win,
+    document: doc,
+    localStorage: win.localStorage,
+    URLSearchParams,
+    AbortController,
+    fetch: win.fetch,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    console,
+  });
+  vm.runInContext(code, ctx);
+  return { win, body, makeEl, fetchedURLs };
+}
+
+(async () => {
+  const clickToggle = (ch, inst) => {
+    const toggleBtn = ch.makeEl("BUTTON");
+    toggleBtn.className = "sym-ver-chip sym-ver-toggle";
+    toggleBtn.setAttribute("data-action", "toggle-popup-side");
+    inst.el.dispatch("click", { target: toggleBtn, preventDefault() {}, stopPropagation() {} });
+  };
+
+  // 3a. Code Search: uncolored Target chip -> toggles to Base and re-fetches side=L.
+  const ch = runScenario({ isChangePage: true });
+  const inst = ch.win.openCodeSearchPopup("Server");
+  await new Promise(r => setTimeout(r, 20));
+  if (!inst.contentEl.innerHTML.includes('class="sym-ver-chip sym-ver-toggle"') ||
+      !inst.contentEl.innerHTML.includes(">Target<") ||
+      !inst.contentEl.innerHTML.includes("Target (Live Snapshot · 22222222) — click to switch to Base (Snapshot 1)") ||
+      inst.contentEl.innerHTML.includes("sym-ver-right")) {
+    throw new Error("expected uncolored clickable Target chip on Code Search header, got: " + inst.contentEl.innerHTML);
+  }
+  if (!ch.fetchedURLs.some(u => u.includes("side=R"))) {
+    throw new Error("expected initial search fetch on side=R, got: " + JSON.stringify(ch.fetchedURLs));
+  }
+
+  clickToggle(ch, inst);
+  await new Promise(r => setTimeout(r, 20));
+  if (inst.currentState.ctx.side !== "L") {
+    throw new Error("expected toggle chip click to flip search side to L");
+  }
+  if (!inst.currentState.headerHtml.includes(">Base<") ||
+      !inst.currentState.headerHtml.includes("Base (Snapshot 1 · 11111111) — click to switch to Target (Live Snapshot)")) {
+    throw new Error("expected toggled header chip to show Base, got: " + inst.currentState.headerHtml);
+  }
+  if (!ch.fetchedURLs.some(u => u.includes("side=L"))) {
+    throw new Error("expected toggled search to re-fetch with side=L, got: " + JSON.stringify(ch.fetchedURLs));
+  }
+
+  // 3b. File preview opened from toggled Base search: clickable Base chip -> toggles to Target, clamps line 25 to 12 with notice!
+  const resultItem = ch.makeEl("DIV");
+  resultItem.setAttribute("data-cs-kind", "file");
+  resultItem.setAttribute("data-path", "hello.go");
+  resultItem.setAttribute("data-line", "25");
+  inst.el.dispatch("click", { target: resultItem, preventDefault() {}, stopPropagation() {} });
+  await new Promise(r => setTimeout(r, 20));
+  if (!inst.contentEl.innerHTML.includes('data-action="toggle-popup-side"') || !inst.contentEl.innerHTML.includes(">Base<")) {
+    throw new Error("expected clickable Base chip on file preview, got: " + inst.contentEl.innerHTML);
+  }
+  clickToggle(ch, inst);
+  await new Promise(r => setTimeout(r, 20));
+  if (inst.currentState.ctx.side !== "R" || inst.currentState.data.def_line !== 12) {
+    throw new Error("expected file preview toggle to switch to Target clamped to line 12, got: " + JSON.stringify(inst.currentState));
+  }
+  if (!inst._noticeEl || !inst._noticeEl.innerHTML.includes("Line 25 does not exist in Target — showing line 12")) {
+    throw new Error("expected clamped line notice textbox, got: " + (inst._noticeEl && inst._noticeEl.innerHTML));
+  }
+
+  // Missing file on Base stays on Target and shows notice.
+  inst.currentState.data.def_path = "only_in_target.go";
+  inst.currentState.data.def_line = 5;
+  clickToggle(ch, inst);
+  await new Promise(r => setTimeout(r, 20));
+  if (inst.currentState.ctx.side !== "R") {
+    throw new Error("expected missing file toggle to stay on Target");
+  }
+  if (!inst._noticeEl || !inst._noticeEl.innerHTML.includes("only_in_target.go does not exist in Base")) {
+    throw new Error("expected missing file notice textbox, got: " + (inst._noticeEl && inst._noticeEl.innerHTML));
+  }
+
+  // Back restores toggled Base search view.
+  const backBtn = ch.makeEl("BUTTON");
+  backBtn.className = "sym-btn-back";
+  inst.el.dispatch("click", { target: backBtn, preventDefault() {}, stopPropagation() {} });
+  if (!inst.contentEl.innerHTML.includes(">Base<") || !inst.contentEl.innerHTML.includes("toggle-popup-side")) {
+    throw new Error("expected Back from file preview to restore Base search chip, got: " + inst.contentEl.innerHTML);
+  }
+
+  // 3c. Go symbol popup: shows Base chip immediately while loading, switches Base <-> Target via sym_* in-place, and supports Refs/Impls switching.
+  const diffContainer = ch.makeEl("DIV");
+  diffContainer.className = "diff-container";
+  diffContainer.setAttribute("data-repo", "myrepo");
+  diffContainer.setAttribute("data-change", "chg1");
+  diffContainer.setAttribute("data-file-path", "hello.go");
+  diffContainer.setAttribute("data-left-rev", "11111111aaaa");
+  diffContainer.setAttribute("data-right-rev", "22222222bbbb");
+  diffContainer.setAttribute("data-base-desc", "Snapshot 1");
+  diffContainer.setAttribute("data-target-desc", "Live Snapshot");
+  const anchorEl = ch.makeEl("SPAN");
+  anchorEl.getBoundingClientRect = () => ({ left: 100, top: 100, right: 140, bottom: 120, width: 40, height: 20 });
+
+  const symPromise = ch.win.openSymbolPopupAt(diffContainer, "L", 3, 5, anchorEl, false);
+  const symPopupEl = ch.body.children[ch.body.children.length - 1];
+  if (!symPopupEl.contentEl.innerHTML.includes('class="sym-ver-chip"') || !symPopupEl.contentEl.innerHTML.includes(">Base<")) {
+    throw new Error("expected loading symbol popup to show uncolored Base chip, got: " + symPopupEl.contentEl.innerHTML);
+  }
+  await symPromise;
+  if (!symPopupEl.contentEl.innerHTML.includes('data-action="toggle-popup-side"') || !symPopupEl.contentEl.innerHTML.includes(">Base<")) {
+    throw new Error("expected resolved symbol popup to show toggleable Base chip, got: " + symPopupEl.contentEl.innerHTML);
+  }
+
+  // Switch Base -> Target via semantic lookup.
+  const symToggle = ch.makeEl("BUTTON");
+  symToggle.className = "sym-ver-chip sym-ver-toggle";
+  symToggle.setAttribute("data-action", "toggle-popup-side");
+  symPopupEl.dispatch("click", { target: symToggle, preventDefault() {}, stopPropagation() {} });
+  await new Promise(r => setTimeout(r, 20));
+  if (!symPopupEl.contentEl.innerHTML.includes(">Target<") || !symPopupEl.contentEl.innerHTML.includes("hello.go:8")) {
+    throw new Error("expected symbol popup to switch to Target at line 8, got: " + symPopupEl.contentEl.innerHTML);
+  }
+  if (!ch.fetchedURLs.some(u => u.includes("/api/symbol?") && u.includes("sym_name=Server") && u.includes("side=R"))) {
+    throw new Error("expected semantic /api/symbol fetch on side=R, got: " + JSON.stringify(ch.fetchedURLs));
+  }
+
+  // Open Refs from switched Target def, then switch Refs Target -> Base.
+  const refsBtn = ch.makeEl("BUTTON");
+  refsBtn.className = "sym-btn-action sym-btn-refs";
+  refsBtn.setAttribute("data-action", "refs");
+  symPopupEl.dispatch("click", { target: refsBtn, preventDefault() {}, stopPropagation() {} });
+  await new Promise(r => setTimeout(r, 20));
+  if (!symPopupEl.contentEl.innerHTML.includes("References to") || !symPopupEl.contentEl.innerHTML.includes(">Target<")) {
+    throw new Error("expected Refs view on Target, got: " + symPopupEl.contentEl.innerHTML);
+  }
+  symPopupEl.dispatch("click", { target: symToggle, preventDefault() {}, stopPropagation() {} });
+  await new Promise(r => setTimeout(r, 20));
+  if (!symPopupEl.contentEl.innerHTML.includes("References to") || !symPopupEl.contentEl.innerHTML.includes(">Base<")) {
+    throw new Error("expected Refs view to switch to Base, got: " + symPopupEl.contentEl.innerHTML);
+  }
+  if (!ch.fetchedURLs.some(u => u.includes("/api/symbol/refs?") && u.includes("sym_name=Server") && u.includes("side=L"))) {
+    throw new Error("expected /api/symbol/refs fetch with sym_name=Server&side=L, got: " + JSON.stringify(ch.fetchedURLs));
+  }
+
+  // 3d. Symbol missing in Base stays on Target and shows notice textbox.
+  await ch.win.openSymbolPopupAt(diffContainer, "R", 50, 5, anchorEl, false);
+  const onlyTargetEl = ch.body.children[ch.body.children.length - 1];
+  onlyTargetEl.dispatch("click", { target: symToggle, preventDefault() {}, stopPropagation() {} });
+  await new Promise(r => setTimeout(r, 20));
+  const missingNotice = onlyTargetEl.children.find(c => c.className && c.className.includes("sym-ver-notice"));
+  if (!missingNotice || !missingNotice.innerHTML.includes("OnlyInTarget does not exist in Base")) {
+    throw new Error("expected missing symbol notice textbox, got: " + (missingNotice && missingNotice.innerHTML));
+  }
+
+  // 3e. Local symbol shows clear notice without switching.
+  await ch.win.openSymbolPopupAt(diffContainer, "R", 99, 1, anchorEl, false);
+  const localEl = ch.body.children[ch.body.children.length - 1];
+  localEl.dispatch("click", { target: symToggle, preventDefault() {}, stopPropagation() {} });
+  await new Promise(r => setTimeout(r, 20));
+  const localNotice = localEl.children.find(c => c.className && c.className.includes("sym-ver-notice"));
+  if (!localNotice || !localNotice.innerHTML.includes("localVar cannot be switched to Base")) {
+    throw new Error("expected local symbol notice textbox, got: " + (localNotice && localNotice.innerHTML));
+  }
+  // Clicking the notice dismisses it cleanly (and clears its timer).
+  localNotice.dispatch("click", { stopPropagation() {} });
+  if (localEl.children.some(c => c.className && c.className.includes("sym-ver-notice"))) {
+    throw new Error("expected clicking notice to dismiss it");
+  }
+  // Closing remaining popups clears any pending notice timers so Node exits promptly.
+  ch.win.closeSpecificSymbolPopup(inst);
+  if (onlyTargetEl.children.some(c => c.className && c.className.includes("sym-ver-notice"))) {
+    onlyTargetEl.children.find(c => c.className && c.className.includes("sym-ver-notice")).dispatch("click", { stopPropagation() {} });
+  }
+
+  // 3f. Same base & target rev (and raw commit hash desc): non-toggleable chip, no duplicated SHA in title.
+  const sameRev = runScenario({
+    isChangePage: true,
+    leftRev: "abcdef1234567890",
+    rightRev: "abcdef1234567890",
+    baseDesc: "abcdef123456",
+    targetDesc: "abcdef123456",
+  });
+  const sameInst = sameRev.win.openCodeSearchPopup("");
+  if (sameInst.contentEl.innerHTML.includes("toggle-popup-side")) {
+    throw new Error("expected identical base/target rev chip NOT to be toggleable");
+  }
+  if (!sameInst.contentEl.innerHTML.includes('title="Target (abcdef123456)"') || sameInst.contentEl.innerHTML.includes("abcdef123456 · abcdef12")) {
+    throw new Error("expected raw SHA title without duplicated short hash, got: " + sameInst.contentEl.innerHTML);
+  }
+
+  // 3g. Repo page: Code Search shows static HEAD chip (not toggleable).
+  const rp = runScenario({ isChangePage: false });
+  const repoInst = rp.win.openCodeSearchPopup("");
+  if (!repoInst.contentEl.innerHTML.includes('class="sym-ver-chip"') || !repoInst.contentEl.innerHTML.includes(">HEAD<")) {
+    throw new Error("expected static HEAD version chip on repo-level Code Search, got: " + repoInst.contentEl.innerHTML);
+  }
+  if (repoInst.contentEl.innerHTML.includes("toggle-popup-side")) {
+    throw new Error("expected repo-level HEAD chip NOT to be toggleable");
+  }
+})().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+`
+	cmd := exec.Command(nodeBin, "-e", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("TestUI_PopupVersionChip failed: %v\n%s", err, string(out))
+	}
+}

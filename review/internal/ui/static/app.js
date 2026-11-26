@@ -1346,11 +1346,13 @@
     if (!popup) return MIN_WIDTH;
     const actionsEl = popup.querySelector ? popup.querySelector('.sym-popup-actions') : null;
     const backEl = popup.querySelector ? popup.querySelector('.sym-btn-back') : null;
+    const verEl = popup.querySelector ? popup.querySelector('.sym-ver-chip') : null;
     const actionsW = actionsEl ? (actionsEl.offsetWidth || 0) : 0;
     const backW = backEl ? (backEl.offsetWidth || 0) : 0;
-    const gapsAndPad = 22 + (actionsW > 0 ? 8 : 0) + (backW > 0 ? 8 : 0);
+    const verW = verEl ? (verEl.offsetWidth || 0) : 0;
+    const gapsAndPad = 22 + (actionsW > 0 ? 8 : 0) + (backW > 0 ? 8 : 0) + (verW > 0 ? 8 : 0);
     const clientW = (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1000;
-    return Math.min(Math.max(180, clientW - 24), Math.max(MIN_WIDTH, LOC_MIN_WIDTH + actionsW + backW + gapsAndPad));
+    return Math.min(Math.max(180, clientW - 24), Math.max(MIN_WIDTH, LOC_MIN_WIDTH + actionsW + backW + verW + gapsAndPad));
   }
   window.getPopupMinWidth = getPopupMinWidth;
 
@@ -4670,6 +4672,7 @@
       clearTimeout(inst._searchTimer);
       inst._searchTimer = null;
     }
+    clearPopupNotice(inst);
 
     const idx = openSymbolPopups.indexOf(inst);
     if (idx !== -1) {
@@ -4713,6 +4716,361 @@
     const inst = resolvePopupInst(popupOrInst);
     if (inst) return !!inst.shaded;
     return !!(popupOrInst && popupOrInst.classList && popupOrInst.classList.contains('sym-shaded'));
+  }
+
+  function getPageVersionDescs(container) {
+    const overview = document.querySelector ? document.querySelector('.change-overview') : null;
+    const diffContainer = container || (document.querySelector ? document.querySelector('.diff-container') : null);
+    const baseDesc = (diffContainer && diffContainer.getAttribute && diffContainer.getAttribute('data-base-desc')) ||
+      (overview && overview.getAttribute && overview.getAttribute('data-base-desc')) || '';
+    const targetDesc = (diffContainer && diffContainer.getAttribute && diffContainer.getAttribute('data-target-desc')) ||
+      (overview && overview.getAttribute && overview.getAttribute('data-target-desc')) || '';
+    return { baseDesc, targetDesc };
+  }
+
+  function formatVersionDesc(desc, param, side) {
+    const raw = (desc || '').trim();
+    if (raw) return raw;
+    const p = (param || '').trim();
+    const paramSnap = p.match(/^snap:(\d+)$/i);
+    if (paramSnap) return 'Snapshot ' + paramSnap[1];
+    if (side === 'L') {
+      if (!p || p === 'parent') return 'Parent';
+      return p;
+    }
+    if (!p || p === 'live') return 'Live Snapshot';
+    return p;
+  }
+
+  function renderPopupVersionChipHtml(stateCtx, interactive) {
+    if (!stateCtx) return '';
+    if (!stateCtx.change) {
+      return `<span class="sym-ver-chip" title="Repository HEAD">HEAD</span>`;
+    }
+    const isLeft = (stateCtx.side === 'L');
+    const sideLabel = isLeft ? 'Base' : 'Target';
+    const otherSideLabel = isLeft ? 'Target' : 'Base';
+    let baseDesc = stateCtx.baseDesc || '';
+    let targetDesc = stateCtx.targetDesc || '';
+    if (!baseDesc || !targetDesc) {
+      const pageDescs = getPageVersionDescs(null);
+      if (!baseDesc) baseDesc = pageDescs.baseDesc;
+      if (!targetDesc) targetDesc = pageDescs.targetDesc;
+    }
+    const curDesc = isLeft
+      ? formatVersionDesc(baseDesc, stateCtx.base, 'L')
+      : formatVersionDesc(targetDesc, stateCtx.target, 'R');
+    const curRev = isLeft ? (stateCtx.leftRev || '') : (stateCtx.rightRev || '');
+    const shortRev = (curRev && curRev !== 'working') ? curRev.slice(0, 8) : '';
+    const revDetail = (shortRev && !curDesc.startsWith(shortRev) && !shortRev.startsWith(curDesc))
+      ? `${curDesc} · ${shortRev}`
+      : curDesc;
+    const baseTitle = revDetail ? `${sideLabel} (${revDetail})` : sideLabel;
+
+    const hasDistinctBase = !!((stateCtx.leftRev && stateCtx.rightRev && stateCtx.leftRev !== stateCtx.rightRev) || (!stateCtx.leftRev && !stateCtx.rightRev));
+    if (interactive && hasDistinctBase) {
+      const otherDesc = isLeft
+        ? formatVersionDesc(targetDesc, stateCtx.target, 'R')
+        : formatVersionDesc(baseDesc, stateCtx.base, 'L');
+      const otherFull = otherDesc ? `${otherSideLabel} (${otherDesc})` : otherSideLabel;
+      const toggleTitle = `${baseTitle} — click to switch to ${otherFull}`;
+      return `<button type="button" class="sym-ver-chip sym-ver-toggle" data-action="toggle-popup-side" title="${escapeHtml(toggleTitle)}" aria-label="${escapeHtml(toggleTitle)}">${sideLabel}<span class="sym-ver-swap" aria-hidden="true">⇄</span></button>`;
+    }
+    return `<span class="sym-ver-chip" title="${escapeHtml(baseTitle)}">${sideLabel}</span>`;
+  }
+
+  function clearPopupNotice(inst) {
+    if (!inst) return;
+    if (inst._noticeTimer) {
+      clearTimeout(inst._noticeTimer);
+      inst._noticeTimer = null;
+    }
+    if (inst._noticeRemoveTimer) {
+      clearTimeout(inst._noticeRemoveTimer);
+      inst._noticeRemoveTimer = null;
+    }
+    if (inst._noticeEl) {
+      if (inst._noticeEl.remove) inst._noticeEl.remove();
+      inst._noticeEl = null;
+    }
+  }
+
+  function showPopupNotice(inst, message) {
+    if (!inst || !inst.el || !message) return;
+    clearPopupNotice(inst);
+    const notice = document.createElement('div');
+    notice.className = 'sym-ver-notice';
+    if (notice.setAttribute) {
+      notice.setAttribute('role', 'status');
+      notice.setAttribute('title', 'Click to dismiss');
+    }
+    notice.innerHTML = escapeHtml(message);
+    const contentEl = getPopupContentEl(inst);
+    const headerEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.sym-popup-header') : null;
+    if (notice.style) {
+      const topPx = (headerEl && headerEl.offsetHeight) ? (headerEl.offsetHeight + 6) : 38;
+      notice.style.top = topPx + 'px';
+    }
+    if (notice.addEventListener) {
+      notice.addEventListener('click', (e) => {
+        if (e && e.stopPropagation) e.stopPropagation();
+        clearPopupNotice(inst);
+      });
+    }
+    if (inst.el.appendChild) {
+      inst.el.appendChild(notice);
+    }
+    inst._noticeEl = notice;
+    inst._noticeTimer = setTimeout(() => {
+      inst._noticeTimer = null;
+      if (inst._noticeEl && inst._noticeEl.classList && inst._noticeEl.classList.add) {
+        inst._noticeEl.classList.add('sym-ver-notice-fade');
+      }
+      inst._noticeRemoveTimer = setTimeout(() => {
+        clearPopupNotice(inst);
+      }, 260);
+    }, 3200);
+  }
+
+  function buildSymbolTargetParams(stateCtx, symTarget, side) {
+    const params = new URLSearchParams({
+      repo: (stateCtx && stateCtx.repo) || '',
+      change: (stateCtx && stateCtx.change) || '',
+      side: side || 'R',
+      left_rev: (stateCtx && stateCtx.leftRev) || '',
+      right_rev: (stateCtx && stateCtx.rightRev) || '',
+      base: (stateCtx && stateCtx.base) || '',
+      target: (stateCtx && stateCtx.target) || '',
+      sym_kind: (symTarget && symTarget.kind) || '',
+      sym_name: (symTarget && symTarget.name) || '',
+    });
+    if (symTarget && symTarget.in_repo) params.set('sym_in_repo', '1');
+    if (symTarget && symTarget.dir) params.set('sym_dir', symTarget.dir);
+    if (symTarget && symTarget.pkg) params.set('sym_pkg', symTarget.pkg);
+    if (symTarget && symTarget.pkg_name) params.set('sym_pkg_name', symTarget.pkg_name);
+    if (symTarget && symTarget.owner) params.set('sym_owner', symTarget.owner);
+    if (symTarget && symTarget.is_test) params.set('sym_is_test', '1');
+    if (symTarget && symTarget.origin) params.set('sym_origin', symTarget.origin);
+    return params;
+  }
+
+  async function togglePopupSide(inst) {
+    if (!inst || !inst.currentState) return;
+    if (inst.shaded) {
+      setPopupShaded(inst, false, false);
+    }
+    clearPopupNotice(inst);
+
+    const state = inst.currentState;
+    const curCtx = state.ctx || getCodeSearchContext(inst);
+    if (!curCtx || !curCtx.change) return;
+
+    const nextSide = (curCtx.side === 'L') ? 'R' : 'L';
+    const nextSideLabel = nextSide === 'L' ? 'Base' : 'Target';
+    const nextCtx = Object.assign({}, curCtx, { side: nextSide });
+    const contentEl = getPopupContentEl(inst);
+
+    if (state.kind === 'search') {
+      state.ctx = nextCtx;
+      const headerEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.sym-popup-header') : null;
+      if (headerEl) {
+        const newHeaderHtml = renderSearchHeaderHtml(inst, nextCtx);
+        headerEl.innerHTML = newHeaderHtml;
+        state.headerHtml = newHeaderHtml;
+        syncPopupShadeUI(inst);
+        ensurePopupMinWidth(inst);
+      }
+      const inputEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.cs-search-input') : null;
+      if (inputEl && inputEl.focus) {
+        inputEl.focus({ preventScroll: true });
+      }
+      const curQuery = inputEl ? inputEl.value : (state.query || '');
+      if (curQuery.trim()) {
+        state.data = null;
+        runCodeSearchQuery(inst, curQuery, true);
+      }
+      return;
+    }
+
+    if (inst._abortPendingNav) {
+      inst._abortPendingNav();
+      inst._abortPendingNav = null;
+    } else if (inst.listAbort) {
+      inst.listAbort.abort();
+      inst.listAbort = null;
+    }
+
+    let endpoint = '';
+    let params = null;
+    let isFilePreview = false;
+    let requestedLine = 0;
+    let notFoundMsg = '';
+
+    if (state.kind === 'refs' || state.kind === 'impls') {
+      const symTarget = state.data && state.data.sym_target;
+      const symLabel = (state.data && state.data.symbol_name) || 'Symbol';
+      if (!symTarget) {
+        showPopupNotice(inst, `${symLabel} cannot be switched to ${nextSideLabel}`);
+        return;
+      }
+      endpoint = state.kind === 'refs' ? '/api/symbol/refs' : '/api/symbol/impls';
+      params = buildSymbolTargetParams(nextCtx, symTarget, nextSide);
+      notFoundMsg = `${symLabel} does not exist in ${nextSideLabel}`;
+    } else if (state.kind === 'move') {
+      const filePath = (state.data && (state.data.path || state.data.def_path)) || '';
+      const lineNum = (state.data && state.data.start_line) || 1;
+      if (!filePath) {
+        showPopupNotice(inst, `Cannot switch to ${nextSideLabel}`);
+        return;
+      }
+      isFilePreview = true;
+      requestedLine = lineNum;
+      endpoint = '/api/file/preview';
+      params = new URLSearchParams({
+        repo: nextCtx.repo || '',
+        change: nextCtx.change || '',
+        path: filePath,
+        line: lineNum,
+        side: nextSide,
+      });
+      if (nextCtx.base) params.set('base', nextCtx.base);
+      if (nextCtx.target) params.set('target', nextCtx.target);
+      notFoundMsg = `${filePath} does not exist in ${nextSideLabel}`;
+    } else if (state.kind === 'def') {
+      const symTarget = state.data && state.data.sym_target;
+      if (symTarget) {
+        endpoint = '/api/symbol';
+        params = buildSymbolTargetParams(nextCtx, symTarget, nextSide);
+        const symLabel = (state.data && state.data.symbol_name) || symTarget.name || 'Symbol';
+        notFoundMsg = `${symLabel} does not exist in ${nextSideLabel}`;
+      } else if (!state.lookupParams && state.data && state.data.def_path) {
+        isFilePreview = true;
+        requestedLine = (state.data && state.data.def_line) || 1;
+        const filePath = state.data.def_path;
+        endpoint = '/api/file/preview';
+        params = new URLSearchParams({
+          repo: nextCtx.repo || '',
+          change: nextCtx.change || '',
+          path: filePath,
+          line: requestedLine,
+          side: nextSide,
+        });
+        if (nextCtx.base) params.set('base', nextCtx.base);
+        if (nextCtx.target) params.set('target', nextCtx.target);
+        notFoundMsg = `${filePath} does not exist in ${nextSideLabel}`;
+      } else {
+        const symLabel = (state.data && state.data.symbol_name) || 'This symbol';
+        showPopupNotice(inst, `${symLabel} cannot be switched to ${nextSideLabel}`);
+        return;
+      }
+    } else {
+      return;
+    }
+
+    const headerEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.sym-popup-header') : null;
+    const prevHeaderHtml = (state && state.headerHtml) || (headerEl ? headerEl.innerHTML : null);
+    const loadingHeaderHtml = `
+      <button type="button" class="sym-btn-back" title="Cancel" aria-label="Cancel">←</button>
+      ${renderPopupVersionChipHtml(nextCtx, false)}
+      <div class="sym-popup-loc" style="color: var(--muted); font-size: 11px;">Switching to ${nextSideLabel}…</div>
+      <div class="sym-popup-actions">
+        ${renderPopupWindowControlsHtml(inst)}
+      </div>
+    `;
+    if (headerEl) {
+      headerEl.innerHTML = loadingHeaderHtml;
+      syncPopupShadeUI(inst);
+    }
+
+    function restoreHeader() {
+      if (headerEl && prevHeaderHtml !== null) {
+        headerEl.innerHTML = prevHeaderHtml;
+        syncPopupShadeUI(inst);
+      }
+    }
+
+    const abort = new AbortController();
+    inst.listAbort = abort;
+    inst._abortPendingNav = () => {
+      if (inst.listAbort === abort) {
+        abort.abort();
+        inst.listAbort = null;
+      }
+      restoreHeader();
+    };
+
+    try {
+      const resp = await fetch(endpoint + '?' + params.toString(), {
+        cache: 'no-store',
+        signal: abort.signal,
+      });
+      if (inst.listAbort === abort) inst.listAbort = null;
+      inst._abortPendingNav = null;
+      if (!openSymbolPopups.includes(inst) || inst.currentState !== state) return;
+      if (!resp.ok) {
+        restoreHeader();
+        showPopupNotice(inst, notFoundMsg);
+        return;
+      }
+      const newData = await resp.json();
+      if (!openSymbolPopups.includes(inst) || inst.currentState !== state) return;
+      if (!newData || !newData.found) {
+        restoreHeader();
+        showPopupNotice(inst, notFoundMsg);
+        return;
+      }
+
+      if (state.kind === 'refs') {
+        inst.currentState = {
+          kind: 'refs',
+          data: newData,
+          ctx: nextCtx,
+          lookupParams: params,
+          scrollTop: 0,
+        };
+        renderRefsView(inst, newData, nextCtx);
+      } else if (state.kind === 'impls') {
+        inst.currentState = {
+          kind: 'impls',
+          data: newData,
+          ctx: nextCtx,
+          lookupParams: params,
+          scrollTop: 0,
+        };
+        renderImplsView(inst, newData, nextCtx);
+      } else {
+        inst.currentState = {
+          kind: 'def',
+          data: newData,
+          ctx: nextCtx,
+          lookupParams: isFilePreview ? null : params,
+          scrollTop: 0,
+        };
+        renderSymbolPopup(inst, newData, nextCtx, undefined, inst.history && inst.history.length > 0);
+        if (isFilePreview && newData.def_line && requestedLine && newData.def_line !== requestedLine) {
+          showPopupNotice(inst, `Line ${requestedLine} does not exist in ${nextSideLabel} — showing line ${newData.def_line}`);
+        }
+      }
+    } catch (err) {
+      if (inst.listAbort === abort) inst.listAbort = null;
+      inst._abortPendingNav = null;
+      if (err && err.name === 'AbortError') return;
+      if (openSymbolPopups.includes(inst) && inst.currentState === state) {
+        restoreHeader();
+        showPopupNotice(inst, notFoundMsg);
+      }
+    }
+  }
+
+  function renderSearchHeaderHtml(inst, ctx) {
+    const canBack = !!(inst && inst.history && inst.history.length > 0);
+    const backBtnHtml = canBack ? `<button type="button" class="sym-btn-back" title="Back" aria-label="Back">←</button>` : '';
+    return `
+      ${backBtnHtml}
+      ${renderPopupVersionChipHtml(ctx, true)}
+      <div class="sym-popup-loc">Code Search in <code>${escapeHtml((ctx && ctx.repo) || 'repo')}</code></div>
+      <div class="sym-popup-actions">${renderPopupWindowControlsHtml(inst, { hideSearch: true })}</div>
+    `;
   }
 
   function renderPopupWindowControlsHtml(popupOrInst, opts) {
@@ -4797,6 +5155,7 @@
       clearTimeout(inst._searchTimer);
       inst._searchTimer = null;
     }
+    clearPopupNotice(inst);
     if (inst.lookupAbort) {
       inst.lookupAbort.abort();
       inst.lookupAbort = null;
@@ -5293,7 +5652,7 @@
         return;
       }
 
-      if (e.target.closest && e.target.closest('button, .sym-popup-actions a')) {
+      if (e.target.closest && e.target.closest('button, .sym-popup-actions a, .sym-ver-notice')) {
         return;
       }
 
@@ -6012,9 +6371,9 @@
       : `<code>${escapeHtml(implsData.symbol_name || '')}</code> Implementations`;
     const emptyText = isInterfaces ? 'No interfaces found' : 'No implementations found';
 
-    let bodyHtml = `
-      <div class="sym-popup-header">
+    const headerInnerHtml = `
         ${backBtnHtml}
+        ${renderPopupVersionChipHtml(stateCtx, true)}
         <div class="sym-popup-loc">
           ${headerTitle}
           <span class="sym-count-badge">${badgeText}</span>
@@ -6022,6 +6381,10 @@
         <div class="sym-popup-actions">
           ${renderPopupWindowControlsHtml(popupOrInst)}
         </div>
+    `;
+    let bodyHtml = `
+      <div class="sym-popup-header">
+        ${headerInnerHtml}
       </div>
     `;
 
@@ -6029,6 +6392,14 @@
       bodyHtml += `<div class="sym-popup-sig">${implsData.signature_html}</div>`;
     } else if (implsData.signature) {
       bodyHtml += `<div class="sym-popup-sig">${escapeHtml(implsData.signature)}</div>`;
+    }
+
+    const targetInst = popupOrInst && popupOrInst.el ? popupOrInst : (openSymbolPopups.find(p => p && p.el === popupOrInst) || null);
+    if (targetInst) {
+      clearPopupNotice(targetInst);
+      if (targetInst.currentState) {
+        targetInst.currentState.headerHtml = headerInnerHtml;
+      }
     }
 
     if (implList.length === 0) {
@@ -6118,7 +6489,6 @@
         listBody.scrollLeft = restoredScrollLeft;
       }
     }
-    const targetInst = popupOrInst && popupOrInst.el ? popupOrInst : (openSymbolPopups.find(p => p && p.el === popupOrInst) || null);
     if (targetInst && activePopupInst === targetInst && targetInst.el && targetInst.el.focus) {
       targetInst.el.focus({ preventScroll: true });
     }
@@ -6827,9 +7197,9 @@
     const totalCount = refsData.refs ? refsData.refs.length : 0;
     const badgeText = `${totalCount}${refsData.truncated ? '+' : ''}`;
 
-    let bodyHtml = `
-      <div class="sym-popup-header">
+    const headerInnerHtml = `
         ${backBtnHtml}
+        ${renderPopupVersionChipHtml(stateCtx, true)}
         <div class="sym-popup-loc">
           References to <code>${escapeHtml(refsData.symbol_name || '')}</code>
           <span class="sym-count-badge">${badgeText}</span>
@@ -6837,8 +7207,19 @@
         <div class="sym-popup-actions">
           ${renderPopupWindowControlsHtml(popupOrInst)}
         </div>
+    `;
+    let bodyHtml = `
+      <div class="sym-popup-header">
+        ${headerInnerHtml}
       </div>
     `;
+
+    if (targetInst) {
+      clearPopupNotice(targetInst);
+      if (targetInst.currentState) {
+        targetInst.currentState.headerHtml = headerInnerHtml;
+      }
+    }
 
     if (refsData.signature_html) {
       bodyHtml += `<div class="sym-popup-sig">${refsData.signature_html}</div>`;
@@ -6984,6 +7365,7 @@
 
     let headerInnerHtml = `
       ${backBtnHtml}
+      ${renderPopupVersionChipHtml(stateCtx, true)}
       <div class="sym-popup-loc">${headerLocHtml}</div>
       <div class="sym-popup-actions">${actionsHtml}</div>
     `;
@@ -6992,6 +7374,8 @@
         ${headerInnerHtml}
       </div>
     `;
+    const symTargetInst = resolvePopupInst(popupOrInst);
+    if (symTargetInst) clearPopupNotice(symTargetInst);
 
     if (data.signature_html) {
       bodyHtml += `<div class="sym-popup-sig">${data.signature_html}</div>`;
@@ -7106,6 +7490,7 @@
 
     let headerInnerHtml = `
       ${backBtnHtml}
+      ${renderPopupVersionChipHtml(stateCtx, true)}
       <div class="sym-popup-loc">${headerLocHtml}</div>
       <div class="sym-popup-actions">${actionsHtml}</div>
     `;
@@ -7115,6 +7500,7 @@
         ${headerInnerHtml}
       </div>
     `;
+    clearPopupNotice(inst);
 
     if (data.rows && data.rows.length > 0) {
       let snippetRows = '';
@@ -7197,9 +7583,12 @@
     const rightRev = (existing && existing.rightRev) ||
       (diffContainer && diffContainer.getAttribute('data-right-rev')) ||
       (overview && overview.getAttribute('data-right-rev')) || '';
+    const pageDescs = getPageVersionDescs(diffContainer);
+    const baseDesc = (existing && existing.baseDesc) || pageDescs.baseDesc || '';
+    const targetDesc = (existing && existing.targetDesc) || pageDescs.targetDesc || '';
     const mode = (existing && existing.mode) || (typeof getCurrentPageDiffMode === 'function' ? getCurrentPageDiffMode() : '') || (sp && sp.get('mode')) || '';
 
-    return { repo, change, base, target, side, leftRev, rightRev, mode };
+    return { repo, change, base, target, baseDesc, targetDesc, side, leftRev, rightRev, mode };
   }
 
   function renderSearchGuideHtml() {
@@ -7350,6 +7739,7 @@
       clearTimeout(inst._searchTimer);
       inst._searchTimer = null;
     }
+    clearPopupNotice(inst);
     if (inst.listAbort) {
       inst.listAbort.abort();
       inst.listAbort = null;
@@ -7433,11 +7823,6 @@
 
     const ctx = state.ctx || getCodeSearchContext(inst);
     state.ctx = ctx;
-    const canBack = !!(inst.history && inst.history.length > 0);
-    const backBtnHtml = canBack ? `<button type="button" class="sym-btn-back" title="Back" aria-label="Back">←</button>` : '';
-    const scopeLabel = ctx.change
-      ? (ctx.side === 'L' ? `${ctx.repo} (base)` : ctx.repo)
-      : (ctx.repo || 'repo');
     const queryVal = state.query || '';
 
     const hints = ['f:', 's:', 'func:', 'type:', 'p:', 'in:comments', 'is:unresolved', 'in:change', 'case:yes'];
@@ -7445,11 +7830,7 @@
       `<button type="button" class="cs-hint-chip" data-cs-hint="${escapeHtml(h)}">${escapeHtml(h)}</button>`
     ).join('');
 
-    const headerInnerHtml = `
-      ${backBtnHtml}
-      <div class="sym-popup-loc">Code Search in <code>${escapeHtml(scopeLabel)}</code></div>
-      <div class="sym-popup-actions">${renderPopupWindowControlsHtml(inst, { hideSearch: true })}</div>
-    `;
+    const headerInnerHtml = renderSearchHeaderHtml(inst, ctx);
 
     contentEl.innerHTML = `
       <div class="sym-popup-header">${headerInnerHtml}</div>
@@ -7568,6 +7949,7 @@
       clearTimeout(inst._searchTimer);
       inst._searchTimer = null;
     }
+    clearPopupNotice(inst);
     if (inst._abortPendingNav) {
       inst._abortPendingNav();
       inst._abortPendingNav = null;
@@ -7580,6 +7962,7 @@
     const prevHeaderHtml = (baseState && baseState.headerHtml) || (headerEl ? headerEl.innerHTML : null);
     const loadingHeaderHtml = `
       <button type="button" class="sym-btn-back" title="Back" aria-label="Back">←</button>
+      ${renderPopupVersionChipHtml(stateCtx, false)}
       <div class="sym-popup-loc" style="color: var(--muted); font-size: 11px;">Loading ${escapeHtml(filePath)}…</div>
       <div class="sym-popup-actions">
         ${renderPopupWindowControlsHtml(inst, { hideSearch: true })}
@@ -7693,6 +8076,7 @@
       clearTimeout(inst._searchTimer);
       inst._searchTimer = null;
     }
+    clearPopupNotice(inst);
     if (inst._abortPendingNav) {
       inst._abortPendingNav();
       inst._abortPendingNav = null;
@@ -7853,6 +8237,14 @@
         return;
       }
 
+      const verToggleBtn = evt.target.closest ? evt.target.closest('[data-action="toggle-popup-side"]') : null;
+      if (verToggleBtn && inst.currentState) {
+        if (evt.preventDefault) evt.preventDefault();
+        if (evt.stopPropagation) evt.stopPropagation();
+        togglePopupSide(inst);
+        return;
+      }
+
       const hintChip = evt.target.closest ? evt.target.closest('.cs-hint-chip') : null;
       if (hintChip) {
         if (evt.preventDefault) evt.preventDefault();
@@ -7939,6 +8331,7 @@
 
         const loadingHeaderHtml = `
           <button type="button" class="sym-btn-back" title="Back" aria-label="Back">←</button>
+          ${renderPopupVersionChipHtml(stateCtx, false)}
           <div class="sym-popup-loc" style="color: var(--muted); font-size: 11px;">Finding references…</div>
           <div class="sym-popup-actions">
             ${renderPopupWindowControlsHtml(inst)}
@@ -8036,6 +8429,7 @@
         const loadingText = curData && curData.impls_direction === 'interfaces' ? 'Finding interfaces…' : 'Finding implementations…';
         const loadingHeaderHtml = `
           <button type="button" class="sym-btn-back" title="Back" aria-label="Back">←</button>
+          ${renderPopupVersionChipHtml(stateCtx, false)}
           <div class="sym-popup-loc" style="color: var(--muted); font-size: 11px;">${loadingText}</div>
           <div class="sym-popup-actions">
             ${renderPopupWindowControlsHtml(inst)}
@@ -8424,7 +8818,7 @@
     });
   }
 
-  function createPopupInstance(anchorEl, highlightAnchor, initialLocText) {
+  function createPopupInstance(anchorEl, highlightAnchor, initialLocText, initialCtx) {
     dismissUnpinnedPopupsExcept(null);
     if (highlightAnchor && anchorEl && anchorEl.classList && anchorEl.classList.add) {
       anchorEl.classList.add('sym-active');
@@ -8454,6 +8848,7 @@
     contentEl.className = 'sym-popup-content';
     contentEl.innerHTML = `
       <div class="sym-popup-header">
+        ${initialCtx ? renderPopupVersionChipHtml(initialCtx, false) : ''}
         <div class="sym-popup-loc" style="color: var(--muted); font-size: 11px;">${escapeHtml(initialLocText || 'Loading…')}</div>
         <div class="sym-popup-actions">
           ${renderPopupWindowControlsHtml(null)}
@@ -8514,10 +8909,7 @@
     const isGo = (extPkg && extFile) ? extFile.endsWith('.go') : filePath.endsWith('.go');
     if (!isGo) return false;
 
-    const inst = createPopupInstance(anchorEl, highlightAnchor, 'Inspecting symbol…');
-    const signal = inst.lookupAbort.signal;
-
-    const allFilesEl = document.querySelector('.diff-all-files');
+    const allFilesEl = document.querySelector ? document.querySelector('.diff-all-files') : null;
     const repo = (container.getAttribute && container.getAttribute('data-repo')) || (allFilesEl && allFilesEl.getAttribute && allFilesEl.getAttribute('data-repo')) || '';
     const change = (container.getAttribute && container.getAttribute('data-change')) || (allFilesEl && allFilesEl.getAttribute && allFilesEl.getAttribute('data-change')) || '';
     const leftRev = (container.getAttribute && container.getAttribute('data-left-rev')) || '';
@@ -8525,6 +8917,23 @@
     const sp = new URLSearchParams(window.location.search);
     const base = sp.get('base') || '';
     const target = sp.get('target') || '';
+    const pageDescs = getPageVersionDescs(container);
+    const stateCtx = {
+      repo: repo,
+      change: change,
+      leftRev: leftRev,
+      rightRev: rightRev,
+      base: base,
+      target: target,
+      baseDesc: pageDescs.baseDesc,
+      targetDesc: pageDescs.targetDesc,
+      side: side,
+      mode: getCurrentPageDiffMode(),
+      originPath: originPath || (extPkg ? '' : filePath),
+    };
+
+    const inst = createPopupInstance(anchorEl, highlightAnchor, 'Inspecting symbol…', stateCtx);
+    const signal = inst.lookupAbort.signal;
 
     const params = new URLSearchParams({
       repo: repo,
@@ -8557,6 +8966,7 @@
         if (cEl) {
           cEl.innerHTML = `
             <div class="sym-popup-header">
+              ${renderPopupVersionChipHtml(stateCtx, false)}
               <div class="sym-popup-loc" style="color: var(--danger);">Error</div>
               <div class="sym-popup-actions">
                 ${renderPopupWindowControlsHtml(inst)}
@@ -8578,18 +8988,6 @@
         closeSpecificSymbolPopup(inst);
         return false;
       }
-
-      const stateCtx = {
-        repo: repo,
-        change: change,
-        leftRev: leftRev,
-        rightRev: rightRev,
-        base: base,
-        target: target,
-        side: side,
-        mode: getCurrentPageDiffMode(),
-        originPath: originPath || (extPkg ? '' : filePath),
-      };
 
       inst.currentState = {
         kind: 'def',
@@ -8646,8 +9044,22 @@
     const sp = new URLSearchParams(window.location.search);
     const base = sp.get('base') || '';
     const target = sp.get('target') || '';
+    const movePageDescs = getPageVersionDescs(container);
+    const stateCtx = {
+      repo: repo,
+      change: change,
+      leftRev: (container && container.getAttribute && container.getAttribute('data-left-rev')) || '',
+      rightRev: (container && container.getAttribute && container.getAttribute('data-right-rev')) || '',
+      base: base,
+      target: target,
+      baseDesc: movePageDescs.baseDesc,
+      targetDesc: movePageDescs.targetDesc,
+      side: peerSide,
+      mode: getCurrentPageDiffMode(),
+      originPath: peerPath,
+    };
 
-    const inst = createPopupInstance(btnEl, false, 'Loading moved block…');
+    const inst = createPopupInstance(btnEl, false, 'Loading moved block…', stateCtx);
     const signal = inst.lookupAbort.signal;
 
     const params = new URLSearchParams({
@@ -8669,6 +9081,7 @@
         if (cEl) {
           cEl.innerHTML = `
             <div class="sym-popup-header">
+              ${renderPopupVersionChipHtml(stateCtx, false)}
               <div class="sym-popup-loc" style="color: var(--danger);">Error</div>
               <div class="sym-popup-actions">
                 ${renderPopupWindowControlsHtml(inst)}
@@ -8694,17 +9107,8 @@
       data.in_repo = true;
       data.def_path = data.path || peerPath;
 
-      const stateCtx = {
-        repo: repo,
-        change: change,
-        leftRev: data.left_rev || '',
-        rightRev: data.right_rev || '',
-        base: base,
-        target: target,
-        side: peerSide,
-        mode: getCurrentPageDiffMode(),
-        originPath: peerPath,
-      };
+      if (data.left_rev) stateCtx.leftRev = data.left_rev;
+      if (data.right_rev) stateCtx.rightRev = data.right_rev;
 
       inst.currentState = {
         kind: 'move',

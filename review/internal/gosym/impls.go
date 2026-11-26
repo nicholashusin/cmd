@@ -60,6 +60,7 @@ type ImplsResult struct {
 	SymbolName      string           `json:"symbol_name,omitempty"`
 	Signature       string           `json:"signature,omitempty"`
 	SignatureHTML   string           `json:"signature_html,omitempty"`
+	SymTarget       *SymbolTarget    `json:"sym_target,omitempty"`
 	Implementations []Implementation `json:"implementations,omitempty"`
 	Truncated       bool             `json:"truncated,omitempty"`
 }
@@ -461,6 +462,7 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 		SymbolName:    obj.Name(),
 		Signature:     sig,
 		SignatureHTML: highlightSignature(sig),
+		SymTarget:     buildSymbolTarget(req, target),
 	}
 
 	// Identify changed files in the diff

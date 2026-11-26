@@ -9345,3 +9345,235 @@ func TestStripGoFuncBodiesScannerEdgesAndFallback(t *testing.T) {
 		}
 	})
 }
+
+func TestSymbolTargetCrossVersion(t *testing.T) {
+	dir := t.TempDir()
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester",
+			"GIT_AUTHOR_EMAIL=tester@example.com",
+			"GIT_COMMITTER_NAME=Tester",
+			"GIT_COMMITTER_EMAIL=tester@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init")
+	runGit("config", "user.name", "Tester")
+	runGit("config", "user.email", "tester@example.com")
+
+	writeFile := func(rel, content string) {
+		full := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	writeFile("go.mod", "module example.com/xver\n\ngo 1.22\n")
+	writeFile("calc/calc.go", `package calc
+
+import "fmt"
+
+type Runner interface {
+	Run() error
+}
+
+type Box struct {
+	Val int
+}
+
+func (b *Box) Run() error {
+	fmt.Println(b.Val)
+	return nil
+}
+
+func Add(a, b int) int {
+	return a + b
+}
+
+func UseBase() int {
+	return Add(1, 2)
+}
+`)
+	runGit("add", ".")
+	runGit("commit", "-m", "base")
+	baseRev := runGit("rev-parse", "HEAD")
+
+	// Target shifts all existing declarations down by inserting NewOnlyInTarget and an extra caller.
+	writeFile("calc/calc.go", `package calc
+
+import "fmt"
+
+// Extra lines to shift declarations in Target.
+func NewOnlyInTarget() int {
+	return Add(10, 20)
+}
+
+type Runner interface {
+	Run() error
+}
+
+type Box struct {
+	Val int
+}
+
+func (b *Box) Run() error {
+	fmt.Println(b.Val)
+	return nil
+}
+
+func Add(a, b int) int {
+	return a + b
+}
+
+func UseBase() int {
+	return Add(1, 2)
+}
+`)
+	runGit("add", ".")
+	runGit("commit", "-m", "target")
+	targetRev := runGit("rev-parse", "HEAD")
+
+	repo, err := vcs.Open(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewAnalyzer()
+	defer a.Close()
+	ctx := context.Background()
+
+	// 1. Lookup shifted func Add in Target -> switch to Base via SymTarget.
+	addTarget, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "R", FilePath: "calc/calc.go", Line: 23, UTF16Col: 6,
+	})
+	if err != nil || !addTarget.Found || addTarget.SymTarget == nil {
+		t.Fatalf("expected Add with SymTarget in Target, got %+v err=%v", addTarget, err)
+	}
+	if addTarget.DefLine != 23 {
+		t.Fatalf("expected Target Add at line 23, got %d", addTarget.DefLine)
+	}
+	addBase, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "L", Symbol: addTarget.SymTarget,
+	})
+	if err != nil || !addBase.Found {
+		t.Fatalf("expected Add to resolve in Base via SymTarget, got %+v err=%v", addBase, err)
+	}
+	if addBase.DefLine != 18 {
+		t.Fatalf("expected Base Add at line 18, got %d", addBase.DefLine)
+	}
+
+	// 2. Newly added func in Target returns Found=false in Base.
+	newRes, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "R", FilePath: "calc/calc.go", Line: 6, UTF16Col: 6,
+	})
+	if err != nil || !newRes.Found || newRes.SymTarget == nil {
+		t.Fatalf("expected NewOnlyInTarget with SymTarget in Target, got %+v err=%v", newRes, err)
+	}
+	newInBase, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "L", Symbol: newRes.SymTarget,
+	})
+	if err != nil || newInBase.Found {
+		t.Fatalf("expected NewOnlyInTarget NOT to exist in Base, got %+v err=%v", newInBase, err)
+	}
+
+	// 3. Struct field Box.Val and method (*Box).Run resolve across shifted lines.
+	fieldTarget, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "R", FilePath: "calc/calc.go", Line: 15, UTF16Col: 2,
+	})
+	if err != nil || !fieldTarget.Found || fieldTarget.SymTarget == nil || fieldTarget.SymTarget.Kind != "field" || fieldTarget.SymTarget.Owner != "Box" {
+		t.Fatalf("expected field SymTarget for Box.Val, got %+v err=%v", fieldTarget, err)
+	}
+	fieldBase, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "L", Symbol: fieldTarget.SymTarget,
+	})
+	if err != nil || !fieldBase.Found || fieldBase.DefLine != 10 {
+		t.Fatalf("expected Box.Val in Base at line 10, got %+v err=%v", fieldBase, err)
+	}
+
+	methTarget, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "R", FilePath: "calc/calc.go", Line: 18, UTF16Col: 15,
+	})
+	if err != nil || !methTarget.Found || methTarget.SymTarget == nil || methTarget.SymTarget.Kind != "method" || methTarget.SymTarget.Owner != "Box" {
+		t.Fatalf("expected method SymTarget for (*Box).Run, got %+v err=%v", methTarget, err)
+	}
+	methBase, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "L", Symbol: methTarget.SymTarget,
+	})
+	if err != nil || !methBase.Found || methBase.DefLine != 13 {
+		t.Fatalf("expected (*Box).Run in Base at line 13, got %+v err=%v", methBase, err)
+	}
+
+	// 4. References across versions reflect each version's callers (2 in Target vs 1 in Base).
+	refsTarget, err := a.References(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "R", Symbol: addTarget.SymTarget,
+	})
+	if err != nil || !refsTarget.Found || refsTarget.SymTarget == nil || len(refsTarget.Refs) != 2 {
+		t.Fatalf("expected 2 Target refs for Add, got %+v err=%v", refsTarget, err)
+	}
+	refsBase, err := a.References(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "L", Symbol: refsTarget.SymTarget,
+	})
+	if err != nil || !refsBase.Found || len(refsBase.Refs) != 1 {
+		t.Fatalf("expected 1 Base ref for Add, got %+v err=%v", refsBase, err)
+	}
+
+	// 5. Implementations across versions for Runner interface.
+	ifaceTarget, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "R", FilePath: "calc/calc.go", Line: 10, UTF16Col: 6,
+	})
+	if err != nil || !ifaceTarget.Found || ifaceTarget.SymTarget == nil {
+		t.Fatalf("expected Runner interface with SymTarget, got %+v err=%v", ifaceTarget, err)
+	}
+	implsBase, err := a.Implementations(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "L", Symbol: ifaceTarget.SymTarget,
+	})
+	if err != nil || !implsBase.Found || implsBase.SymTarget == nil || len(implsBase.Implementations) == 0 {
+		t.Fatalf("expected Base implementations for Runner, got %+v err=%v", implsBase, err)
+	}
+
+	// 6. Local parameter does not emit SymTarget.
+	localRes, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "R", FilePath: "calc/calc.go", Line: 24, UTF16Col: 9,
+	})
+	if err != nil || !localRes.Found || localRes.SymTarget != nil {
+		t.Fatalf("expected local param a to have Found=true and SymTarget=nil, got %+v err=%v", localRes, err)
+	}
+
+	// 7. Stdlib symbol fmt.Println resolves in Base via SymTarget.
+	fmtTarget, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "R", FilePath: "calc/calc.go", Line: 19, UTF16Col: 6,
+	})
+	if err != nil || !fmtTarget.Found || fmtTarget.SymTarget == nil || fmtTarget.SymTarget.InRepo {
+		t.Fatalf("expected external SymTarget for fmt.Println, got %+v err=%v", fmtTarget, err)
+	}
+	fmtBase, err := a.Lookup(ctx, LookupRequest{
+		Repo: repo, RepoRoot: dir, BaseRev: baseRev, TargetRev: targetRev,
+		Side: "L", Symbol: fmtTarget.SymTarget,
+	})
+	if err != nil || !fmtBase.Found || fmtBase.SymbolName != "Println" {
+		t.Fatalf("expected fmt.Println to resolve in Base via SymTarget, got %+v err=%v", fmtBase, err)
+	}
+}

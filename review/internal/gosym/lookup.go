@@ -28,13 +28,14 @@ type LookupRequest struct {
 	RepoRoot      string
 	BaseRev       string
 	TargetRev     string
-	Side          string // "L" or "R"
-	FilePath      string // slash path relative to RepoRoot
-	Line          int    // 1-based line number
-	UTF16Col      int    // 0-based UTF-16 code unit offset
-	PkgImportPath string // optional: for chained lookup of external/stdlib package
-	PkgFile       string // optional: filename e.g. "header.go"
-	Site          bool   // optional: resolve the enclosing symbol at reference site (Line)
+	Side          string        // "L" or "R"
+	FilePath      string        // slash path relative to RepoRoot
+	Line          int           // 1-based line number
+	UTF16Col      int           // 0-based UTF-16 code unit offset
+	PkgImportPath string        // optional: for chained lookup of external/stdlib package
+	PkgFile       string        // optional: filename e.g. "header.go"
+	Site          bool          // optional: resolve the enclosing symbol at reference site (Line)
+	Symbol        *SymbolTarget // optional: resolve by semantic symbol identity across revisions
 }
 
 // ExternalFileRequest specifies a request to read an external source file
@@ -74,6 +75,7 @@ type Result struct {
 	CanRefs          bool          `json:"can_refs,omitempty"`
 	CanImpls         bool          `json:"can_impls,omitempty"`
 	ImplsDirection   string        `json:"impls_direction,omitempty"`
+	SymTarget        *SymbolTarget `json:"sym_target,omitempty"`
 }
 
 type revCacheKey struct {
@@ -286,6 +288,7 @@ func (a *Analyzer) Lookup(ctx context.Context, req LookupRequest) (*Result, erro
 			res.CanRefs = true
 		}
 		res.CanImpls, res.ImplsDirection = canCheckImplementations(target.obj)
+		res.SymTarget = buildSymbolTarget(req, target)
 	}
 
 	if req.Site && res != nil && res.Found {
@@ -471,6 +474,11 @@ func (a *Analyzer) resolveTarget(ctx context.Context, req LookupRequest) (*resol
 	}
 	if rev == "" {
 		rev = "working"
+	}
+
+	// 0. Semantic symbol lookup (e.g. switching a popup between Base and Target)
+	if req.Symbol != nil && req.Symbol.Kind != "" {
+		return a.resolveTargetBySymbol(ctx, req, rev)
 	}
 
 	// 1. Chained lookup: looking up a symbol directly inside an imported package file
