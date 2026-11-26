@@ -68,6 +68,7 @@ type targetIdentity struct {
 	isMethod     bool
 	isLocal      bool
 	declDir      string
+	declInRepo   bool
 	isUnexported bool
 	fieldBase    string
 	fieldClean   string
@@ -159,13 +160,23 @@ func resolveTargetIdentity(obj types.Object, target *resolvedTarget, defCleanFil
 	}
 
 	declDir := ""
-	if target != nil {
-		declDir = target.dir
-	}
-	if defRel := cleanRepoRel(defCleanFile, repoRoot); defRel != "" {
+	declInRepo := false
+	if targetID.isPkgName && (target == nil || !target.isPkgClause) {
+		if target != nil && target.loader != nil && targetID.pkgPath != "" {
+			if pkgDir, isDisk, err := target.loader.resolvePackageDir(targetID.pkgPath); err == nil && !isDisk {
+				declDir = pkgDir
+				declInRepo = true
+			}
+		}
+	} else if defRel := cleanRepoRel(defCleanFile, repoRoot); defRel != "" {
 		declDir = repoDirOf(defRel)
+		declInRepo = true
+	} else if defCleanFile == "" && target != nil && !target.isDisk && (target.isPkgClause || (obj.Pkg() != nil && target.rootPkg != nil && obj.Pkg() == target.rootPkg)) {
+		declDir = target.dir
+		declInRepo = true
 	}
 	targetID.declDir = declDir
+	targetID.declInRepo = declInRepo
 	targetID.isUnexported = !targetID.isPkgName && !obj.Exported()
 	return targetID
 }
@@ -292,6 +303,9 @@ func matchesTarget(obj types.Object, target targetIdentity, matcher *methodMatch
 		pkgName, ok := obj.(*types.PkgName)
 		return ok && pkgName.Imported() != nil && pkgName.Imported().Path() == target.pkgPath
 	}
+	if _, isPkg := obj.(*types.PkgName); isPkg {
+		return false
+	}
 	if obj.Name() != target.name {
 		return false
 	}
@@ -320,7 +334,7 @@ func matchesTarget(obj types.Object, target targetIdentity, matcher *methodMatch
 	if target.isLocal {
 		return false
 	}
-	return true
+	return obj.Parent() != nil && obj.Parent() == obj.Pkg().Scope()
 }
 
 func matchMethod(obj types.Object, target targetIdentity, matcher *methodMatcher, curPkg *types.Package, localFset *token.FileSet, loader *lookupLoader, rootPkg *types.Package) bool {
@@ -572,14 +586,9 @@ func identicalTypeAcrossPackages(a, b types.Type, seen map[[2]types.Type]bool) b
 		seen[pair] = true
 		for i := 0; i < aT.NumMethods(); i++ {
 			am := aT.Method(i)
-			bm := findInterfaceMethod(bT, am.Name())
+			bm := findInterfaceMethod(bT, am)
 			if bm == nil {
 				return false
-			}
-			if !am.Exported() {
-				if am.Pkg() == nil || bm.Pkg() == nil || am.Pkg().Path() != bm.Pkg().Path() {
-					return false
-				}
 			}
 			aSig, ok1 := am.Type().(*types.Signature)
 			bSig, ok2 := bm.Type().(*types.Signature)
@@ -598,15 +607,30 @@ func identicalTypeAcrossPackages(a, b types.Type, seen map[[2]types.Type]bool) b
 	}
 }
 
-func findInterfaceMethod(iface *types.Interface, name string) *types.Func {
-	if iface == nil {
+func findInterfaceMethod(iface *types.Interface, target *types.Func) *types.Func {
+	if iface == nil || target == nil {
 		return nil
+	}
+	name := target.Name()
+	unexported := !target.Exported()
+	var targetPkgPath string
+	if unexported {
+		if target.Pkg() == nil {
+			return nil
+		}
+		targetPkgPath = target.Pkg().Path()
 	}
 	for i := 0; i < iface.NumMethods(); i++ {
 		m := iface.Method(i)
-		if m.Name() == name {
-			return m
+		if m.Name() != name {
+			continue
 		}
+		if unexported {
+			if m.Pkg() == nil || m.Pkg().Path() != targetPkgPath {
+				continue
+			}
+		}
+		return m
 	}
 	return nil
 }
@@ -777,13 +801,31 @@ func sortRefs(refs []Reference) {
 	})
 }
 
+func formatRefSignature(obj types.Object, rootPkg *types.Package, symName string) string {
+	if pkgName, ok := obj.(*types.PkgName); ok && pkgName.Imported() != nil {
+		pkgDisplayName := pkgName.Imported().Name()
+		if pkgDisplayName == "" {
+			pkgDisplayName = symName
+		}
+		isImportable := pkgName.Imported().Path() != "" && pkgName.Imported().Path() != "." && pkgDisplayName != "main" && !strings.HasSuffix(pkgDisplayName, "_test")
+		if isImportable {
+			return fmt.Sprintf("package %s (%q)", pkgDisplayName, pkgName.Imported().Path())
+		}
+		return fmt.Sprintf("package %s", pkgDisplayName)
+	}
+	return formatSignature(obj, rootPkg)
+}
+
 // References resolves all reference sites for the Go symbol under the cursor in req.
 func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	target, err := a.resolveTarget(ctx, req)
-	if err != nil || target == nil || target.obj == nil || target.obj.Pkg() == nil {
+	if err != nil || target == nil || target.obj == nil {
+		return &RefsResult{Found: false}, nil
+	}
+	if _, isPkg := target.obj.(*types.PkgName); !isPkg && target.obj.Pkg() == nil {
 		return &RefsResult{Found: false}, nil
 	}
 	target.obj = unwrapOrigin(target.obj)
@@ -797,19 +839,7 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 			}
 		}
 	}
-	sig := formatSignature(target.obj, target.rootPkg)
-	if pkgName, ok := target.obj.(*types.PkgName); ok {
-		pkgDisplayName := pkgName.Imported().Name()
-		if pkgDisplayName == "" {
-			pkgDisplayName = symName
-		}
-		isImportable := pkgName.Imported().Path() != "" && pkgName.Imported().Path() != "." && pkgDisplayName != "main" && !strings.HasSuffix(pkgDisplayName, "_test")
-		if isImportable {
-			sig = fmt.Sprintf("package %s (%q)", pkgDisplayName, pkgName.Imported().Path())
-		} else {
-			sig = fmt.Sprintf("package %s", pkgDisplayName)
-		}
-	}
+	sig := formatRefSignature(target.obj, target.rootPkg, symName)
 	sigHTML := highlightSignature(sig)
 
 	res := &RefsResult{
@@ -840,16 +870,25 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 
 	var refsCacheK refsCacheKey
 	var canCacheRefs bool
-	if target.loader.revCache != nil && !targetID.isLocal && isImmutableRev(req.BaseRev) && isImmutableRev(target.rev) {
+	if target.loader.revCache != nil && !targetID.isLocal && isImmutableRev(req.BaseRev) && isImmutableRev(req.TargetRev) && isImmutableRev(target.rev) {
 		canCacheRefs = true
+		diskDir := ""
+		if target.isChained && target.isDisk {
+			diskDir = target.dir
+		}
 		refsCacheK = refsCacheKey{
 			baseRev:      req.BaseRev,
+			reqTargetRev: req.TargetRev,
 			targetRev:    target.rev,
+			goos:         target.loader.goos,
+			goarch:       target.loader.goarch,
+			tagsSig:      target.loader.buildTagsSig(),
 			targetID:     targetID,
 			defCleanFile: defCleanFile,
 			defLine:      defLine,
 			defCol:       defCol,
 			isPkgClause:  target.isPkgClause,
+			diskDir:      diskDir,
 		}
 		if cached, ok := target.loader.revCache.refsCache.get(refsCacheK); ok {
 			return cached, nil
@@ -887,6 +926,11 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 			return false
 		}
 		return true
+	}
+
+	diskPkgPath := strings.TrimSuffix(target.rootImportPath, "_test")
+	if diskPkgPath == "" {
+		diskPkgPath = strings.TrimSuffix(req.PkgImportPath, "_test")
 	}
 
 	// 0. Sibling package declarations in the same directory (for package clause clicks)
@@ -964,7 +1008,7 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 				}
 			} else {
 				ref.InRepo = false
-				ref.Pkg = req.PkgImportPath
+				ref.Pkg = diskPkgPath
 				ref.PkgFile = name
 				ref.Display = name
 				ref.Group = RefGroupPackage
@@ -1060,7 +1104,7 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 					}
 				} else {
 					ref.InRepo = false
-					ref.Pkg = req.PkgImportPath
+					ref.Pkg = diskPkgPath
 					ref.PkgFile = req.PkgFile
 					ref.Display = req.PkgFile
 					ref.Group = RefGroupPackage
@@ -1071,9 +1115,6 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 		})
 
 		sortRefs(res.Refs)
-		if canCacheRefs && res != nil {
-			target.loader.revCache.refsCache.put(refsCacheK, res)
-		}
 		return cloneRefsResult(res), nil
 	}
 
@@ -1082,19 +1123,27 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 		if !target.isChained {
 			var preAST []*ast.File
 			var preInfo *types.Info
-			if declDir == target.dir {
+			if targetID.declInRepo && declDir == target.dir {
 				preAST = target.pkgASTFiles
 				preInfo = target.info
 			}
-			_ = a.searchRepoDir(ctx, target.loader, target.rootPkg, target.rev, declDir, targetID, matcher, defCleanFile, defLine, defCol, changedFiles, declDir, preAST, preInfo, addRef)
-			if target.dir != declDir {
-				_ = a.searchRepoDir(ctx, target.loader, target.rootPkg, target.rev, target.dir, targetID, matcher, defCleanFile, defLine, defCol, changedFiles, declDir, target.pkgASTFiles, target.info, addRef)
+			if targetID.declInRepo {
+				if err := a.searchRepoDir(ctx, target.loader, target.rootPkg, target.rev, declDir, targetID, matcher, defCleanFile, defLine, defCol, changedFiles, declDir, preAST, preInfo, addRef); err != nil && ctx.Err() != nil {
+					return nil, err
+				}
+			}
+			if !targetID.declInRepo || target.dir != declDir {
+				if err := a.searchRepoDir(ctx, target.loader, target.rootPkg, target.rev, target.dir, targetID, matcher, defCleanFile, defLine, defCol, changedFiles, declDir, target.pkgASTFiles, target.info, addRef); err != nil && ctx.Err() != nil {
+					return nil, err
+				}
 			}
 		} else if target.isDisk && target.dir != "" {
-			_ = a.searchDiskDir(ctx, target.loader, target.rootPkg, target.dir, req.PkgImportPath, targetID, matcher, defCleanFile, defLine, defCol, addRef)
+			if err := a.searchDiskDir(ctx, target.loader, target.rootPkg, target.dir, diskPkgPath, targetID, matcher, defCleanFile, defLine, defCol, addRef); err != nil && ctx.Err() != nil {
+				return nil, err
+			}
 		}
 		sortRefs(res.Refs)
-		if canCacheRefs && res != nil {
+		if canCacheRefs && res != nil && ctx.Err() == nil {
 			target.loader.revCache.refsCache.put(refsCacheK, res)
 		}
 		return cloneRefsResult(res), nil
@@ -1102,7 +1151,9 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 
 	// 3. Exported symbol or package name across repository
 	if target.isChained && target.isDisk && target.dir != "" {
-		_ = a.searchDiskDir(ctx, target.loader, target.rootPkg, target.dir, req.PkgImportPath, targetID, matcher, defCleanFile, defLine, defCol, addRef)
+		if err := a.searchDiskDir(ctx, target.loader, target.rootPkg, target.dir, diskPkgPath, targetID, matcher, defCleanFile, defLine, defCol, addRef); err != nil && ctx.Err() != nil {
+			return nil, err
+		}
 	}
 
 	if req.Repo == nil {
@@ -1138,13 +1189,18 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 		if fDir == "." {
 			fDir = ""
 		}
-		needImport := targetID.isPkgName || (fDir != declDir && requireImportOutsideDeclDir)
+		needImport := targetID.isPkgName || ((!targetID.declInRepo || fDir != declDir) && requireImportOutsideDeclDir)
 
 		if fileIdx != nil {
 			if needImport && !fileIdx.hasImport(fPath, targetID.pkgPath) {
 				continue
 			}
 			if !targetID.isPkgName && !fileIdx.mayContainIdent(fPath, target.obj.Name()) {
+				continue
+			}
+			// Exact import index already proves this file imports targetID.pkgPath; skip reading it here.
+			if targetID.isPkgName && fileIdx.isImportExact(fPath) {
+				candidateFiles = append(candidateFiles, fPath)
 				continue
 			}
 		}
@@ -1170,7 +1226,7 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 		if fDir == "." {
 			fDir = ""
 		}
-		needImport := targetID.isPkgName || (fDir != declDir && requireImportOutsideDeclDir)
+		needImport := targetID.isPkgName || ((!targetID.declInRepo || fDir != declDir) && requireImportOutsideDeclDir)
 		if needImport && (fileIdx == nil || !fileIdx.isImportExact(fPath)) && !containsImportLiteral(b, targetID.pkgPath) {
 			continue
 		}
@@ -1186,13 +1242,13 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 		pA := 2
 		if changedFiles[a] {
 			pA = 0
-		} else if path.Dir(a) == declDir || (declDir == "" && path.Dir(a) == ".") {
+		} else if targetID.declInRepo && repoDirOf(a) == declDir {
 			pA = 1
 		}
 		pB := 2
 		if changedFiles[b] {
 			pB = 0
-		} else if path.Dir(b) == declDir || (declDir == "" && path.Dir(b) == ".") {
+		} else if targetID.declInRepo && repoDirOf(b) == declDir {
 			pB = 1
 		}
 		return pA - pB
@@ -1287,7 +1343,7 @@ func (a *Analyzer) References(ctx context.Context, req LookupRequest) (*RefsResu
 	}
 
 	sortRefs(res.Refs)
-	if canCacheRefs && res != nil {
+	if canCacheRefs && res != nil && ctx.Err() == nil {
 		target.loader.revCache.refsCache.put(refsCacheK, res)
 	}
 	return cloneRefsResult(res), nil
@@ -1443,7 +1499,7 @@ func (a *Analyzer) searchRepoDirWithCandidates(
 				group := RefGroupRepo
 				if changedFiles[c] {
 					group = RefGroupChange
-				} else if dirInRepo == declDir {
+				} else if targetID.declInRepo && dirInRepo == declDir {
 					group = RefGroupPackage
 				}
 				inspectASTForRefs(astF, preParsedInfo, rootPkg, loader.fset, loader, rootPkg, targetID, matcher, defCleanFile, defLine, defCol, c, lines, group, addRef)
@@ -1487,7 +1543,7 @@ func (a *Analyzer) searchRepoDirWithCandidates(
 					group := RefGroupRepo
 					if changedFiles[f.path] {
 						group = RefGroupChange
-					} else if dirInRepo == declDir {
+					} else if targetID.declInRepo && dirInRepo == declDir {
 						group = RefGroupPackage
 					}
 					ref := Reference{
@@ -1534,7 +1590,7 @@ func (a *Analyzer) searchRepoDirWithCandidates(
 					group := RefGroupRepo
 					if changedFiles[f.path] {
 						group = RefGroupChange
-					} else if dirInRepo == declDir {
+					} else if targetID.declInRepo && dirInRepo == declDir {
 						group = RefGroupPackage
 					}
 					ref := Reference{
@@ -1726,13 +1782,17 @@ func (a *Analyzer) searchRepoDirWithCandidates(
 
 		isExtTest = strings.HasSuffix(pkgName, "_test")
 		impPath := rootImportPath
+		var restoreBase func()
 		if isExtTest {
 			impPath += "_test"
 			if basePkg, err := loader.loadInRepoTestBasePackage(rootImportPath, dirInRepo); err == nil && basePkg != nil {
-				loader.inRepoPkgs[rootImportPath] = basePkg
+				restoreBase = loader.swapInRepoPkg(rootImportPath, basePkg)
 			}
 		}
 		pkg, _ := conf.Check(impPath, fset, astFiles, info)
+		if restoreBase != nil {
+			restoreBase()
+		}
 
 		for _, e := range entries {
 			if !candSet[e.fPath] {
@@ -1741,7 +1801,7 @@ func (a *Analyzer) searchRepoDirWithCandidates(
 			group := RefGroupRepo
 			if changedFiles[e.fPath] {
 				group = RefGroupChange
-			} else if dirInRepo == declDir {
+			} else if targetID.declInRepo && dirInRepo == declDir {
 				group = RefGroupPackage
 			}
 			lines := diff.SplitLines(e.content)
@@ -1985,13 +2045,17 @@ func (a *Analyzer) searchDiskDir(
 		}
 		isExtTest = strings.HasSuffix(pkgName, "_test")
 		impPath = pkgImportPath
+		var restoreBase func()
 		if isExtTest {
 			impPath += "_test"
 			if basePkg, err := loader.loadDiskTestBasePackage(pkgImportPath, absDir); err == nil && basePkg != nil {
-				loader.inRepoPkgs[pkgImportPath] = basePkg
+				restoreBase = loader.swapInRepoPkg(pkgImportPath, basePkg)
 			}
 		}
 		pkg, _ := conf.Check(impPath, fset, astFiles, info)
+		if restoreBase != nil {
+			restoreBase()
+		}
 
 		for _, e := range list {
 			if !e.isCand || astFileMap[e.name] == nil {
@@ -2364,7 +2428,10 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 					resolved[i].err = err
 					continue
 				}
-				if target == nil || target.obj == nil || target.obj.Pkg() == nil {
+				if target == nil || target.obj == nil {
+					continue
+				}
+				if _, isPkg := target.obj.(*types.PkgName); !isPkg && target.obj.Pkg() == nil {
 					continue
 				}
 				target.obj = unwrapOrigin(target.obj)
@@ -2398,16 +2465,25 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 
 				var refsCacheK refsCacheKey
 				var canCacheRefs bool
-				if target.loader != nil && target.loader.revCache != nil && !targetID.isLocal && isImmutableRev(req.BaseRev) && isImmutableRev(target.rev) {
+				if target.loader != nil && target.loader.revCache != nil && !targetID.isLocal && isImmutableRev(req.BaseRev) && isImmutableRev(req.TargetRev) && isImmutableRev(target.rev) {
 					canCacheRefs = true
+					diskDir := ""
+					if target.isChained && target.isDisk {
+						diskDir = target.dir
+					}
 					refsCacheK = refsCacheKey{
 						baseRev:      req.BaseRev,
+						reqTargetRev: req.TargetRev,
 						targetRev:    target.rev,
+						goos:         target.loader.goos,
+						goarch:       target.loader.goarch,
+						tagsSig:      target.loader.buildTagsSig(),
 						targetID:     targetID,
 						defCleanFile: defCleanFile,
 						defLine:      defLine,
 						defCol:       defCol,
 						isPkgClause:  target.isPkgClause,
+						diskDir:      diskDir,
 					}
 				}
 
@@ -2487,7 +2563,7 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 		}
 
 		// Collect in-repo target for unified batch scan
-		sig := formatSignature(item.target.obj, item.target.rootPkg)
+		sig := formatRefSignature(item.target.obj, item.target.rootPkg, item.symName)
 		sigHTML := highlightSignature(sig)
 		t := &batchTarget{
 			reqIdx:                      i,
@@ -2507,6 +2583,7 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 				SymbolName:    item.symName,
 				Signature:     sig,
 				SignatureHTML: sigHTML,
+				SymTarget:     buildSymbolTarget(reqs[i], item.target),
 			},
 			seen:          make(map[refKey]bool),
 			dirCandidates: make(map[string][]string),
@@ -2589,11 +2666,12 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 			}
 
 			var matchTargets []*batchTarget
+			allExactPkgName := fileIdx != nil && fileIdx.isImportExact(fPath)
 			for _, t := range groupTargets {
-				if t.targetID.isUnexported && fDir != t.declDir {
+				if t.targetID.isUnexported && (!t.targetID.declInRepo || fDir != t.declDir) {
 					continue
 				}
-				needImport := t.targetID.isPkgName || (fDir != t.declDir && t.requireImportOutsideDeclDir)
+				needImport := t.targetID.isPkgName || ((!t.targetID.declInRepo || fDir != t.declDir) && t.requireImportOutsideDeclDir)
 				if fileIdx != nil {
 					if needImport && !fileIdx.hasImport(fPath, t.targetID.pkgPath) {
 						continue
@@ -2602,9 +2680,32 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 						continue
 					}
 				}
+				if !t.targetID.isPkgName {
+					allExactPkgName = false
+				}
 				matchTargets = append(matchTargets, t)
 			}
 			if len(matchTargets) == 0 {
+				continue
+			}
+			if allExactPkgName {
+				// Exact import index already proves this file imports every matched package target;
+				// skip reading its blob solely for text pre-filtering.
+				for _, t := range matchTargets {
+					t.dirCandidates[fDir] = append(t.dirCandidates[fDir], fPath)
+					dInfo, exists := candDirsMap[fDir]
+					if !exists {
+						dInfo = &dirCandInfo{dir: fDir}
+						candDirsMap[fDir] = dInfo
+						orderedCandDirs = append(orderedCandDirs, fDir)
+					}
+					if !slices.Contains(dInfo.targets, t) {
+						dInfo.targets = append(dInfo.targets, t)
+					}
+					if !slices.Contains(dInfo.files, fPath) {
+						dInfo.files = append(dInfo.files, fPath)
+					}
+				}
 				continue
 			}
 			fileMatches = append(fileMatches, fileMatch{fPath: fPath, fDir: fDir, matchTargets: matchTargets})
@@ -2629,7 +2730,7 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 			}
 
 			for _, t := range fm.matchTargets {
-				needImport := t.targetID.isPkgName || (fDir != t.declDir && t.requireImportOutsideDeclDir)
+				needImport := t.targetID.isPkgName || ((!t.targetID.declInRepo || fDir != t.declDir) && t.requireImportOutsideDeclDir)
 				if needImport && (fileIdx == nil || !fileIdx.isImportExact(fPath)) {
 					if !containsImportLiteral(content, t.targetID.pkgPath) {
 						continue
@@ -2717,13 +2818,8 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 							continue
 						}
 
-						var preParsedASTs []*ast.File
-						var preParsedInfo *types.Info
-						if d == t.target.dir && !t.target.isChained {
-							preParsedASTs = t.target.pkgASTFiles
-							preParsedInfo = t.target.info
-						}
-
+						// Do not pass t.target.pkgASTFiles with a cloned loader: the cloned loader has a
+						// fresh FileSet that does not contain positions from t.target.loader.fset.
 						ldr := t.target.loader.clone()
 						var dirRefs []Reference
 						dirAddRef := func(ref Reference) bool {
@@ -2731,7 +2827,7 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 							return len(dirRefs) < maxRefs
 						}
 
-						_ = a.searchRepoDirWithCandidates(ctx, ldr, t.target.rootPkg, t.target.rev, d, candFiles, dirContentMap, t.targetID, t.matcher, t.defCleanFile, t.defLine, t.defCol, changedFiles, t.declDir, preParsedASTs, preParsedInfo, dirAddRef)
+						_ = a.searchRepoDirWithCandidates(ctx, ldr, t.target.rootPkg, t.target.rev, d, candFiles, dirContentMap, t.targetID, t.matcher, t.defCleanFile, t.defLine, t.defCol, changedFiles, t.declDir, nil, nil, dirAddRef)
 
 						t.mu.Lock()
 						if len(dirRefs) >= maxRefs {
@@ -2763,7 +2859,7 @@ func (a *Analyzer) ReferencesBatch(ctx context.Context, reqs []LookupRequest) ([
 					t.res.Refs = t.res.Refs[:maxRefs]
 				}
 			}
-			if t.canCacheRefs && t.res != nil {
+			if t.canCacheRefs && t.res != nil && ctx.Err() == nil {
 				t.target.loader.revCache.refsCache.put(t.refsCacheK, t.res)
 			}
 			results[t.reqIdx] = cloneRefsResult(t.res)

@@ -157,6 +157,10 @@ func (a *Analyzer) warmChange(ctx context.Context, vc *vcs.Cache, req WarmReques
 
 	uniqueDirs := make([]string, 0, 16)
 	seenDirs := make(map[string]string) // dir -> sampleFile
+	hasPlatformSuffix := func(filePath string) bool {
+		gos, garch := inferPlatformFromFilename(filePath)
+		return gos != "" || garch != ""
+	}
 	for _, f := range req.Files {
 		fClean := path.Clean(strings.TrimPrefix(filepath.ToSlash(f), "/"))
 		if fClean == "" || fClean == "." || !strings.HasSuffix(fClean, ".go") || strings.HasPrefix(fClean, "vendor/") || strings.Contains(fClean, "/vendor/") || isTestdataPath(fClean) {
@@ -166,12 +170,15 @@ func (a *Analyzer) warmChange(ctx context.Context, vc *vcs.Cache, req WarmReques
 		if d == "." {
 			d = ""
 		}
-		if _, ok := seenDirs[d]; !ok {
+		if prev, ok := seenDirs[d]; !ok {
+			if len(uniqueDirs) >= 16 {
+				continue
+			}
 			seenDirs[d] = fClean
 			uniqueDirs = append(uniqueDirs, d)
-			if len(uniqueDirs) >= 16 {
-				break
-			}
+		} else if hasPlatformSuffix(prev) && !hasPlatformSuffix(fClean) {
+			// Prefer a platform-neutral sample file so warming uses host GOOS/GOARCH.
+			seenDirs[d] = fClean
 		}
 	}
 
@@ -244,6 +251,9 @@ func (a *Analyzer) warmChange(ctx context.Context, vc *vcs.Cache, req WarmReques
 				if len(needParsePaths) > 0 {
 					fset := token.NewFileSet()
 					for _, fPath := range needParsePaths {
+						if !a.waitForIdle(ctx) {
+							return
+						}
 						data, err := repo.Content(req.Rev, fPath)
 						if err != nil || len(data) == 0 {
 							continue
@@ -289,6 +299,9 @@ func (a *Analyzer) warmChange(ctx context.Context, vc *vcs.Cache, req WarmReques
 			pkgMap := make(map[string]*pkgTrack)
 			fset := token.NewFileSet()
 			for _, name := range names {
+				if !a.waitForIdle(ctx) {
+					return
+				}
 				if !strings.HasSuffix(name, ".go") || strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
 					continue
 				}

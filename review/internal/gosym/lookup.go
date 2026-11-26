@@ -284,7 +284,8 @@ func (a *Analyzer) Lookup(ctx context.Context, req LookupRequest) (*Result, erro
 		return nil, err
 	}
 	if res != nil && target.obj != nil {
-		if (target.obj.Pkg() != nil || target.isPkgClause) && !target.isInitFunc {
+		_, isPkgName := target.obj.(*types.PkgName)
+		if (target.obj.Pkg() != nil || target.isPkgClause || isPkgName) && !target.isInitFunc {
 			res.CanRefs = true
 		}
 		res.CanImpls, res.ImplsDirection = canCheckImplementations(target.obj)
@@ -621,11 +622,12 @@ func (a *Analyzer) resolveTarget(ctx context.Context, req LookupRequest) (*resol
 	}
 
 	// If this is an external test package (e.g. package foo_test),
-	// make the base package (foo) in that directory importable as its import path
+	// temporarily make the base package (foo) in that directory importable as its import path.
+	var restoreBase func()
 	if isExternalTest {
 		basePkgImport := cleanPathToImport(mod, dirInRepo)
 		if basePkg, err := loader.loadInRepoTestBasePackage(basePkgImport, dirInRepo); err == nil && basePkg != nil {
-			loader.inRepoPkgs[basePkgImport] = basePkg
+			restoreBase = loader.swapInRepoPkg(basePkgImport, basePkg)
 		}
 	}
 
@@ -649,6 +651,9 @@ func (a *Analyzer) resolveTarget(ctx context.Context, req LookupRequest) (*resol
 	}
 
 	rootPkg, _ := conf.Check(rootImportPath, loader.fset, pkgASTFiles, info)
+	if restoreBase != nil {
+		restoreBase()
+	}
 
 	if req.Site {
 		return a.findTargetAtSite(rev, cleanPath, false, false, dirInRepo, rootImportPath, mod, loader, clickedAST, pkgASTFiles, rootPkg, info, lines, req.Line)
@@ -688,6 +693,9 @@ func (a *Analyzer) ResolveExternalFile(ctx context.Context, req ExternalFileRequ
 	}
 
 	dir, isDisk, err := loader.resolvePackageDir(req.PkgImportPath)
+	if err != nil && strings.HasSuffix(req.PkgImportPath, "_test") {
+		dir, isDisk, err = loader.resolvePackageDir(strings.TrimSuffix(req.PkgImportPath, "_test"))
+	}
 	if err != nil {
 		return "", nil, false
 	}
@@ -786,23 +794,43 @@ func (a *Analyzer) resolveTargetChained(ctx context.Context, req LookupRequest, 
 			}
 		}
 
-		errObj := types.Universe.Lookup("error")
-		var targetObj types.Object = errObj
-		if errObj != nil {
+		lookupErrorMethod := func() types.Object {
+			errObj := types.Universe.Lookup("error")
+			if errObj == nil {
+				return nil
+			}
 			if iface, ok := errObj.Type().Underlying().(*types.Interface); ok {
 				for i := 0; i < iface.NumMethods(); i++ {
-					m := iface.Method(i)
-					if m.Name() == "Error" {
-						if req.Line > 0 && req.Line <= len(lines) {
-							lineStr := lines[req.Line-1]
-							if strings.Contains(lineStr, "Error()") {
-								targetObj = m
-							}
-						}
-						break
+					if m := iface.Method(i); m.Name() == "Error" {
+						return m
 					}
 				}
 			}
+			return nil
+		}
+
+		var targetObj types.Object
+		if req.Line > 0 && req.Line <= len(lines) {
+			lineStr := lines[req.Line-1]
+			if !req.Site {
+				byteIdx := utf16ColToByteIndex(lineStr, req.UTF16Col)
+				if sym := extractSymbolAtByteIndex(lineStr, byteIdx); sym != "" && !isGoKeyword(sym) {
+					if sym == "Error" && strings.Contains(lineStr, "Error()") {
+						targetObj = lookupErrorMethod()
+					} else {
+						targetObj = types.Universe.Lookup(sym)
+					}
+				}
+			} else if strings.Contains(lineStr, "Error()") {
+				targetObj = lookupErrorMethod()
+			} else {
+				targetObj = types.Universe.Lookup("error")
+			}
+		} else if req.Site {
+			targetObj = types.Universe.Lookup("error")
+		}
+		if targetObj == nil {
+			return nil, nil
 		}
 
 		dir := ""
@@ -850,6 +878,7 @@ func (a *Analyzer) resolveTargetChained(ctx context.Context, req LookupRequest, 
 	var clickedBytes []byte
 	var clickedAST *ast.File
 	var pkgASTFiles []*ast.File
+	var targetRelPath string
 
 	if isDisk {
 		targetPath := filepath.Join(dir, pkgFile)
@@ -926,6 +955,7 @@ func (a *Analyzer) resolveTargetChained(ctx context.Context, req LookupRequest, 
 		}
 	} else {
 		targetPath := path.Join(dir, pkgFile)
+		targetRelPath = targetPath
 		clickedBytes, err = req.Repo.Content(rev, targetPath)
 		if err != nil || len(clickedBytes) == 0 {
 			return nil, nil
@@ -1001,18 +1031,24 @@ func (a *Analyzer) resolveTargetChained(ctx context.Context, req LookupRequest, 
 
 	checkImportPath := req.PkgImportPath
 	basePkgImport = strings.TrimSuffix(req.PkgImportPath, "_test")
+	var restoreBase func()
 	if clickedAST != nil && strings.HasSuffix(clickedAST.Name.Name, "_test") {
 		checkImportPath = basePkgImport + "_test"
 		if isDisk {
 			if basePkg, err := loader.loadDiskTestBasePackage(basePkgImport, dir); err == nil && basePkg != nil {
-				loader.inRepoPkgs[basePkgImport] = basePkg
+				restoreBase = loader.swapInRepoPkg(basePkgImport, basePkg)
 			}
 		} else {
 			if basePkg, err := loader.loadInRepoTestBasePackage(basePkgImport, dir); err == nil && basePkg != nil {
-				loader.inRepoPkgs[basePkgImport] = basePkg
+				restoreBase = loader.swapInRepoPkg(basePkgImport, basePkg)
 			}
 		}
 	}
+	defer func() {
+		if restoreBase != nil {
+			restoreBase()
+		}
+	}()
 
 	lines := diff.SplitLines(clickedBytes)
 	if req.Line < 1 || req.Line > len(lines) {
@@ -1048,11 +1084,15 @@ func (a *Analyzer) resolveTargetChained(ctx context.Context, req LookupRequest, 
 	}
 
 	rootPkg, _ := conf.Check(checkImportPath, loader.fset, pkgASTFiles, info)
+	if restoreBase != nil {
+		restoreBase()
+		restoreBase = nil
+	}
 
 	if req.Site {
-		return a.findTargetAtSite(rev, "", true, isDisk, dir, checkImportPath, mod, loader, clickedAST, pkgASTFiles, rootPkg, info, lines, req.Line)
+		return a.findTargetAtSite(rev, targetRelPath, isDisk, isDisk, dir, checkImportPath, mod, loader, clickedAST, pkgASTFiles, rootPkg, info, lines, req.Line)
 	}
-	return a.findTargetInAST(rev, "", true, isDisk, dir, checkImportPath, mod, loader, clickedAST, pkgASTFiles, rootPkg, info, lines, req.Line, byteIdx)
+	return a.findTargetInAST(rev, targetRelPath, isDisk, isDisk, dir, checkImportPath, mod, loader, clickedAST, pkgASTFiles, rootPkg, info, lines, req.Line, byteIdx)
 }
 
 func (a *Analyzer) findTargetAtSite(
@@ -1222,6 +1262,7 @@ func (a *Analyzer) findTargetInAST(rev, cleanPath string, isChained, isDisk bool
 	var enclosingSelector *ast.SelectorExpr
 	var typeSwitchIdent *ast.Ident
 	var enclosingTypeSwitch *ast.TypeSwitchStmt
+	var isInitFunc bool
 
 	ast.Inspect(clickedAST, func(n ast.Node) bool {
 		if n == nil {
@@ -1239,6 +1280,14 @@ func (a *Analyzer) findTargetInAST(rev, cleanPath string, isChained, isDisk bool
 			if pPos.Line == targetLine && byteIdx+1 >= pPos.Column && (pEnd.Line > targetLine || byteIdx+1 <= pEnd.Column) {
 				clickedImport = spec
 				return false
+			}
+		}
+
+		if fn, ok := n.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name != nil && fn.Name.Name == "init" {
+			fPos := loader.fset.Position(fn.Name.Pos())
+			fEnd := loader.fset.Position(fn.Name.End())
+			if fPos.Line == targetLine && byteIdx+1 >= fPos.Column && (fEnd.Line > targetLine || byteIdx+1 <= fEnd.Column) {
+				isInitFunc = true
 			}
 		}
 
@@ -1338,6 +1387,8 @@ func (a *Analyzer) findTargetInAST(rev, cleanPath string, isChained, isDisk bool
 		if pkgName.Imported() != nil && pkgName.Imported().Path() == "C" {
 			return nil, nil
 		}
+	} else if clickedIdent.Name == "_" {
+		return nil, nil
 	}
 
 	target := &resolvedTarget{
@@ -1346,6 +1397,7 @@ func (a *Analyzer) findTargetInAST(rev, cleanPath string, isChained, isDisk bool
 		isChained:           isChained,
 		isDisk:              isDisk,
 		isPkgClause:         isPkgClause,
+		isInitFunc:          isInitFunc,
 		dir:                 dir,
 		rootImportPath:      rootImportPath,
 		mod:                 mod,
@@ -1393,78 +1445,66 @@ func (a *Analyzer) buildResult(req LookupRequest, target *resolvedTarget) (*Resu
 		SymbolName: obj.Name(),
 	}
 
-	// 1. Built-ins & Universe (obj.Pkg() == nil)
-	if obj.Pkg() == nil {
+	// 1. Built-ins & Universe (obj.Pkg() == nil, excluding synthetic PkgName)
+	if _, isPkg := obj.(*types.PkgName); !isPkg && obj.Pkg() == nil {
 		res.Found = true
 		res.Signature = formatSignature(obj, rootPkg)
 		res.SignatureHTML = highlightSignature(res.Signature)
-		if obj.Name() != "nil" {
+		if obj.Name() == "Error" {
+			res.PkgGoDevURL = "https://pkg.go.dev/builtin#error"
+		} else if obj.Name() != "nil" {
 			res.PkgGoDevURL = "https://pkg.go.dev/builtin#" + obj.Name()
 		}
-		builtinPath := ""
-		if loader.env.goroot != "" {
-			builtinPath = filepath.Join(loader.env.goroot, "src", "builtin", "builtin.go")
-		}
 
-		if builtinPath != "" && fileExists(builtinPath) {
-			if bBytes, err := os.ReadFile(builtinPath); err == nil {
-				bFset := token.NewFileSet()
-				if bAST, err := parser.ParseFile(bFset, builtinPath, bBytes, parser.SkipObjectResolution); err == nil {
-					bLines := diff.SplitLines(bBytes)
-				declLoop:
-					for _, decl := range bAST.Decls {
-						if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == obj.Name() {
-							p := bFset.Position(fn.Name.Pos())
-							res.DefLine = p.Line
-							res.DisplayPath = "builtin/builtin.go"
-							res.DefPkg = "builtin"
-							res.DefFile = "builtin.go"
-							res.Snippet, res.SnippetTruncated = buildSnippet(bLines, res.DefLine)
-							if p.Line > 0 && p.Line <= len(bLines) {
-								sigLine := strings.TrimSpace(bLines[p.Line-1])
-								sigLine = strings.TrimSuffix(sigLine, " {}")
-								sigLine = strings.TrimSuffix(sigLine, " {")
-								res.Signature = sigLine
-								res.SignatureHTML = highlightSignature(sigLine)
+		if bc := getParsedBuiltin(loader.env.goroot); bc != nil {
+			bFset := bc.fset
+			bAST := bc.ast
+			bLines := bc.lines
+			setBuiltinResult := func(pos token.Pos, stripBrace bool) {
+				p := bFset.Position(pos)
+				res.DefLine = p.Line
+				res.DisplayPath = "builtin/builtin.go"
+				res.DefPkg = "builtin"
+				res.DefFile = "builtin.go"
+				res.Snippet, res.SnippetTruncated = buildSnippet(bLines, res.DefLine)
+				if p.Line > 0 && p.Line <= len(bLines) {
+					sigLine := strings.TrimSpace(bLines[p.Line-1])
+					if stripBrace {
+						sigLine = strings.TrimSuffix(sigLine, " {}")
+						sigLine = strings.TrimSuffix(sigLine, " {")
+					}
+					res.Signature = sigLine
+					res.SignatureHTML = highlightSignature(sigLine)
+				}
+			}
+		declLoop:
+			for _, decl := range bAST.Decls {
+				if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == obj.Name() {
+					setBuiltinResult(fn.Name.Pos(), true)
+					break declLoop
+				} else if gd, ok := decl.(*ast.GenDecl); ok {
+					for _, sp := range gd.Specs {
+						switch spec := sp.(type) {
+						case *ast.TypeSpec:
+							if spec.Name.Name == obj.Name() {
+								setBuiltinResult(spec.Name.Pos(), true)
+								break declLoop
 							}
-							break declLoop
-						} else if gd, ok := decl.(*ast.GenDecl); ok {
-							for _, sp := range gd.Specs {
-								if ts, ok := sp.(*ast.TypeSpec); ok {
-									if ts.Name.Name == obj.Name() {
-										p := bFset.Position(ts.Name.Pos())
-										res.DefLine = p.Line
-										res.DisplayPath = "builtin/builtin.go"
-										res.DefPkg = "builtin"
-										res.DefFile = "builtin.go"
-										res.Snippet, res.SnippetTruncated = buildSnippet(bLines, res.DefLine)
-										if p.Line > 0 && p.Line <= len(bLines) {
-											sigLine := strings.TrimSpace(bLines[p.Line-1])
-											res.Signature = sigLine
-											res.SignatureHTML = highlightSignature(sigLine)
-										}
-										break declLoop
-									}
-									if it, ok := ts.Type.(*ast.InterfaceType); ok && it.Methods != nil {
-										for _, m := range it.Methods.List {
-											for _, id := range m.Names {
-												if id.Name == obj.Name() {
-													p := bFset.Position(id.Pos())
-													res.DefLine = p.Line
-													res.DisplayPath = "builtin/builtin.go"
-													res.DefPkg = "builtin"
-													res.DefFile = "builtin.go"
-													res.Snippet, res.SnippetTruncated = buildSnippet(bLines, res.DefLine)
-													if p.Line > 0 && p.Line <= len(bLines) {
-														sigLine := strings.TrimSpace(bLines[p.Line-1])
-														res.Signature = sigLine
-														res.SignatureHTML = highlightSignature(sigLine)
-													}
-													break declLoop
-												}
-											}
+							if it, ok := spec.Type.(*ast.InterfaceType); ok && it.Methods != nil {
+								for _, m := range it.Methods.List {
+									for _, id := range m.Names {
+										if id.Name == obj.Name() {
+											setBuiltinResult(id.Pos(), false)
+											break declLoop
 										}
 									}
+								}
+							}
+						case *ast.ValueSpec:
+							for _, id := range spec.Names {
+								if id.Name == obj.Name() {
+									setBuiltinResult(id.Pos(), false)
+									break declLoop
 								}
 							}
 						}
@@ -1716,41 +1756,71 @@ func (a *Analyzer) buildResult(req LookupRequest, target *resolvedTarget) (*Resu
 
 func cleanPathToImport(mod *moduleInfo, dirInRepo string) string {
 	cleanDir := path.Clean(dirInRepo)
-	if cleanDir == "." || cleanDir == "" {
-		if mod.modPath != "" && mod.modDir == "" {
-			return mod.modPath
-		}
-		return "main"
+	if cleanDir == "." {
+		cleanDir = ""
 	}
+	if mod == nil {
+		if cleanDir == "" {
+			return "main"
+		}
+		return cleanDir
+	}
+
+	// Pick the module (primary or sibling) with the longest matching directory prefix.
+	bestMod := ""
+	bestDir := ""
+	bestLen := -1
+	consider := func(modPath, modDir string) {
+		if modPath == "" {
+			return
+		}
+		d := path.Clean(modDir)
+		if d == "." {
+			d = ""
+		}
+		matched := false
+		if d == cleanDir {
+			matched = true
+		} else if d == "" {
+			matched = true
+		} else if strings.HasPrefix(cleanDir, d+"/") {
+			matched = true
+		}
+		if !matched {
+			return
+		}
+		prefixLen := len(d)
+		if prefixLen > bestLen || (prefixLen == bestLen && modPath < bestMod) {
+			bestLen = prefixLen
+			bestMod = modPath
+			bestDir = d
+		}
+	}
+
+	consider(mod.modPath, mod.modDir)
 	for sibMod, sibDir := range mod.siblingMods {
-		if sibDir == cleanDir {
-			if sibMod == "std" {
+		consider(sibMod, sibDir)
+	}
+
+	if bestLen >= 0 {
+		if bestDir == cleanDir {
+			if bestMod == "std" {
 				return ""
 			}
-			return sibMod
+			return bestMod
 		}
-		if sibDir != "" && strings.HasPrefix(cleanDir, sibDir+"/") {
-			sub := strings.TrimPrefix(cleanDir, sibDir+"/")
-			if sibMod == "std" {
-				return sub
-			}
-			return path.Join(sibMod, sub)
+		sub := cleanDir
+		if bestDir != "" {
+			sub = strings.TrimPrefix(cleanDir, bestDir+"/")
 		}
+		if bestMod == "std" {
+			return sub
+		}
+		return path.Join(bestMod, sub)
 	}
-	if mod.modPath == "std" {
-		return strings.TrimPrefix(cleanDir, "src/")
-	}
-	if mod.modPath != "" {
-		if mod.modDir == cleanDir {
-			return mod.modPath
-		}
-		if mod.modDir != "" && strings.HasPrefix(cleanDir, mod.modDir+"/") {
-			sub := strings.TrimPrefix(cleanDir, mod.modDir+"/")
-			return path.Join(mod.modPath, sub)
-		}
-		if mod.modDir == "" {
-			return path.Join(mod.modPath, cleanDir)
-		}
+
+	if cleanDir == "" {
+		return "main"
 	}
 	return cleanDir
 }
@@ -1804,16 +1874,26 @@ func formatSignature(obj types.Object, rootPkg *types.Package) string {
 
 	case *types.TypeName:
 		if v.IsAlias() {
+			if alias, ok := v.Type().(*types.Alias); ok {
+				return "type " + v.Name() + formatTypeParams(alias.TypeParams(), qf) + " = " + types.TypeString(alias.Rhs(), qf)
+			}
 			return "type " + v.Name() + " = " + types.TypeString(v.Type(), qf)
+		}
+		if tp, ok := v.Type().(*types.TypeParam); ok {
+			return "type parameter " + v.Name() + " " + types.TypeString(tp.Constraint(), qf)
+		}
+		tpStr := ""
+		if named, ok := v.Type().(*types.Named); ok {
+			tpStr = formatTypeParams(named.TypeParams(), qf)
 		}
 		underlying := v.Type().Underlying()
 		if _, ok := underlying.(*types.Struct); ok {
-			return "type " + v.Name() + " struct"
+			return "type " + v.Name() + tpStr + " struct"
 		}
 		if _, ok := underlying.(*types.Interface); ok {
-			return "type " + v.Name() + " interface"
+			return "type " + v.Name() + tpStr + " interface"
 		}
-		return "type " + v.Name() + " " + types.TypeString(underlying, qf)
+		return "type " + v.Name() + tpStr + " " + types.TypeString(underlying, qf)
 
 	case *types.Const:
 		sig := types.ObjectString(v, qf)
@@ -1838,6 +1918,25 @@ func formatSignature(obj types.Object, rootPkg *types.Package) string {
 	default:
 		return types.ObjectString(obj, qf)
 	}
+}
+
+func formatTypeParams(tps *types.TypeParamList, qf types.Qualifier) string {
+	if tps == nil || tps.Len() == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := 0; i < tps.Len(); i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		tp := tps.At(i)
+		b.WriteString(tp.Obj().Name())
+		b.WriteByte(' ')
+		b.WriteString(types.TypeString(tp.Constraint(), qf))
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 func highlightSignature(sig string) string {
@@ -1943,7 +2042,7 @@ func pkgGoDevBaseURL(importPath, defAbsPath string, inRepo bool, mod *moduleInfo
 
 func buildPkgGoDevURL(obj types.Object, sel *ast.SelectorExpr, info *types.Info, defAbsPath string, inRepo bool, mod *moduleInfo, env goEnv) string {
 	pkg := obj.Pkg()
-	if pkg == nil {
+	if pkg == nil || strings.HasSuffix(pkg.Name(), "_test") || strings.HasSuffix(pkg.Path(), "_test") {
 		return ""
 	}
 	cleanPkg, ok := pkgGoDevBaseURL(pkg.Path(), defAbsPath, inRepo, mod, env)
@@ -1969,32 +2068,65 @@ func buildPkgGoDevURL(obj types.Object, sel *ast.SelectorExpr, info *types.Info,
 				// Interface method (e.g. http.ResponseWriter.WriteHeader)
 				if sel != nil && info != nil {
 					if s := info.Selections[sel]; s != nil {
-						if rNamed := unwrapNamed(s.Recv()); rNamed != nil {
+						if rNamed := unwrapNamed(s.Recv()); rNamed != nil && rNamed.Obj() != nil && rNamed.Obj().Exported() &&
+							rNamed.Obj().Pkg() != nil && rNamed.Obj().Pkg().Path() == pkg.Path() {
 							recvName = rNamed.Obj().Name()
 						}
 					}
 				}
 				if recvName == "" {
 					scope := pkg.Scope()
+					// Prefer exact method identity on an explicit interface, then exact on embedded,
+					// then name-only fallback (skipping type aliases).
+					var exactEmbedded, nameExplicit, nameEmbedded string
+					fnOrig := fn.Origin()
 					for _, name := range scope.Names() {
-						if tn, ok := scope.Lookup(name).(*types.TypeName); ok && tn.Exported() {
-							if iface, ok := tn.Type().Underlying().(*types.Interface); ok {
-								for i := 0; i < iface.NumMethods(); i++ {
-									if iface.Method(i) == fn || iface.Method(i).Name() == fn.Name() {
-										recvName = tn.Name()
-										break
-									}
-								}
-								if recvName != "" {
-									break
-								}
+						tn, ok := scope.Lookup(name).(*types.TypeName)
+						if !ok || !tn.Exported() || tn.IsAlias() {
+							continue
+						}
+						iface, ok := tn.Type().Underlying().(*types.Interface)
+						if !ok {
+							continue
+						}
+						for i := 0; i < iface.NumExplicitMethods(); i++ {
+							m := iface.ExplicitMethod(i)
+							if m == fn || (fnOrig != nil && m.Origin() == fnOrig) {
+								recvName = tn.Name()
+								break
 							}
+							if nameExplicit == "" && m.Name() == fn.Name() {
+								nameExplicit = tn.Name()
+							}
+						}
+						if recvName != "" {
+							break
+						}
+						for i := 0; i < iface.NumMethods(); i++ {
+							m := iface.Method(i)
+							if exactEmbedded == "" && (m == fn || (fnOrig != nil && m.Origin() == fnOrig)) {
+								exactEmbedded = tn.Name()
+								break
+							}
+							if nameEmbedded == "" && m.Name() == fn.Name() {
+								nameEmbedded = tn.Name()
+							}
+						}
+					}
+					if recvName == "" {
+						switch {
+						case exactEmbedded != "":
+							recvName = exactEmbedded
+						case nameExplicit != "":
+							recvName = nameExplicit
+						default:
+							recvName = nameEmbedded
 						}
 					}
 				}
 			}
 
-			if recvName != "" && unicode.IsUpper(rune(recvName[0])) {
+			if recvName != "" && token.IsExported(recvName) {
 				return fmt.Sprintf("https://pkg.go.dev/%s#%s.%s", cleanPkg, recvName, fn.Name())
 			}
 		}
@@ -2003,7 +2135,7 @@ func buildPkgGoDevURL(obj types.Object, sel *ast.SelectorExpr, info *types.Info,
 	// 3. Exported struct field
 	if v, ok := obj.(*types.Var); ok && v.IsField() && v.Exported() {
 		structName := findDeclaringStructName(v)
-		if structName != "" && unicode.IsUpper(rune(structName[0])) {
+		if structName != "" && token.IsExported(structName) {
 			return fmt.Sprintf("https://pkg.go.dev/%s#%s.%s", cleanPkg, structName, v.Name())
 		}
 	}
@@ -2034,7 +2166,7 @@ func buildPkgGoDevURLForPath(importPath, symName string, mod *moduleInfo, env go
 	if !ok {
 		return ""
 	}
-	if symName != "" && unicode.IsUpper(rune(symName[0])) {
+	if symName != "" && token.IsExported(symName) {
 		return fmt.Sprintf("https://pkg.go.dev/%s#%s", cleanPkg, symName)
 	}
 	return fmt.Sprintf("https://pkg.go.dev/%s", cleanPkg)

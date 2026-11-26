@@ -5,6 +5,7 @@ import (
 	"go/scanner"
 	"go/token"
 	"go/types"
+	"path"
 	"strconv"
 	"strings"
 
@@ -168,9 +169,18 @@ func lookupTypeOrMember(pkg *types.Package, recvName, memberName string) types.O
 	return obj
 }
 
-func resolveDocPkgByName(pkgName string, clickedAST *ast.File, pkgASTFiles []*ast.File, rootPkg *types.Package, info *types.Info, loader *lookupLoader) *types.Package {
-	allFiles := collectASTFiles(clickedAST, pkgASTFiles)
-
+// resolveImportedDocPkg resolves an imported package by its visible local name
+// in allFiles (respecting blank "_" and aliased imports). It reports excluded=true
+// if pkgName was explicitly hidden by a blank or differently-aliased import.
+func resolveImportedDocPkg(
+	pkgName string,
+	allFiles []*ast.File,
+	rootPkg *types.Package,
+	info *types.Info,
+	loader *lookupLoader,
+) (*types.Package, token.Pos, bool) {
+	seenImports := make(map[string]bool)
+	excluded := false
 	for _, f := range allFiles {
 		for _, spec := range f.Imports {
 			if spec.Path == nil {
@@ -180,37 +190,80 @@ func resolveDocPkgByName(pkgName string, clickedAST *ast.File, pkgASTFiles []*as
 			if err != nil || unquoted == "" {
 				continue
 			}
-			// Explicit alias: import myfmt "fmt" -> myfmt matches pkgName
-			if spec.Name != nil && spec.Name.Name == pkgName {
-				if imp, err := loader.Import(unquoted); err == nil && imp != nil {
-					return imp
+			if spec.Name != nil {
+				if spec.Name.Name == "_" || spec.Name.Name == "." {
+					if path.Base(unquoted) == pkgName {
+						excluded = true
+					}
+					continue
 				}
-			}
-			// Implicits
-			if info != nil {
-				if impObj, ok := info.Implicits[spec].(*types.PkgName); ok && impObj != nil {
-					if impObj.Name() == pkgName {
-						return impObj.Imported()
+				if spec.Name.Name == pkgName {
+					if info != nil {
+						if impObj, ok := info.Defs[spec.Name].(*types.PkgName); ok && impObj != nil && impObj.Imported() != nil {
+							return impObj.Imported(), spec.Pos(), false
+						}
+					}
+					if imp, err := loader.Import(unquoted); err == nil && imp != nil {
+						return imp, spec.Pos(), false
 					}
 				}
+				// Explicitly aliased to a different name: do not match by package name.
+				if path.Base(unquoted) == pkgName {
+					excluded = true
+				}
+				continue
 			}
-			// Direct import name check
+			if info != nil {
+				if impObj, ok := info.Implicits[spec].(*types.PkgName); ok && impObj != nil && impObj.Imported() != nil {
+					if impObj.Name() == pkgName {
+						return impObj.Imported(), spec.Pos(), false
+					}
+					continue
+				}
+			}
+			if seenImports[unquoted] {
+				continue
+			}
+			seenImports[unquoted] = true
 			if imp, err := loader.Import(unquoted); err == nil && imp != nil && imp.Name() == pkgName {
-				return imp
+				return imp, spec.Pos(), false
 			}
 		}
 	}
 
-	// 2. Check rootPkg.Imports()
-	if rootPkg != nil {
+	// Only fall back to rootPkg.Imports() when AST import specs were unavailable,
+	// so blank/aliased imports excluded above are not resurrected.
+	if len(allFiles) == 0 && rootPkg != nil {
 		for _, imp := range rootPkg.Imports() {
 			if imp != nil && imp.Name() == pkgName {
-				return imp
+				return imp, token.NoPos, false
 			}
 		}
 	}
+	return nil, token.NoPos, excluded
+}
 
-	// 3. Fallback for unimported standard library single-segment packages (e.g. io, os, fmt, net)
+func resolveDocPkgByName(
+	pkgName string,
+	clickedAST *ast.File,
+	pkgASTFiles []*ast.File,
+	rootPkg *types.Package,
+	info *types.Info,
+	loader *lookupLoader,
+) *types.Package {
+	if pkgName == "" {
+		return nil
+	}
+	allFiles := collectASTFiles(clickedAST, pkgASTFiles)
+
+	// 1. Check imported packages matching local name/alias
+	if imp, _, excluded := resolveImportedDocPkg(pkgName, allFiles, rootPkg, info, loader); imp != nil {
+		return imp
+	} else if excluded {
+		return nil
+	}
+
+	// 2. Fallback for unimported standard library single-segment packages (e.g. io, os, fmt, net)
 	if _, _, err := loader.resolvePackageDir(pkgName); err == nil {
 		if pkg, err := loader.Import(pkgName); err == nil && pkg != nil && pkg.Name() != "" {
 			return pkg
@@ -257,12 +310,21 @@ func (a *Analyzer) resolveDocLinkTarget(
 		}
 
 		var targetPkg *types.Package
-		if rootPkg != nil && impPath == strings.TrimSuffix(rootImportPath, "_test") && !strings.HasSuffix(rootPkg.Name(), "_test") {
+		baseRootImport := strings.TrimSuffix(rootImportPath, "_test")
+		if rootPkg != nil && impPath == baseRootImport && !strings.HasSuffix(rootPkg.Name(), "_test") {
 			targetPkg = rootPkg
-		} else if p := loader.inRepoPkgs[impPath]; p != nil {
-			targetPkg = p
-		} else {
-			targetPkg, _ = loader.Import(impPath)
+		} else if impPath == baseRootImport && strings.HasSuffix(rootImportPath, "_test") {
+			if isDisk {
+				targetPkg, _ = loader.loadDiskTestBasePackage(impPath, dir)
+			} else {
+				targetPkg, _ = loader.loadInRepoTestBasePackage(impPath, dir)
+			}
+		} else if _, _, err := loader.resolvePackageDir(impPath); err == nil {
+			if p := loader.inRepoPkgs[impPath]; p != nil {
+				targetPkg = p
+			} else {
+				targetPkg, _ = loader.Import(impPath)
+			}
 		}
 
 		if targetPkg == nil {
@@ -271,11 +333,7 @@ func (a *Analyzer) resolveDocLinkTarget(
 
 		if name == "" {
 			if !hadLeadingStar {
-				if targetPkg == rootPkg || loader.inRepoPkgs[impPath] != nil {
-					obj = types.NewPkgName(token.NoPos, rootPkg, targetPkg.Name(), targetPkg)
-				} else if _, _, err := loader.resolvePackageDir(impPath); err == nil {
-					obj = types.NewPkgName(token.NoPos, rootPkg, targetPkg.Name(), targetPkg)
-				}
+				obj = types.NewPkgName(token.NoPos, rootPkg, targetPkg.Name(), targetPkg)
 			}
 		} else if recv != "" {
 			obj = lookupTypeOrMember(targetPkg, recv, name)
@@ -298,16 +356,11 @@ func (a *Analyzer) resolveDocLinkTarget(
 			// If not found and rootImportPath ends in _test, check base package
 			if obj == nil && strings.HasSuffix(rootImportPath, "_test") {
 				basePkgImport := strings.TrimSuffix(rootImportPath, "_test")
-				basePkg := loader.inRepoPkgs[basePkgImport]
-				if basePkg == nil {
-					if isDisk {
-						basePkg, _ = loader.loadDiskTestBasePackage(basePkgImport, dir)
-					} else {
-						basePkg, _ = loader.loadInRepoTestBasePackage(basePkgImport, dir)
-					}
-					if basePkg != nil {
-						loader.inRepoPkgs[basePkgImport] = basePkg
-					}
+				var basePkg *types.Package
+				if isDisk {
+					basePkg, _ = loader.loadDiskTestBasePackage(basePkgImport, dir)
+				} else {
+					basePkg, _ = loader.loadInRepoTestBasePackage(basePkgImport, dir)
 				}
 				if basePkg != nil {
 					obj = lookupTypeOrMember(basePkg, parts[0], parts[1])
@@ -320,6 +373,16 @@ func (a *Analyzer) resolveDocLinkTarget(
 					obj = targetPkg.Scope().Lookup(parts[1])
 				}
 			}
+			// Also support builtin type members such as [error.Error].
+			if obj == nil && !hadLeadingStar {
+				if uniObj := types.Universe.Lookup(parts[0]); uniObj != nil {
+					if tn, ok := uniObj.(*types.TypeName); ok {
+						if m, _, _ := types.LookupFieldOrMethod(tn.Type(), true, nil, parts[1]); m != nil {
+							obj = m
+						}
+					}
+				}
+			}
 		} else if len(parts) == 1 {
 			name := parts[0]
 			if rootPkg != nil {
@@ -327,16 +390,11 @@ func (a *Analyzer) resolveDocLinkTarget(
 			}
 			if obj == nil && strings.HasSuffix(rootImportPath, "_test") {
 				basePkgImport := strings.TrimSuffix(rootImportPath, "_test")
-				basePkg := loader.inRepoPkgs[basePkgImport]
-				if basePkg == nil {
-					if isDisk {
-						basePkg, _ = loader.loadDiskTestBasePackage(basePkgImport, dir)
-					} else {
-						basePkg, _ = loader.loadInRepoTestBasePackage(basePkgImport, dir)
-					}
-					if basePkg != nil {
-						loader.inRepoPkgs[basePkgImport] = basePkg
-					}
+				var basePkg *types.Package
+				if isDisk {
+					basePkg, _ = loader.loadDiskTestBasePackage(basePkgImport, dir)
+				} else {
+					basePkg, _ = loader.loadInRepoTestBasePackage(basePkgImport, dir)
 				}
 				if basePkg != nil {
 					obj = basePkg.Scope().Lookup(name)
@@ -363,37 +421,14 @@ func (a *Analyzer) resolveDocLinkTarget(
 					}
 				}
 			}
-			// Check imported packages matching pkgName == name
+			// Check imported packages matching local name/alias (respecting blank/aliased imports)
+			excludedImport := false
 			if obj == nil && !hadLeadingStar {
-				for _, f := range allFiles {
-					for _, spec := range f.Imports {
-						if spec.Path != nil {
-							unquoted, err := strconv.Unquote(spec.Path.Value)
-							if err == nil {
-								if spec.Name != nil && spec.Name.Name == name {
-									if impPkg, err := loader.Import(unquoted); err == nil && impPkg != nil {
-										obj = types.NewPkgName(spec.Pos(), rootPkg, impPkg.Name(), impPkg)
-										break
-									}
-								}
-								if impPkg, err := loader.Import(unquoted); err == nil && impPkg != nil && impPkg.Name() == name {
-									obj = types.NewPkgName(spec.Pos(), rootPkg, impPkg.Name(), impPkg)
-									break
-								}
-							}
-						}
-					}
-					if obj != nil {
-						break
-					}
-				}
-				if obj == nil && rootPkg != nil {
-					for _, imp := range rootPkg.Imports() {
-						if imp != nil && imp.Name() == name {
-							obj = types.NewPkgName(token.NoPos, rootPkg, imp.Name(), imp)
-							break
-						}
-					}
+				var impPkg *types.Package
+				var impPos token.Pos
+				impPkg, impPos, excludedImport = resolveImportedDocPkg(name, allFiles, rootPkg, info, loader)
+				if impPkg != nil {
+					obj = types.NewPkgName(impPos, rootPkg, impPkg.Name(), impPkg)
 				}
 			}
 			// Builtin Universe (error, any, comparable, append, etc.)
@@ -401,7 +436,7 @@ func (a *Analyzer) resolveDocLinkTarget(
 				obj = types.Universe.Lookup(name)
 			}
 			// Fallback for stdlib single-segment package name (os, io, fmt, context, etc.)
-			if obj == nil && !hadLeadingStar {
+			if obj == nil && !hadLeadingStar && !excludedImport {
 				if _, _, err := loader.resolvePackageDir(name); err == nil {
 					if pkg, err := loader.Import(name); err == nil && pkg != nil && pkg.Name() == name {
 						obj = types.NewPkgName(token.NoPos, rootPkg, pkg.Name(), pkg)

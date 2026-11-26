@@ -149,9 +149,11 @@ func dirExists(p string) bool {
 }
 
 type replaceTarget struct {
-	path    string
-	version string
-	isLocal bool
+	path       string
+	version    string
+	isLocal    bool
+	baseDir    string // repo-relative dir of the go.mod that declared this replace
+	hasBaseDir bool
 }
 
 type moduleInfo struct {
@@ -285,6 +287,13 @@ func resolveModCacheReplaceDir(rep replaceTarget, sub, gomodcache string) (strin
 }
 
 func findModuleInfo(repo vcs.Repo, rev, filePath string, rc *diskCache) *moduleInfo {
+	if repo == nil {
+		return &moduleInfo{
+			requires:    make(map[string]string),
+			replaces:    make(map[string]replaceTarget),
+			siblingMods: make(map[string]string),
+		}
+	}
 	cleanFile := path.Clean(filepath.ToSlash(strings.TrimPrefix(filePath, "/")))
 	if cleanFile == "." || strings.HasPrefix(cleanFile, "..") || strings.HasPrefix(cleanFile, "/") {
 		cleanFile = ""
@@ -344,6 +353,13 @@ func findModuleInfo(repo vcs.Repo, rev, filePath string, rc *diskCache) *moduleI
 	if len(modData) > 0 {
 		m = parseGoMod(modData)
 		m.modDir = foundModDir
+		for repMod, repTarget := range m.replaces {
+			if repTarget.isLocal && !filepath.IsAbs(repTarget.path) {
+				repTarget.baseDir = foundModDir
+				repTarget.hasBaseDir = true
+				m.replaces[repMod] = repTarget
+			}
+		}
 	} else {
 		m = &moduleInfo{
 			requires:    make(map[string]string),
@@ -388,6 +404,10 @@ func findModuleInfo(repo vcs.Repo, rev, filePath string, rc *diskCache) *moduleI
 					}
 					for repMod, repTarget := range sMod.replaces {
 						if _, exists := m.replaces[repMod]; !exists {
+							if repTarget.isLocal && !filepath.IsAbs(repTarget.path) {
+								repTarget.baseDir = cleanUse
+								repTarget.hasBaseDir = true
+							}
 							m.replaces[repMod] = repTarget
 						}
 					}

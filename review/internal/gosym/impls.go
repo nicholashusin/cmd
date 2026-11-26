@@ -277,20 +277,18 @@ func collectExternalDepPackages(ctx context.Context, target *resolvedTarget, ext
 			return nil, err
 		}
 
-		// Concurrently pre-load uncached external imports into shared disk cache
+		// Concurrently pre-load uncached immutable external imports into shared disk cache
 		var toPreload []string
-		for _, impPath := range repoImports {
-			dir, isDisk, err := target.loader.resolvePackageDir(impPath)
-			if err != nil || !isDisk {
-				continue
-			}
-			key := target.loader.makeCacheKey(impPath, dir)
-			if target.loader.diskCache != nil {
+		if target.loader.diskCache != nil {
+			for _, impPath := range repoImports {
+				dir, isDisk, err := target.loader.resolvePackageDir(impPath)
+				if err != nil || !isDisk || !isImmutableDiskDir(target.loader.env, dir) {
+					continue
+				}
+				key := target.loader.makeCacheKey(impPath, dir)
 				if _, ok := target.loader.diskCache.get(key); !ok {
 					toPreload = append(toPreload, impPath)
 				}
-			} else {
-				toPreload = append(toPreload, impPath)
 			}
 		}
 
@@ -436,20 +434,34 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 	defLine := defPos.Line
 	defCol := defPos.Column
 	targetID := resolveTargetIdentity(obj, target, defCleanFile, defLine, defCol, req.RepoRoot)
+	declDir := targetID.declDir
+	declInRepo := targetID.declInRepo
+	if !declInRepo && target != nil && !target.isDisk {
+		// When inspecting an external interface/type from an in-repo file, group
+		// implementations in the viewer's current package under ImplGroupPackage.
+		declDir = target.dir
+		declInRepo = true
+	}
 
 	var implsCacheK implsCacheKey
 	var canCacheImpls bool
-	if target.loader.revCache != nil && !targetID.isLocal && isImmutableRev(req.BaseRev) && isImmutableRev(target.rev) {
+	if target.loader.revCache != nil && !targetID.isLocal && isImmutableRev(req.BaseRev) && isImmutableRev(req.TargetRev) && isImmutableRev(target.rev) {
 		canCacheImpls = true
 		implsCacheK = implsCacheKey{
 			baseRev:          req.BaseRev,
+			reqTargetRev:     req.TargetRev,
 			targetRev:        target.rev,
+			goos:             target.loader.goos,
+			goarch:           target.loader.goarch,
+			tagsSig:          target.loader.buildTagsSig(),
 			direction:        string(direction),
 			targetID:         targetID,
 			defCleanFile:     defCleanFile,
 			defLine:          defLine,
 			defCol:           defCol,
 			targetMethodName: targetMethodName,
+			pkgGroupDir:      declDir,
+			hasPkgGroup:      declInRepo,
 		}
 		if cached, ok := target.loader.revCache.implsCache.get(implsCacheK); ok {
 			return cached, nil
@@ -485,8 +497,6 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 	for f := range changedFiles {
 		changedDirs[repoDirOf(f)] = true
 	}
-
-	declDir := target.dir
 
 	seen := make(map[string]bool)
 	const maxImpls = 200
@@ -550,7 +560,7 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 
 	finishImpls := func() (*ImplsResult, error) {
 		sortImpls(res.Implementations)
-		if canCacheImpls && res != nil {
+		if canCacheImpls && res != nil && ctx.Err() == nil {
 			target.loader.revCache.implsCache.put(implsCacheK, res)
 		}
 		return cloneImplsResult(res), nil
@@ -585,11 +595,15 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 			if fileIdx != nil {
 				if len(goFiles) <= 1500 {
 					for d := range fileIdx.dirHasType {
-						candDirSet[d] = true
+						if !isTestdataPath(d) {
+							candDirSet[d] = true
+						}
 					}
 				} else if len(methodNames) == 0 && targetIfaceName == "" {
 					for d := range fileIdx.dirHasType {
-						candDirSet[d] = true
+						if !isTestdataPath(d) {
+							candDirSet[d] = true
+						}
 					}
 				} else {
 					type bloomCand struct {
@@ -599,6 +613,9 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 					}
 					var bloomFiles []bloomCand
 					for d := range fileIdx.dirHasType {
+						if isTestdataPath(d) {
+							continue
+						}
 						fileIndices := fileIdx.dirFiles[d]
 						for _, fi := range fileIndices {
 							f := &fileIdx.files[fi]
@@ -655,6 +672,9 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 					if ctx.Err() != nil {
 						return nil, ctx.Err()
 					}
+					if isTestdataPath(fPath) {
+						continue
+					}
 					d := repoDirOf(fPath)
 					if candDirSet[d] {
 						continue
@@ -702,14 +722,14 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 				pA := 2
 				if changedDirs[a] {
 					pA = 0
-				} else if a == declDir || (declDir == "" && a == "") {
+				} else if declInRepo && a == declDir {
 					pA = 1
 				}
 
 				pB := 2
 				if changedDirs[b] {
 					pB = 0
-				} else if b == declDir || (declDir == "" && b == "") {
+				} else if declInRepo && b == declDir {
 					pB = 1
 				}
 
@@ -751,8 +771,8 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 							}
 							scope := pkg.Scope()
 							for _, name := range scope.Names() {
-								obj := scope.Lookup(name)
-								tn, ok := obj.(*types.TypeName)
+								candObj := scope.Lookup(name)
+								tn, ok := candObj.(*types.TypeName)
 								if !ok || tn.IsAlias() {
 									continue
 								}
@@ -761,8 +781,8 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 									continue
 								}
 
-								ptrImpl := safeImplements(types.NewPointer(named), targetIface)
-								valImpl := safeImplements(named, targetIface)
+								ptrImpl := implementsAcrossPackages(types.NewPointer(named), targetIface)
+								valImpl := implementsAcrossPackages(named, targetIface)
 								if !ptrImpl && !valImpl {
 									continue
 								}
@@ -775,14 +795,11 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 								if targetMethodName == "" {
 									pos := resolveObjectPosition(named.Obj(), pkg, fset, ldr, target.rootPkg)
 									relPath := cleanRepoRel(pos.Filename, req.RepoRoot)
-									var lines []string
-									if b, err := req.Repo.Content(target.rev, relPath); err == nil {
-										lines = diff.SplitLines(b)
-									}
+									lines := getRepoLines(relPath)
 									group := ImplGroupRepo
 									if changedFiles[relPath] {
 										group = ImplGroupChange
-									} else if d == declDir {
+									} else if declInRepo && repoDirOf(relPath) == declDir {
 										group = ImplGroupPackage
 									}
 									impl := Implementation{
@@ -806,11 +823,14 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 									for i := 0; i < mset.Len(); i++ {
 										m := mset.At(i)
 										if m.Obj().Name() == targetMethodName {
-											concreteMethodObj = m.Obj()
-											if fn, ok := concreteMethodObj.(*types.Func); ok && fn.Origin() != nil {
-												concreteMethodObj = fn.Origin()
+											targetIfaceMethodPkgMatches := (obj.Pkg() == nil || (m.Obj().Pkg() != nil && m.Obj().Pkg().Path() == obj.Pkg().Path()))
+											if ast.IsExported(targetMethodName) || targetIfaceMethodPkgMatches {
+												concreteMethodObj = m.Obj()
+												if fn, ok := concreteMethodObj.(*types.Func); ok && fn.Origin() != nil {
+													concreteMethodObj = fn.Origin()
+												}
+												break
 											}
-											break
 										}
 									}
 									if concreteMethodObj == nil {
@@ -822,19 +842,15 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 									inRepo := (relPath != "" && !strings.HasPrefix(relPath, ".."))
 									var lines []string
 									if inRepo {
-										if b, err := req.Repo.Content(target.rev, relPath); err == nil {
-											lines = diff.SplitLines(b)
-										}
-									} else if fileExists(pos.Filename) {
-										if b, err := os.ReadFile(pos.Filename); err == nil {
-											lines = diff.SplitLines(b)
-										}
+										lines = getRepoLines(relPath)
+									} else {
+										lines = getDiskLines(pos.Filename)
 									}
 									group := ImplGroupRepo
 									if inRepo {
 										if changedFiles[relPath] {
 											group = ImplGroupChange
-										} else if d == declDir {
+										} else if declInRepo && repoDirOf(relPath) == declDir {
 											group = ImplGroupPackage
 										}
 									} else {
@@ -891,18 +907,6 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 			if err != nil {
 				return nil, err
 			}
-			diskFileLines := make(map[string][]string)
-			getDiskLines := func(filename string) []string {
-				if lines, ok := diskFileLines[filename]; ok {
-					return lines
-				}
-				var lines []string
-				if b, err := os.ReadFile(filename); err == nil {
-					lines = diff.SplitLines(b)
-				}
-				diskFileLines[filename] = lines
-				return lines
-			}
 			for _, extPkg := range extPkgs {
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
@@ -924,8 +928,8 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 					if !ok || isInterfaceType(named) {
 						continue
 					}
-					ptrImpl := safeImplements(types.NewPointer(named), targetIface)
-					valImpl := safeImplements(named, targetIface)
+					ptrImpl := implementsAcrossPackages(types.NewPointer(named), targetIface)
+					valImpl := implementsAcrossPackages(named, targetIface)
 					if !ptrImpl && !valImpl {
 						continue
 					}
@@ -1035,7 +1039,7 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 
 	// 1. Built-in error interface
 	errIface := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
-	if safeImplements(targetConcreteNamed, errIface) || safeImplements(types.NewPointer(targetConcreteNamed), errIface) {
+	if implementsAcrossPackages(targetConcreteNamed, errIface) || implementsAcrossPackages(types.NewPointer(targetConcreteNamed), errIface) {
 		if targetConcreteMethod == "" || targetConcreteMethod == "Error" {
 			name := "error"
 			if targetConcreteMethod == "Error" {
@@ -1109,7 +1113,7 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 		if iface == nil || tn == nil || iface.NumMethods() == 0 || !iface.IsMethodSet() {
 			return
 		}
-		if !safeImplements(targetConcreteNamed, iface) && !safeImplements(types.NewPointer(targetConcreteNamed), iface) {
+		if !implementsAcrossPackages(targetConcreteNamed, iface) && !implementsAcrossPackages(types.NewPointer(targetConcreteNamed), iface) {
 			return
 		}
 		if targetConcreteMethod != "" {
@@ -1151,7 +1155,7 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 				disp = relPath
 				if changedFiles[relPath] {
 					group = ImplGroupChange
-				} else if repoDirOf(relPath) == declDir {
+				} else if declInRepo && repoDirOf(relPath) == declDir {
 					group = ImplGroupPackage
 				} else {
 					group = ImplGroupRepo
@@ -1173,8 +1177,12 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 				UTF16Col: byteColToUTF16Col(lines, pos.Line, pos.Column),
 				LineHTML: formatLineHTML(lines, pos.Line),
 			}
-			if !inRepo && pkg != nil {
-				impl.Pkg = pkg.Path()
+			if !inRepo {
+				if mObj.Pkg() != nil && mObj.Pkg().Path() != "" {
+					impl.Pkg = mObj.Pkg().Path()
+				} else if pkg != nil {
+					impl.Pkg = pkg.Path()
+				}
 				impl.PkgFile = filepath.Base(pos.Filename)
 			}
 			emit(impl)
@@ -1196,7 +1204,7 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 				disp = relPath
 				if changedFiles[relPath] {
 					group = ImplGroupChange
-				} else if repoDirOf(relPath) == declDir {
+				} else if declInRepo && repoDirOf(relPath) == declDir {
 					group = ImplGroupPackage
 				} else {
 					group = ImplGroupRepo
@@ -1300,11 +1308,15 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 		if fileIdx != nil {
 			if len(goFiles) <= 1500 {
 				for d := range fileIdx.dirHasInterface {
-					candDirSet[d] = true
+					if !isTestdataPath(d) {
+						candDirSet[d] = true
+					}
 				}
 			} else if len(concreteMethodNames) == 0 {
 				for d := range fileIdx.dirHasInterface {
-					candDirSet[d] = true
+					if !isTestdataPath(d) {
+						candDirSet[d] = true
+					}
 				}
 			} else {
 				type bloomCand struct {
@@ -1314,6 +1326,9 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 				}
 				var bloomFiles []bloomCand
 				for d := range fileIdx.dirHasInterface {
+					if isTestdataPath(d) {
+						continue
+					}
 					fileIndices := fileIdx.dirFiles[d]
 					for _, fi := range fileIndices {
 						f := &fileIdx.files[fi]
@@ -1367,6 +1382,9 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
 				}
+				if isTestdataPath(fPath) {
+					continue
+				}
 				d := repoDirOf(fPath)
 				if candDirSet[d] {
 					continue
@@ -1408,14 +1426,14 @@ func (a *Analyzer) Implementations(ctx context.Context, req LookupRequest) (*Imp
 			pA := 2
 			if changedDirs[a] {
 				pA = 0
-			} else if a == declDir || (declDir == "" && a == "") {
+			} else if declInRepo && a == declDir {
 				pA = 1
 			}
 
 			pB := 2
 			if changedDirs[b] {
 				pB = 0
-			} else if b == declDir || (declDir == "" && b == "") {
+			} else if declInRepo && b == declDir {
 				pB = 1
 			}
 
@@ -1756,15 +1774,26 @@ func loadRepoPackages(ctx context.Context, loader *lookupLoader, rev, dirInRepo 
 					Error:            func(error) {},
 				}
 
+				var restoreBase func()
+				if isExtTest {
+					if basePkg, err := loader.loadInRepoTestBasePackage(rootImportPath, dirInRepo); err == nil && basePkg != nil {
+						restoreBase = loader.swapInRepoPkg(rootImportPath, basePkg)
+					}
+				}
 				p, _ := conf.Check(impPath, localFset, astFiles, nil)
+				if restoreBase != nil {
+					restoreBase()
+				}
 				if ctx.Err() != nil || loader.ctx.Err() != nil {
 					return nil, nil, ctx.Err()
 				}
 				if p != nil {
-					loader.revCache.registerPkg(p)
-					loader.revCache.registerPkgFset(p, localFset)
+					loader.registerDepFsets(p)
 					if canUseRevCache {
-						loader.revCache.put(pkgKey, p)
+						loader.revCache.putWithMeta(pkgKey, p, "", localFset)
+					} else {
+						loader.revCache.registerPkg(p)
+						loader.revCache.registerPkgFset(p, localFset)
 					}
 					pkgs[pkgName] = p
 				}
@@ -1779,7 +1808,9 @@ func loadRepoPackages(ctx context.Context, loader *lookupLoader, rev, dirInRepo 
 		loader.revCache.dirPkgs[dirKey] = pkgs
 		loader.revCache.mu.Unlock()
 
-		return localFset, pkgs, nil
+		// Return nil fset so callers resolve each package's positions via revCache.pkgFsets,
+		// since pkgs may mix newly checked packages with packages reused from revCache.
+		return nil, pkgs, nil
 	}
 
 	names, err := loader.req.Repo.ListDir(rev, dirInRepo)
@@ -1865,7 +1896,16 @@ func loadRepoPackages(ctx context.Context, loader *lookupLoader, rev, dirInRepo 
 		if isExtTest {
 			impPath += "_test"
 		}
+		var restoreBase func()
+		if isExtTest {
+			if basePkg, err := loader.loadInRepoTestBasePackage(rootImportPath, dirInRepo); err == nil && basePkg != nil {
+				restoreBase = loader.swapInRepoPkg(rootImportPath, basePkg)
+			}
+		}
 		p, _ := conf.Check(impPath, fset, astFiles, nil)
+		if restoreBase != nil {
+			restoreBase()
+		}
 		if ctx.Err() != nil || loader.ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}

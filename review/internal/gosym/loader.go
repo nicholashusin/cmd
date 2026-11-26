@@ -53,9 +53,9 @@ type diskCache struct {
 	modMu         sync.RWMutex
 	modInfos      map[string]*moduleInfo
 	semverDirs    map[string]string
-	fsetMu        sync.Mutex
-	fset          *token.FileSet
 	inflight      map[diskCacheKey]chan struct{}
+	inflightOwner map[diskCacheKey]*lookupLoader
+	waitingOn     map[*lookupLoader]diskCacheKey
 	goFilesMu     sync.Mutex
 	goFiles       []string
 	repoImportsMu sync.Mutex
@@ -92,21 +92,22 @@ func newDiskCache(checkedCap ...int) *diskCache {
 		cap = checkedCap[0]
 	}
 	return &diskCache{
-		blobCache:    sharedBlobIndexCache,
-		pkgs:         make(map[diskCacheKey]*types.Package),
-		pkgSet:       make(map[*types.Package]struct{}),
-		pkgDirs:      make(map[*types.Package]string),
-		pkgFsets:     make(map[*types.Package]*token.FileSet),
-		modInfos:     make(map[string]*moduleInfo),
-		semverDirs:   make(map[string]string),
-		fset:         token.NewFileSet(),
-		inflight:     make(map[diskCacheKey]chan struct{}),
-		dirPkgs:      make(map[diskCacheKey]map[string]*types.Package),
-		dirInflight:  make(map[diskCacheKey]chan struct{}),
-		changedFiles: make(map[string]map[string]bool),
-		checkedPkgs:  newCheckedPkgLRU(cap),
-		refsCache:    newRefsLRU(128),
-		implsCache:   newImplsLRU(64),
+		blobCache:     sharedBlobIndexCache,
+		pkgs:          make(map[diskCacheKey]*types.Package),
+		pkgSet:        make(map[*types.Package]struct{}),
+		pkgDirs:       make(map[*types.Package]string),
+		pkgFsets:      make(map[*types.Package]*token.FileSet),
+		modInfos:      make(map[string]*moduleInfo),
+		semverDirs:    make(map[string]string),
+		inflight:      make(map[diskCacheKey]chan struct{}),
+		inflightOwner: make(map[diskCacheKey]*lookupLoader),
+		waitingOn:     make(map[*lookupLoader]diskCacheKey),
+		dirPkgs:       make(map[diskCacheKey]map[string]*types.Package),
+		dirInflight:   make(map[diskCacheKey]chan struct{}),
+		changedFiles:  make(map[string]map[string]bool),
+		checkedPkgs:   newCheckedPkgLRU(cap),
+		refsCache:     newRefsLRU(128),
+		implsCache:    newImplsLRU(64),
 	}
 }
 
@@ -165,18 +166,40 @@ func (dc *diskCache) positionForPkg(pkg *types.Package, pos token.Pos) (token.Po
 	if fset != nil {
 		return fset.Position(pos), true
 	}
-	if dc.has(pkg) {
-		return dc.position(pos), true
-	}
 	return token.Position{}, false
+}
+
+// wouldDeadlockLocked reports whether waiter waiting for target would form a cycle
+// through currently inflight package loads. Caller must hold dc.mu.
+func (dc *diskCache) wouldDeadlockLocked(waiter *lookupLoader, target diskCacheKey) bool {
+	if waiter == nil {
+		return false
+	}
+	cur := target
+	for steps := 0; steps < 64; steps++ {
+		owner := dc.inflightOwner[cur]
+		if owner == nil {
+			return false
+		}
+		if owner == waiter {
+			return true
+		}
+		next, waiting := dc.waitingOn[owner]
+		if !waiting {
+			return false
+		}
+		cur = next
+	}
+	return true
 }
 
 func (dc *diskCache) getChangedFiles(repo vcs.Repo, baseRev, targetRev string) map[string]bool {
 	if repo == nil || baseRev == "" || targetRev == "" {
 		return nil
 	}
+	canCache := dc != nil && isImmutableRev(baseRev) && isImmutableRev(targetRev)
 	key := baseRev + "\x00" + targetRev
-	if dc != nil {
+	if canCache {
 		dc.changedFilesMu.Lock()
 		if m, ok := dc.changedFiles[key]; ok {
 			dc.changedFilesMu.Unlock()
@@ -186,15 +209,17 @@ func (dc *diskCache) getChangedFiles(repo vcs.Repo, baseRev, targetRev string) m
 	}
 
 	m := make(map[string]bool)
-	if files, err := repo.Files(baseRev, targetRev); err == nil {
-		for _, f := range files {
-			if f != nil && f.Status != vcs.FileDeleted {
-				m[f.Path] = true
-			}
+	files, err := repo.Files(baseRev, targetRev)
+	if err != nil {
+		return m
+	}
+	for _, f := range files {
+		if f != nil && f.Status != vcs.FileDeleted {
+			m[f.Path] = true
 		}
 	}
 
-	if dc != nil {
+	if canCache {
 		dc.changedFilesMu.Lock()
 		dc.changedFiles[key] = m
 		dc.changedFilesMu.Unlock()
@@ -534,7 +559,9 @@ func matchIndexedGoFile(bctx *build.Context, repoRoot string, e *repoFileEntry) 
 		if pkg == "" {
 			pkg = "p"
 		}
-		content := e.constraintHeader + "\npackage " + pkg + "\n"
+		// constraintHeader is the exact slice before "package"; do not inject an extra
+		// newline that would turn a package-adjacent "// +build" comment into a constraint.
+		content := e.constraintHeader + "package " + pkg + "\n"
 		return io.NopCloser(strings.NewReader(content)), nil
 	}
 	match, _ := cp.MatchFile(filepath.Join(repoRoot, filepath.FromSlash(e.dir)), path.Base(e.path))
@@ -559,11 +586,9 @@ func readRepoFilesBatch(repo vcs.Repo, rev string, paths []string, oids []string
 
 	oidToPaths := make(map[string][]string, len(oids))
 	var uniqueOIDs []string
-	var missingPaths []string
 	for i, p := range paths {
 		oid := oids[i]
 		if oid == "" {
-			missingPaths = append(missingPaths, p)
 			continue
 		}
 		if _, seen := oidToPaths[oid]; !seen {
@@ -583,15 +608,6 @@ func readRepoFilesBatch(repo vcs.Repo, rev string, paths []string, oids []string
 		})
 	}
 
-	for _, p := range missingPaths {
-		if _, ok := out[p]; !ok {
-			b, err := repo.Content(rev, p)
-			if err == nil {
-				out[p] = b
-			}
-		}
-	}
-
 	for _, p := range paths {
 		if _, ok := out[p]; !ok {
 			b, err := repo.Content(rev, p)
@@ -605,10 +621,17 @@ func readRepoFilesBatch(repo vcs.Repo, rev string, paths []string, oids []string
 }
 
 type crossRevPkgEntry struct {
-	repoRoot string
-	digest   string
-	pkg      *types.Package
-	fset     *token.FileSet
+	repoRoot  string
+	digest    string
+	pkg       *types.Package
+	extraPkgs []*types.Package
+	fset      *token.FileSet
+	depFsets  map[*types.Package]*token.FileSet
+}
+
+type crossRevPkgMeta struct {
+	digest string
+	fset   *token.FileSet
 }
 
 type crossRevPkgCache struct {
@@ -616,7 +639,7 @@ type crossRevPkgCache struct {
 	cap      int
 	order    []string
 	byDigest map[string]*crossRevPkgEntry
-	byPkg    map[*types.Package]*crossRevPkgEntry
+	byPkg    map[*types.Package]crossRevPkgMeta
 }
 
 func newCrossRevPkgCache(capacity int) *crossRevPkgCache {
@@ -626,7 +649,7 @@ func newCrossRevPkgCache(capacity int) *crossRevPkgCache {
 	return &crossRevPkgCache{
 		cap:      capacity,
 		byDigest: make(map[string]*crossRevPkgEntry, capacity),
-		byPkg:    make(map[*types.Package]*crossRevPkgEntry, capacity),
+		byPkg:    make(map[*types.Package]crossRevPkgMeta, capacity),
 	}
 }
 
@@ -645,10 +668,7 @@ func (c *crossRevPkgCache) digestFor(pkg *types.Package) string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if e := c.byPkg[pkg]; e != nil {
-		return e.digest
-	}
-	return ""
+	return c.byPkg[pkg].digest
 }
 
 func (c *crossRevPkgCache) fsetFor(pkg *types.Package) *token.FileSet {
@@ -657,21 +677,24 @@ func (c *crossRevPkgCache) fsetFor(pkg *types.Package) *token.FileSet {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if e := c.byPkg[pkg]; e != nil {
-		return e.fset
-	}
-	return nil
+	return c.byPkg[pkg].fset
 }
 
-func (c *crossRevPkgCache) put(repoRoot, digest string, pkg *types.Package, fset *token.FileSet) {
+func (c *crossRevPkgCache) put(repoRoot, digest string, pkg *types.Package, fset *token.FileSet, depFsets map[*types.Package]*token.FileSet) {
 	if c == nil || digest == "" || pkg == nil {
 		return
 	}
+	cleanRoot := filepath.Clean(repoRoot)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if existing, ok := c.byDigest[digest]; ok {
-		c.byPkg[pkg] = existing
+		if existing.pkg != pkg {
+			if _, seen := c.byPkg[pkg]; !seen {
+				existing.extraPkgs = append(existing.extraPkgs, pkg)
+				c.byPkg[pkg] = crossRevPkgMeta{digest: digest, fset: fset}
+			}
+		}
 		return
 	}
 
@@ -681,17 +704,21 @@ func (c *crossRevPkgCache) put(repoRoot, digest string, pkg *types.Package, fset
 		if oldE, ok := c.byDigest[oldest]; ok {
 			delete(c.byDigest, oldest)
 			delete(c.byPkg, oldE.pkg)
+			for _, ep := range oldE.extraPkgs {
+				delete(c.byPkg, ep)
+			}
 		}
 	}
 
 	entry := &crossRevPkgEntry{
-		repoRoot: repoRoot,
+		repoRoot: cleanRoot,
 		digest:   digest,
 		pkg:      pkg,
 		fset:     fset,
+		depFsets: depFsets,
 	}
 	c.byDigest[digest] = entry
-	c.byPkg[pkg] = entry
+	c.byPkg[pkg] = crossRevPkgMeta{digest: digest, fset: fset}
 	c.order = append(c.order, digest)
 }
 
@@ -699,15 +726,20 @@ func (c *crossRevPkgCache) evictRepo(repoRoot string) {
 	if c == nil {
 		return
 	}
+	cleanRoot := filepath.Clean(repoRoot)
+	prefix := cleanRoot + string(filepath.Separator)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	newOrder := c.order[:0]
 	for _, digest := range c.order {
 		e := c.byDigest[digest]
-		if e != nil && e.repoRoot == repoRoot {
+		if e != nil && (e.repoRoot == cleanRoot || strings.HasPrefix(e.repoRoot, prefix)) {
 			delete(c.byDigest, digest)
 			delete(c.byPkg, e.pkg)
+			for _, ep := range e.extraPkgs {
+				delete(c.byPkg, ep)
+			}
 		} else {
 			newOrder = append(newOrder, digest)
 		}
@@ -786,7 +818,7 @@ func (c *crossRevCheckedLRU) put(digest, repoRoot string, checked *checkedPkgEnt
 	}
 
 	c.byDigest[digest] = &crossRevCheckedEntry{
-		repoRoot: repoRoot,
+		repoRoot: filepath.Clean(repoRoot),
 		digest:   digest,
 		checked:  checked,
 	}
@@ -797,13 +829,15 @@ func (c *crossRevCheckedLRU) evictRepo(repoRoot string) {
 	if c == nil {
 		return
 	}
+	cleanRoot := filepath.Clean(repoRoot)
+	prefix := cleanRoot + string(filepath.Separator)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	newOrder := c.order[:0]
 	for _, digest := range c.order {
 		e := c.byDigest[digest]
-		if e != nil && e.repoRoot == repoRoot {
+		if e != nil && (e.repoRoot == cleanRoot || strings.HasPrefix(e.repoRoot, prefix)) {
 			delete(c.byDigest, digest)
 		} else {
 			newOrder = append(newOrder, digest)
@@ -851,7 +885,8 @@ func computeCheckedMerkleDigest(
 }
 
 func isTestdataPath(p string) bool {
-	return strings.HasPrefix(p, "testdata/") || strings.Contains(p, "/testdata/")
+	return p == "testdata" || strings.HasPrefix(p, "testdata/") ||
+		strings.HasSuffix(p, "/testdata") || strings.Contains(p, "/testdata/")
 }
 
 func (dc *diskCache) getRepoFileIndex(ctx context.Context, repo vcs.Repo, rev string) (*repoFileIndex, error) {
@@ -1013,6 +1048,9 @@ func (dc *diskCache) getRepoFileIndex(ctx context.Context, repo vcs.Repo, rev st
 				if firstScanErr != nil {
 					return nil, firstScanErr
 				}
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 			}
 
 			dirHasType := make(map[string]bool)
@@ -1060,6 +1098,10 @@ func (dc *diskCache) getRepoFileIndex(ctx context.Context, repo vcs.Repo, rev st
 				imports = append(imports, imp)
 			}
 			slices.Sort(imports)
+
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 
 			dc.repoImportsMu.Lock()
 			dc.repoImports = imports
@@ -1227,6 +1269,10 @@ func (dc *diskCache) getRepoFileIndex(ctx context.Context, repo vcs.Repo, rev st
 	}
 	slices.Sort(imports)
 
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
 	dc.repoImportsMu.Lock()
 	dc.repoImports = imports
 	dc.repoImportsMu.Unlock()
@@ -1378,7 +1424,9 @@ func buildIndexes(entry *checkedPkgEntry) {
 			}
 			obj := identObject(id, sel, entry.info)
 			if obj != nil {
+				isPkgName := false
 				if pkgName, ok := obj.(*types.PkgName); ok && pkgName.Imported() != nil {
+					isPkgName = true
 					p := pkgName.Imported().Path()
 					entry.pkgUsesByPath[p] = append(entry.pkgUsesByPath[p], indexedPkgUse{
 						fileIdx: fIdx,
@@ -1387,12 +1435,23 @@ func buildIndexes(entry *checkedPkgEntry) {
 						pkgName: pkgName,
 					})
 				}
-				entry.usesByName[obj.Name()] = append(entry.usesByName[obj.Name()], indexedIdentUse{
-					fileIdx: fIdx,
-					id:      id,
-					sel:     sel,
-					obj:     obj,
-				})
+				// Skip PkgName (indexed in pkgUsesByPath) and function-local variables
+				// (local references always walk clickedAST directly).
+				if isPkgName {
+					return true
+				}
+				isLocal := obj.Parent() != nil && obj.Pkg() != nil && obj.Parent() != obj.Pkg().Scope()
+				if v, ok := obj.(*types.Var); ok && v.IsField() {
+					isLocal = false
+				}
+				if !isLocal {
+					entry.usesByName[obj.Name()] = append(entry.usesByName[obj.Name()], indexedIdentUse{
+						fileIdx: fIdx,
+						id:      id,
+						sel:     sel,
+						obj:     obj,
+					})
+				}
 			}
 			return true
 		})
@@ -1436,12 +1495,17 @@ func cloneImplsResult(r *ImplsResult) *ImplsResult {
 
 type refsCacheKey struct {
 	baseRev      string
+	reqTargetRev string
 	targetRev    string
+	goos         string
+	goarch       string
+	tagsSig      string
 	targetID     targetIdentity
 	defCleanFile string
 	defLine      int
 	defCol       int
 	isPkgClause  bool
+	diskDir      string // non-empty only for chained disk lookups (which also scan diskDir)
 }
 
 type refsLRU struct {
@@ -1500,13 +1564,19 @@ func (lru *refsLRU) put(key refsCacheKey, res *RefsResult) {
 
 type implsCacheKey struct {
 	baseRev          string
+	reqTargetRev     string
 	targetRev        string
+	goos             string
+	goarch           string
+	tagsSig          string
 	direction        string
 	targetID         targetIdentity
 	defCleanFile     string
 	defLine          int
 	defCol           int
 	targetMethodName string
+	pkgGroupDir      string
+	hasPkgGroup      bool
 }
 
 type implsLRU struct {
@@ -1589,6 +1659,7 @@ func (l *lookupLoader) loadCheckedPackage(dirInRepo, pkgName string, isTest bool
 	}
 
 	if entry := lru.get(key); entry != nil {
+		l.absorbDepFsets(entry.depFsets)
 		return entry
 	}
 
@@ -1597,6 +1668,7 @@ func (l *lookupLoader) loadCheckedPackage(dirInRepo, pkgName string, isTest bool
 		lru.mu.Lock()
 		if entry, ok := lru.items[key]; ok {
 			lru.mu.Unlock()
+			l.absorbDepFsets(entry.depFsets)
 			return entry
 		}
 		if waitCh, busy := lru.inflight[key]; busy {
@@ -1659,14 +1731,14 @@ func (l *lookupLoader) loadCheckedPackage(dirInRepo, pkgName string, isTest bool
 			}
 
 			if canMerkleChecked && len(matchedCheckedEntries) > 0 {
+				slices.SortFunc(matchedCheckedEntries, func(a, b *repoFileEntry) int {
+					return strings.Compare(path.Base(a.path), path.Base(b.path))
+				})
 				var baseDigest string
 				if strings.HasSuffix(pkgName, "_test") {
 					basePkg, err := l.loadInRepoTestBasePackage(rootImportPath, dirInRepo)
-					if err == nil && basePkg != nil {
-						l.inRepoPkgs[rootImportPath] = basePkg
-						if l.crossRevPkgs != nil {
-							baseDigest = l.crossRevPkgs.digestFor(basePkg)
-						}
+					if err == nil && basePkg != nil && l.crossRevPkgs != nil {
+						baseDigest = l.crossRevPkgs.digestFor(basePkg)
 					}
 					if baseDigest == "" {
 						canMerkleChecked = false
@@ -1688,47 +1760,21 @@ func (l *lookupLoader) loadCheckedPackage(dirInRepo, pkgName string, isTest bool
 					}
 					slices.Sort(directImports)
 
-					impDigests := make(map[string]string, len(directImports))
-					for _, imp := range directImports {
-						if l.loading[imp] {
-							canMerkleChecked = false
-							break
-						}
-						impPkg, err := l.Import(imp)
-						if err != nil || impPkg == nil {
-							canMerkleChecked = false
-							break
-						}
-						var d string
-						if impPkg == types.Unsafe {
-							d = "unsafe"
-						} else if l.diskCache != nil && l.diskCache.has(impPkg) {
-							d = "disk:" + impPkg.Path() + "@" + l.diskCache.dirFor(impPkg)
-						} else if l.crossRevPkgs != nil {
-							if cd := l.crossRevPkgs.digestFor(impPkg); cd != "" {
-								d = "repo:" + cd
-							}
-						}
-						if d == "" {
-							canMerkleChecked = false
-							break
-						}
-						impDigests[imp] = d
-					}
-
-					if canMerkleChecked {
+					impDigests, ok := l.computeImportDigests(directImports)
+					if ok {
 						checkedMerkleDigest = computeCheckedMerkleDigest(
 							l.req.RepoRoot, checkImportPath, dirInRepo, pkgName,
 							isTest, l.goos, l.goarch, l.buildTagsSig(),
 							baseDigest, matchedCheckedEntries, directImports, impDigests,
 						)
 						if hit := l.crossRevChecked.get(checkedMerkleDigest); hit != nil {
-							lru.put(key, hit)
+							l.absorbDepFsets(hit.depFsets)
 							if l.revCache != nil && len(hit.depFsets) > 0 {
 								for depPkg, depFset := range hit.depFsets {
 									l.revCache.registerPkgFset(depPkg, depFset)
 								}
 							}
+							lru.put(key, hit)
 							return hit
 						}
 					}
@@ -1817,9 +1863,9 @@ func (l *lookupLoader) loadCheckedPackage(dirInRepo, pkgName string, isTest bool
 		return emptyEntry
 	}
 
-	if strings.HasSuffix(pkgName, "_test") && l.inRepoPkgs[rootImportPath] == nil {
+	if strings.HasSuffix(pkgName, "_test") {
 		if basePkg, err := l.loadInRepoTestBasePackage(rootImportPath, dirInRepo); err == nil && basePkg != nil {
-			l.inRepoPkgs[rootImportPath] = basePkg
+			defer l.swapInRepoPkg(rootImportPath, basePkg)()
 		}
 	}
 
@@ -1858,6 +1904,16 @@ func (l *lookupLoader) loadCheckedPackage(dirInRepo, pkgName string, isTest bool
 	return entry
 }
 
+func (l *lookupLoader) publishCrossRevPkgHit(cacheKey diskCacheKey, hit *crossRevPkgEntry) {
+	l.absorbDepFsets(hit.depFsets)
+	if l.revCache != nil {
+		for depPkg, depFset := range hit.depFsets {
+			l.revCache.registerPkgFset(depPkg, depFset)
+		}
+		l.revCache.putWithMeta(cacheKey, hit.pkg, "", hit.fset)
+	}
+}
+
 func (l *lookupLoader) collectDepFsets(rootPkg *types.Package) map[*types.Package]*token.FileSet {
 	if rootPkg == nil {
 		return nil
@@ -1874,7 +1930,10 @@ func (l *lookupLoader) collectDepFsets(rootPkg *types.Package) map[*types.Packag
 			if imp == nil || visited[imp] {
 				continue
 			}
-			if l.revCache != nil {
+			if fs := l.localPkgFsets[imp]; fs != nil {
+				deps[imp] = fs
+			}
+			if _, ok := deps[imp]; !ok && l.revCache != nil {
 				if fs := l.revCache.fsetForPkg(imp); fs != nil {
 					deps[imp] = fs
 				}
@@ -1920,6 +1979,7 @@ func (l *lookupLoader) loadDiskCheckedPackage(importPath, absDir, pkgName string
 	}
 
 	if entry := lru.get(key); entry != nil {
+		l.absorbDepFsets(entry.depFsets)
 		return entry
 	}
 
@@ -1928,6 +1988,7 @@ func (l *lookupLoader) loadDiskCheckedPackage(importPath, absDir, pkgName string
 		lru.mu.Lock()
 		if entry, ok := lru.items[key]; ok {
 			lru.mu.Unlock()
+			l.absorbDepFsets(entry.depFsets)
 			return entry
 		}
 		if waitCh, busy := lru.inflight[key]; busy {
@@ -1998,10 +2059,12 @@ func (l *lookupLoader) loadDiskCheckedPackage(importPath, absDir, pkgName string
 		return emptyEntry
 	}
 
+	var basePkgImport string
+	var basePkg *types.Package
 	if strings.HasSuffix(pkgName, "_test") {
-		basePkgImport := strings.TrimSuffix(importPath, "_test")
-		if basePkg, err := l.loadDiskTestBasePackage(basePkgImport, absDir); err == nil && basePkg != nil {
-			l.inRepoPkgs[basePkgImport] = basePkg
+		basePkgImport = strings.TrimSuffix(importPath, "_test")
+		if bp, err := l.loadDiskTestBasePackage(basePkgImport, absDir); err == nil && bp != nil {
+			basePkg = bp
 		}
 	}
 
@@ -2014,10 +2077,21 @@ func (l *lookupLoader) loadDiskCheckedPackage(importPath, absDir, pkgName string
 
 	var importer types.Importer
 	if l.env.goroot != "" && strings.HasPrefix(absDir, filepath.Join(l.env.goroot, "src")+string(filepath.Separator)) {
-		importer = newStdlibImporter(l)
+		si := newStdlibImporter(l)
+		if basePkg != nil {
+			si.pkgs[basePkgImport] = basePkg
+		}
+		importer = si
 	} else if l.env.gomodcache != "" && strings.HasPrefix(absDir, filepath.Clean(l.env.gomodcache)+string(filepath.Separator)) {
-		importer = newModCacheImporter(l, absDir)
+		mci := newModCacheImporter(l, absDir)
+		if basePkg != nil {
+			mci.pkgs[basePkgImport] = basePkg
+		}
+		importer = mci
 	} else {
+		if basePkg != nil {
+			defer l.swapInRepoPkg(basePkgImport, basePkg)()
+		}
 		importer = l
 	}
 
@@ -2060,15 +2134,25 @@ func (dc *diskCache) get(key diskCacheKey) (*types.Package, bool) {
 }
 
 func (dc *diskCache) put(key diskCacheKey, p *types.Package) {
-	if p == nil {
+	dc.putWithMeta(key, p, key.absDir, nil)
+}
+
+func (dc *diskCache) putWithMeta(key diskCacheKey, p *types.Package, absDir string, fset *token.FileSet) {
+	if dc == nil || p == nil {
 		return
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
 	dc.pkgs[key] = p
 	dc.pkgSet[p] = struct{}{}
-	if key.absDir != "" {
-		dc.pkgDirs[p] = key.absDir
+	if absDir == "" {
+		absDir = key.absDir
+	}
+	if absDir != "" {
+		dc.pkgDirs[p] = absDir
+	}
+	if fset != nil {
+		dc.pkgFsets[p] = fset
 	}
 }
 
@@ -2080,15 +2164,6 @@ func (dc *diskCache) has(p *types.Package) bool {
 	defer dc.mu.RUnlock()
 	_, ok := dc.pkgSet[p]
 	return ok
-}
-
-func (dc *diskCache) position(pos token.Pos) token.Position {
-	if dc == nil || !pos.IsValid() {
-		return token.Position{}
-	}
-	dc.fsetMu.Lock()
-	defer dc.fsetMu.Unlock()
-	return dc.fset.Position(pos)
 }
 
 func (dc *diskCache) getGoFiles(repo vcs.Repo, rev string) ([]string, error) {
@@ -2138,13 +2213,7 @@ func (dc *diskCache) getRepoImports(ctx context.Context, repo vcs.Repo, rev stri
 		return nil, nil
 	}
 
-	var goFiles []string
-	var err error
-	if dc != nil {
-		goFiles, err = dc.getGoFiles(repo, rev)
-	} else {
-		goFiles, err = repo.ListGoFiles(rev)
-	}
+	goFiles, err := repo.ListGoFiles(rev)
 	if err != nil {
 		return nil, err
 	}
@@ -2184,13 +2253,6 @@ func (dc *diskCache) getRepoImports(ctx context.Context, repo vcs.Repo, rev stri
 		result = append(result, imp)
 	}
 	slices.Sort(result)
-
-	if dc != nil && ctx.Err() == nil {
-		dc.repoImportsMu.Lock()
-		dc.repoImports = result
-		dc.repoImportsMu.Unlock()
-	}
-
 	return result, nil
 }
 
@@ -2274,6 +2336,12 @@ func (c *fileReadCache) put(path string, data []byte) {
 	c.files[path] = data
 }
 
+type resolvedDirEntry struct {
+	dir    string
+	isDisk bool
+	err    error
+}
+
 type lookupLoader struct {
 	ctx             context.Context
 	req             LookupRequest
@@ -2291,33 +2359,63 @@ type lookupLoader struct {
 	fset            *token.FileSet
 	inRepoPkgs      map[string]*types.Package
 	testBasePkgs    map[string]*types.Package
+	localPkgFsets   map[*types.Package]*token.FileSet
+	resolvedDirs    map[string]resolvedDirEntry
 	loading         map[string]bool
 	diskLoading     map[diskCacheKey]bool
+}
+
+// inferPlatformFromFilename extracts trailing Go filename GOOS/GOARCH suffixes
+// (matching go/build rules: *_GOOS.go, *_GOARCH.go, *_GOOS_GOARCH.go, with optional _test).
+func inferPlatformFromFilename(filePath string) (goos, goarch string) {
+	base := filepath.Base(filePath)
+	if !strings.HasSuffix(base, ".go") {
+		return "", ""
+	}
+	stem := strings.TrimSuffix(base, ".go")
+	stem = strings.TrimSuffix(stem, "_test")
+	parts := strings.Split(stem, "_")
+	if len(parts) < 2 {
+		return "", ""
+	}
+	last := parts[len(parts)-1]
+	if knownGOARCH[last] {
+		goarch = last
+		if len(parts) >= 3 && knownGOOS[parts[len(parts)-2]] {
+			goos = parts[len(parts)-2]
+		}
+	} else if knownGOOS[last] {
+		goos = last
+	}
+	return goos, goarch
 }
 
 func newLookupLoader(ctx context.Context, req LookupRequest, mod *moduleInfo, dc *diskCache, rc *diskCache) *lookupLoader {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if mod == nil {
+		mod = &moduleInfo{
+			requires:    make(map[string]string),
+			replaces:    make(map[string]replaceTarget),
+			siblingMods: make(map[string]string),
+		}
+	}
 	env := getGoEnv()
 	goos := env.goos
 	goarch := env.goarch
 
-	// Adjust platform if file has explicit suffix
-	base := filepath.Base(req.FilePath)
-	extIdx := strings.LastIndex(base, ".go")
-	if extIdx != -1 {
-		stem := base[:extIdx]
-		parts := strings.Split(stem, "_")
-		if len(parts) >= 2 {
-			for _, part := range parts[1:] {
-				switch part {
-				case "windows", "darwin", "linux", "freebsd", "openbsd", "netbsd", "plan9", "solaris", "aix", "illumos":
-					goos = part
-				case "amd64", "arm64", "386", "arm", "riscv64", "ppc64", "ppc64le", "s390x", "wasm", "mips", "mipsle", "mips64", "mips64le":
-					goarch = part
-				}
-			}
+	// Adjust platform if the target file has an explicit trailing GOOS/GOARCH suffix.
+	hintPath := req.FilePath
+	if hintPath == "" {
+		hintPath = req.PkgFile
+	}
+	if fg, fa := inferPlatformFromFilename(hintPath); fg != "" || fa != "" {
+		if fg != "" {
+			goos = fg
+		}
+		if fa != "" {
+			goarch = fa
 		}
 	}
 
@@ -2336,8 +2434,24 @@ func newLookupLoader(ctx context.Context, req LookupRequest, mod *moduleInfo, dc
 		fset:            token.NewFileSet(),
 		inRepoPkgs:      make(map[string]*types.Package),
 		testBasePkgs:    make(map[string]*types.Package),
+		localPkgFsets:   make(map[*types.Package]*token.FileSet),
+		resolvedDirs:    make(map[string]resolvedDirEntry),
 		loading:         make(map[string]bool),
 		diskLoading:     make(map[diskCacheKey]bool),
+	}
+}
+
+func (l *lookupLoader) absorbDepFsets(deps map[*types.Package]*token.FileSet) {
+	if l == nil || len(deps) == 0 {
+		return
+	}
+	if l.localPkgFsets == nil {
+		l.localPkgFsets = make(map[*types.Package]*token.FileSet, len(deps))
+	}
+	for p, fs := range deps {
+		if p != nil && fs != nil {
+			l.localPkgFsets[p] = fs
+		}
 	}
 }
 
@@ -2357,6 +2471,14 @@ func (l *lookupLoader) clone() *lookupLoader {
 			testBase[k] = pkg
 		}
 	}
+	localFsets := make(map[*types.Package]*token.FileSet, len(l.localPkgFsets))
+	for p, fs := range l.localPkgFsets {
+		localFsets[p] = fs
+	}
+	resolvedDirs := make(map[string]resolvedDirEntry, len(l.resolvedDirs))
+	for k, v := range l.resolvedDirs {
+		resolvedDirs[k] = v
+	}
 	return &lookupLoader{
 		ctx:             l.ctx,
 		req:             l.req,
@@ -2374,9 +2496,75 @@ func (l *lookupLoader) clone() *lookupLoader {
 		fset:            token.NewFileSet(),
 		inRepoPkgs:      inRepo,
 		testBasePkgs:    testBase,
+		localPkgFsets:   localFsets,
+		resolvedDirs:    resolvedDirs,
 		loading:         make(map[string]bool),
 		diskLoading:     make(map[diskCacheKey]bool),
 	}
+}
+
+func (l *lookupLoader) swapInRepoPkg(importPath string, pkg *types.Package) func() {
+	prev, had := l.inRepoPkgs[importPath]
+	l.inRepoPkgs[importPath] = pkg
+	return func() {
+		if had {
+			l.inRepoPkgs[importPath] = prev
+		} else {
+			delete(l.inRepoPkgs, importPath)
+		}
+	}
+}
+
+// registerDepFsets publishes localPkgFsets for transitive dependencies of pkg
+// into l.revCache so cached packages reused on later requests still resolve
+// positions in non-diskCache (e.g. local replace) dependencies.
+func (l *lookupLoader) registerDepFsets(pkg *types.Package) {
+	if l == nil || l.revCache == nil || pkg == nil || len(l.localPkgFsets) == 0 {
+		return
+	}
+	visited := make(map[*types.Package]bool)
+	var walk func(p *types.Package)
+	walk = func(p *types.Package) {
+		if p == nil || visited[p] {
+			return
+		}
+		visited[p] = true
+		if fs := l.localPkgFsets[p]; fs != nil {
+			l.revCache.registerPkgFset(p, fs)
+		}
+		for _, imp := range p.Imports() {
+			walk(imp)
+		}
+	}
+	walk(pkg)
+}
+
+func (l *lookupLoader) computeImportDigests(directImports []string) (map[string]string, bool) {
+	impDigests := make(map[string]string, len(directImports))
+	for _, imp := range directImports {
+		if l.loading[imp] {
+			return nil, false
+		}
+		impPkg, err := l.Import(imp)
+		if err != nil || impPkg == nil {
+			return nil, false
+		}
+		var d string
+		if impPkg == types.Unsafe {
+			d = "unsafe"
+		} else if l.diskCache != nil && l.diskCache.has(impPkg) {
+			d = "disk:" + impPkg.Path() + "@" + l.diskCache.dirFor(impPkg)
+		} else if l.crossRevPkgs != nil {
+			if cd := l.crossRevPkgs.digestFor(impPkg); cd != "" {
+				d = "repo:" + cd
+			}
+		}
+		if d == "" {
+			return nil, false
+		}
+		impDigests[imp] = d
+	}
+	return impDigests, true
 }
 
 func (l *lookupLoader) positionFor(obj types.Object, rootPkg *types.Package) token.Position {
@@ -2388,6 +2576,9 @@ func (l *lookupLoader) positionFor(obj types.Object, rootPkg *types.Package) tok
 	if pkg == nil || pkg == rootPkg {
 		return l.fset.Position(objPos)
 	}
+	if fs := l.localPkgFsets[pkg]; fs != nil {
+		return fs.Position(objPos)
+	}
 	if l.crossRevPkgs != nil {
 		if fset := l.crossRevPkgs.fsetFor(pkg); fset != nil {
 			return fset.Position(objPos)
@@ -2397,16 +2588,10 @@ func (l *lookupLoader) positionFor(obj types.Object, rootPkg *types.Package) tok
 		if pos, ok := l.revCache.positionForPkg(pkg, objPos); ok {
 			return pos
 		}
-		if l.revCache.has(pkg) {
-			return l.revCache.position(objPos)
-		}
 	}
 	if l.diskCache != nil {
 		if pos, ok := l.diskCache.positionForPkg(pkg, objPos); ok {
 			return pos
-		}
-		if l.diskCache.has(pkg) {
-			return l.diskCache.position(objPos)
 		}
 	}
 	return l.fset.Position(objPos)
@@ -2426,7 +2611,9 @@ func (l *lookupLoader) buildTagsSig() string {
 		parts = append(parts, fmt.Sprintf("rel=%d", len(l.releaseTags)))
 	}
 	if len(parts) == 0 {
-		return "custom"
+		// GOOS/GOARCH are already part of every cache key, so don't split cache
+		// entries when only GOOS/GOARCH changed.
+		return ""
 	}
 	return strings.Join(parts, ";")
 }
@@ -2586,11 +2773,24 @@ func (l *lookupLoader) loadInRepoPackage(importPath, dirInRepo string, ignoreFun
 				return pkg, nil
 			}
 			if waitCh, busy := l.revCache.inflight[cacheKey]; busy {
+				if l.revCache.wouldDeadlockLocked(l, cacheKey) {
+					l.revCache.mu.Unlock()
+					stub := types.NewPackage(importPath, guessPkgName(importPath))
+					stub.MarkComplete()
+					return stub, nil
+				}
+				l.revCache.waitingOn[l] = cacheKey
 				l.revCache.mu.Unlock()
 				select {
 				case <-waitCh:
+					l.revCache.mu.Lock()
+					delete(l.revCache.waitingOn, l)
+					l.revCache.mu.Unlock()
 					continue
 				case <-l.ctx.Done():
+					l.revCache.mu.Lock()
+					delete(l.revCache.waitingOn, l)
+					l.revCache.mu.Unlock()
 					stub := types.NewPackage(importPath, guessPkgName(importPath))
 					stub.MarkComplete()
 					return stub, l.ctx.Err()
@@ -2598,12 +2798,14 @@ func (l *lookupLoader) loadInRepoPackage(importPath, dirInRepo string, ignoreFun
 			}
 			doneCh = make(chan struct{})
 			l.revCache.inflight[cacheKey] = doneCh
+			l.revCache.inflightOwner[cacheKey] = l
 			l.revCache.mu.Unlock()
 			break
 		}
 		defer func() {
 			l.revCache.mu.Lock()
 			delete(l.revCache.inflight, cacheKey)
+			delete(l.revCache.inflightOwner, cacheKey)
 			l.revCache.mu.Unlock()
 			close(doneCh)
 		}()
@@ -2641,6 +2843,9 @@ func (l *lookupLoader) loadInRepoPackage(importPath, dirInRepo string, ignoreFun
 			}
 
 			if canMerkle && len(matchedEntries) > 0 {
+				slices.SortFunc(matchedEntries, func(a, b *repoFileEntry) int {
+					return strings.Compare(path.Base(a.path), path.Base(b.path))
+				})
 				impMap := make(map[string]bool)
 				for _, e := range matchedEntries {
 					for _, imp := range e.imports {
@@ -2655,42 +2860,13 @@ func (l *lookupLoader) loadInRepoPackage(importPath, dirInRepo string, ignoreFun
 				}
 				slices.Sort(directImports)
 
-				impDigests := make(map[string]string, len(directImports))
-				for _, imp := range directImports {
-					if l.loading[imp] {
-						canMerkle = false
-						break
-					}
-					impPkg, err := l.Import(imp)
-					if err != nil || impPkg == nil {
-						canMerkle = false
-						break
-					}
-					var d string
-					if impPkg == types.Unsafe {
-						d = "unsafe"
-					} else if l.diskCache != nil && l.diskCache.has(impPkg) {
-						d = "disk:" + impPkg.Path() + "@" + l.diskCache.dirFor(impPkg)
-					} else if cd := l.crossRevPkgs.digestFor(impPkg); cd != "" {
-						d = "repo:" + cd
-					} else {
-						canMerkle = false
-						break
-					}
-					impDigests[imp] = d
-				}
-
-				if canMerkle {
+				if impDigests, ok := l.computeImportDigests(directImports); ok {
 					merkleDigest = computePkgMerkleDigest(
 						l.req.RepoRoot, importPath, dirInRepo, l.goos, l.goarch, l.buildTagsSig(),
 						matchedEntries, directImports, impDigests,
 					)
 					if hit := l.crossRevPkgs.get(merkleDigest); hit != nil {
-						l.revCache.registerPkg(hit.pkg)
-						l.revCache.put(cacheKey, hit.pkg)
-						if hit.fset != nil {
-							l.revCache.registerPkgFset(hit.pkg, hit.fset)
-						}
+						l.publishCrossRevPkgHit(cacheKey, hit)
 						return hit.pkg, nil
 					}
 				}
@@ -2739,6 +2915,9 @@ func (l *lookupLoader) loadInRepoPackage(importPath, dirInRepo string, ignoreFun
 		if dirRepo, ok := l.req.Repo.(vcs.DirGoBlobRepo); ok && l.rev() != "working" {
 			blobs, err := dirRepo.ReadDirGoFiles(l.rev(), dirInRepo)
 			if err == nil {
+				slices.SortFunc(blobs, func(a, b vcs.GoFileBlobContent) int {
+					return strings.Compare(a.Name, b.Name)
+				})
 				for _, b := range blobs {
 					absDir := filepath.Join(l.req.RepoRoot, filepath.FromSlash(dirInRepo))
 					absPath := filepath.Join(absDir, b.Name)
@@ -2809,33 +2988,10 @@ func (l *lookupLoader) loadInRepoPackage(importPath, dirInRepo string, ignoreFun
 			}
 			slices.Sort(directImports)
 
-			canMerkleFallback := true
-			impDigests := make(map[string]string, len(directImports))
-			for _, imp := range directImports {
-				if l.loading[imp] {
-					canMerkleFallback = false
-					break
-				}
-				impPkg, err := l.Import(imp)
-				if err != nil || impPkg == nil {
-					canMerkleFallback = false
-					break
-				}
-				var d string
-				if impPkg == types.Unsafe {
-					d = "unsafe"
-				} else if l.diskCache != nil && l.diskCache.has(impPkg) {
-					d = "disk:" + impPkg.Path() + "@" + l.diskCache.dirFor(impPkg)
-				} else if cd := l.crossRevPkgs.digestFor(impPkg); cd != "" {
-					d = "repo:" + cd
-				} else {
-					canMerkleFallback = false
-					break
-				}
-				impDigests[imp] = d
-			}
-
-			if canMerkleFallback {
+			if impDigests, ok := l.computeImportDigests(directImports); ok {
+				slices.SortFunc(fallbackHashes, func(a, b fallbackFileHash) int {
+					return strings.Compare(a.name, b.name)
+				})
 				mh := sha256.New()
 				fmt.Fprintf(mh, "pkg:%s|%s|%s|%s|%s|%s\n", l.req.RepoRoot, importPath, dirInRepo, l.goos, l.goarch, l.buildTagsSig())
 				for _, fh := range fallbackHashes {
@@ -2846,11 +3002,7 @@ func (l *lookupLoader) loadInRepoPackage(importPath, dirInRepo string, ignoreFun
 				}
 				merkleDigest = hex.EncodeToString(mh.Sum(nil))
 				if hit := l.crossRevPkgs.get(merkleDigest); hit != nil {
-					l.revCache.registerPkg(hit.pkg)
-					l.revCache.put(cacheKey, hit.pkg)
-					if hit.fset != nil {
-						l.revCache.registerPkgFset(hit.pkg, hit.fset)
-					}
+					l.publishCrossRevPkgHit(cacheKey, hit)
 					return hit.pkg, nil
 				}
 			}
@@ -2877,12 +3029,11 @@ func (l *lookupLoader) loadInRepoPackage(importPath, dirInRepo string, ignoreFun
 	if pkg != nil {
 		if l.ctx.Err() == nil {
 			if merkleDigest != "" && l.crossRevPkgs != nil {
-				l.crossRevPkgs.put(l.req.RepoRoot, merkleDigest, pkg, targetFset)
+				l.crossRevPkgs.put(l.req.RepoRoot, merkleDigest, pkg, targetFset, l.collectDepFsets(pkg))
 			}
 			if useRevCache {
-				l.revCache.put(cacheKey, pkg)
-				l.revCache.registerPkg(pkg)
-				l.revCache.registerPkgFset(pkg, targetFset)
+				l.registerDepFsets(pkg)
+				l.revCache.putWithMeta(cacheKey, pkg, "", targetFset)
 			}
 		}
 		return pkg, nil
@@ -2905,37 +3056,57 @@ func (l *lookupLoader) loadDiskPackage(importPath, absDir string) (*types.Packag
 		return stub, nil
 	}
 
+	useDiskCache := l.diskCache != nil && isImmutableDiskDir(l.env, absDir)
 	var doneCh chan struct{}
-	for {
-		l.diskCache.mu.Lock()
-		if pkg, ok := l.diskCache.pkgs[key]; ok {
-			l.diskCache.mu.Unlock()
-			return pkg, nil
-		}
-		if waitCh, busy := l.diskCache.inflight[key]; busy {
-			l.diskCache.mu.Unlock()
-			select {
-			case <-waitCh:
-				continue
-			case <-l.ctx.Done():
-				stub := types.NewPackage(importPath, guessPkgName(importPath))
-				stub.MarkComplete()
-				return stub, l.ctx.Err()
+	if useDiskCache {
+		for {
+			l.diskCache.mu.Lock()
+			if pkg, ok := l.diskCache.pkgs[key]; ok {
+				l.diskCache.mu.Unlock()
+				return pkg, nil
 			}
+			if waitCh, busy := l.diskCache.inflight[key]; busy {
+				if l.diskCache.wouldDeadlockLocked(l, key) {
+					l.diskCache.mu.Unlock()
+					stub := types.NewPackage(importPath, guessPkgName(importPath))
+					stub.MarkComplete()
+					return stub, nil
+				}
+				l.diskCache.waitingOn[l] = key
+				l.diskCache.mu.Unlock()
+				select {
+				case <-waitCh:
+					l.diskCache.mu.Lock()
+					delete(l.diskCache.waitingOn, l)
+					l.diskCache.mu.Unlock()
+					continue
+				case <-l.ctx.Done():
+					l.diskCache.mu.Lock()
+					delete(l.diskCache.waitingOn, l)
+					l.diskCache.mu.Unlock()
+					stub := types.NewPackage(importPath, guessPkgName(importPath))
+					stub.MarkComplete()
+					return stub, l.ctx.Err()
+				}
+			}
+			doneCh = make(chan struct{})
+			l.diskCache.inflight[key] = doneCh
+			l.diskCache.inflightOwner[key] = l
+			l.diskCache.mu.Unlock()
+			break
 		}
-		doneCh = make(chan struct{})
-		l.diskCache.inflight[key] = doneCh
-		l.diskCache.mu.Unlock()
-		break
 	}
 
 	l.diskLoading[key] = true
 	defer func() {
 		delete(l.diskLoading, key)
-		l.diskCache.mu.Lock()
-		delete(l.diskCache.inflight, key)
-		l.diskCache.mu.Unlock()
-		close(doneCh)
+		if useDiskCache {
+			l.diskCache.mu.Lock()
+			delete(l.diskCache.inflight, key)
+			delete(l.diskCache.inflightOwner, key)
+			l.diskCache.mu.Unlock()
+			close(doneCh)
+		}
 	}()
 
 	entries, err := os.ReadDir(absDir)
@@ -2968,7 +3139,7 @@ func (l *lookupLoader) loadDiskPackage(importPath, absDir string) (*types.Packag
 	if len(astFiles) == 0 {
 		stub := types.NewPackage(importPath, guessPkgName(importPath))
 		stub.MarkComplete()
-		if l.ctx.Err() == nil {
+		if useDiskCache && l.ctx.Err() == nil {
 			l.diskCache.put(key, stub)
 		}
 		return stub, nil
@@ -2992,17 +3163,18 @@ func (l *lookupLoader) loadDiskPackage(importPath, absDir string) (*types.Packag
 
 	pkg, err := conf.Check(importPath, localFset, astFiles, nil)
 	if pkg != nil {
-		if l.ctx.Err() == nil {
-			l.diskCache.put(key, pkg)
-			l.diskCache.registerPkgDir(pkg, absDir)
-			l.diskCache.registerPkgFset(pkg, localFset)
+		if l.localPkgFsets != nil {
+			l.localPkgFsets[pkg] = localFset
+		}
+		if useDiskCache && l.ctx.Err() == nil {
+			l.diskCache.putWithMeta(key, pkg, absDir, localFset)
 		}
 		return pkg, nil
 	}
 
 	stub := types.NewPackage(importPath, guessPkgName(importPath))
 	stub.MarkComplete()
-	if l.ctx.Err() == nil {
+	if useDiskCache && l.ctx.Err() == nil {
 		l.diskCache.put(key, stub)
 	}
 	return stub, err
@@ -3176,6 +3348,19 @@ func (l *lookupLoader) hasInRepoGoFiles(dirInRepo string) bool {
 }
 
 func (l *lookupLoader) resolvePackageDir(importPath string) (dir string, isDisk bool, err error) {
+	if l.resolvedDirs != nil {
+		if cached, ok := l.resolvedDirs[importPath]; ok {
+			return cached.dir, cached.isDisk, cached.err
+		}
+	}
+	dir, isDisk, err = l.resolvePackageDirUncached(importPath)
+	if l.resolvedDirs != nil {
+		l.resolvedDirs[importPath] = resolvedDirEntry{dir: dir, isDisk: isDisk, err: err}
+	}
+	return dir, isDisk, err
+}
+
+func (l *lookupLoader) resolvePackageDirUncached(importPath string) (dir string, isDisk bool, err error) {
 	if !isSafeImportPath(importPath) {
 		return "", false, fmt.Errorf("invalid import path %q", importPath)
 	}
@@ -3206,14 +3391,21 @@ func (l *lookupLoader) resolvePackageDir(importPath string) (dir string, isDisk 
 		if rep.isLocal {
 			cleanLocal := filepath.ToSlash(filepath.Clean(rep.path))
 			if !filepath.IsAbs(rep.path) {
+				baseDir := l.mod.modDir
+				if rep.hasBaseDir {
+					baseDir = rep.baseDir
+				}
 				inRepoTarget := cleanLocal
-				if l.mod.modDir != "" {
-					inRepoTarget = path.Join(l.mod.modDir, cleanLocal)
+				if baseDir != "" {
+					inRepoTarget = path.Join(baseDir, cleanLocal)
 				}
 				if sub != "" {
 					inRepoTarget = path.Join(inRepoTarget, sub)
 				}
 				inRepoTarget = path.Clean(inRepoTarget)
+				if inRepoTarget == "." {
+					inRepoTarget = ""
+				}
 				if !strings.HasPrefix(inRepoTarget, "..") {
 					if l.hasInRepoGoFiles(inRepoTarget) {
 						return inRepoTarget, false, nil
@@ -3239,40 +3431,42 @@ func (l *lookupLoader) resolvePackageDir(importPath string) (dir string, isDisk 
 		}
 	}
 
-	// 3. In-repo module
-	if l.mod.modPath != "" {
-		if importPath == l.mod.modPath {
-			if l.hasInRepoGoFiles(l.mod.modDir) {
-				return l.mod.modDir, false, nil
-			}
-		} else if strings.HasPrefix(importPath, l.mod.modPath+"/") {
-			sub := strings.TrimPrefix(importPath, l.mod.modPath+"/")
-			inRepoDir := sub
-			if l.mod.modDir != "" {
-				inRepoDir = path.Join(l.mod.modDir, sub)
-			}
-			if l.hasInRepoGoFiles(inRepoDir) {
-				return inRepoDir, false, nil
-			}
-		}
+	// 3. In-repo module and go.work siblings (longest matching module path prefix first)
+	type modMatch struct {
+		modPath string
+		modDir  string
 	}
-
-	// 4. In-repo siblings
+	var modMatches []modMatch
+	if l.mod.modPath != "" && (importPath == l.mod.modPath || strings.HasPrefix(importPath, l.mod.modPath+"/")) {
+		modMatches = append(modMatches, modMatch{modPath: l.mod.modPath, modDir: l.mod.modDir})
+	}
 	for sibMod, sibDir := range l.mod.siblingMods {
-		if importPath == sibMod {
-			if l.hasInRepoGoFiles(sibDir) {
-				return sibDir, false, nil
+		if importPath == sibMod || strings.HasPrefix(importPath, sibMod+"/") {
+			modMatches = append(modMatches, modMatch{modPath: sibMod, modDir: sibDir})
+		}
+	}
+	slices.SortFunc(modMatches, func(a, b modMatch) int {
+		if len(a.modPath) != len(b.modPath) {
+			return len(b.modPath) - len(a.modPath)
+		}
+		return strings.Compare(a.modPath, b.modPath)
+	})
+	for _, mm := range modMatches {
+		inRepoDir := mm.modDir
+		if importPath != mm.modPath {
+			sub := strings.TrimPrefix(importPath, mm.modPath+"/")
+			if mm.modDir != "" {
+				inRepoDir = path.Join(mm.modDir, sub)
+			} else {
+				inRepoDir = sub
 			}
-		} else if strings.HasPrefix(importPath, sibMod+"/") {
-			sub := strings.TrimPrefix(importPath, sibMod+"/")
-			inRepoDir := path.Join(sibDir, sub)
-			if l.hasInRepoGoFiles(inRepoDir) {
-				return inRepoDir, false, nil
-			}
+		}
+		if l.hasInRepoGoFiles(inRepoDir) {
+			return inRepoDir, false, nil
 		}
 	}
 
-	// 5. In-repo std
+	// 4. In-repo std
 	if l.mod.modPath == "std" {
 		inRepoDir := path.Join(l.mod.modDir, importPath)
 		if l.hasInRepoGoFiles(inRepoDir) {
@@ -3280,12 +3474,12 @@ func (l *lookupLoader) resolvePackageDir(importPath string) (dir string, isDisk 
 		}
 	}
 
-	// 6. Subpackage-aware requires in go.mod (GOMODCACHE)
+	// 5. Subpackage-aware requires in go.mod (GOMODCACHE)
 	if targetDir, ok := l.mod.resolveRequireDir(importPath, l.env.gomodcache); ok {
 		return targetDir, true, nil
 	}
 
-	// 7. Automatic $GOMODCACHE fallback when not in go.mod
+	// 6. Automatic $GOMODCACHE fallback when not in go.mod
 	firstSeg := importPath
 	if idx := strings.Index(firstSeg, "/"); idx != -1 {
 		firstSeg = firstSeg[:idx]
@@ -3335,6 +3529,9 @@ func (l *lookupLoader) resolvePackageDir(importPath string) (dir string, isDisk 
 			if bestDir != "" {
 				if l.diskCache != nil {
 					l.diskCache.modMu.Lock()
+					if len(l.diskCache.semverDirs) >= 4096 {
+						l.diskCache.semverDirs = make(map[string]string, 256)
+					}
 					l.diskCache.semverDirs[cacheKey] = bestDir
 					l.diskCache.modMu.Unlock()
 				}
@@ -3343,16 +3540,21 @@ func (l *lookupLoader) resolvePackageDir(importPath string) (dir string, isDisk 
 		}
 	}
 
-	// 8. $GOPATH/src fallback
+	// 7. $GOPATH/src fallback (supports multi-entry GOPATH lists)
 	if l.env.gopath != "" {
-		gpSrc := filepath.Join(l.env.gopath, "src")
-		gpDir := filepath.Join(gpSrc, filepath.FromSlash(importPath))
-		if isWithinDir(gpSrc, gpDir) && dirHasGoFiles(gpDir) {
-			return gpDir, true, nil
+		for _, gp := range filepath.SplitList(l.env.gopath) {
+			if gp == "" {
+				continue
+			}
+			gpSrc := filepath.Join(gp, "src")
+			gpDir := filepath.Join(gpSrc, filepath.FromSlash(importPath))
+			if isWithinDir(gpSrc, gpDir) && dirHasGoFiles(gpDir) {
+				return gpDir, true, nil
+			}
 		}
 	}
 
-	// 9. Stdlib on disk
+	// 8. Stdlib on disk
 	if l.env.goroot != "" {
 		stdSrc := filepath.Join(l.env.goroot, "src")
 		stdDir := filepath.Join(stdSrc, filepath.FromSlash(importPath))
@@ -3389,22 +3591,37 @@ func (l *lookupLoader) loadInRepoTestBasePackage(importPath, dirInRepo string) (
 				return pkg, nil
 			}
 			if ch, ok := l.revCache.inflight[cacheKey]; ok {
+				if l.revCache.wouldDeadlockLocked(l, cacheKey) {
+					l.revCache.mu.Unlock()
+					stub := types.NewPackage(importPath, guessPkgName(importPath))
+					stub.MarkComplete()
+					return stub, nil
+				}
+				l.revCache.waitingOn[l] = cacheKey
 				l.revCache.mu.Unlock()
 				select {
 				case <-ch:
+					l.revCache.mu.Lock()
+					delete(l.revCache.waitingOn, l)
+					l.revCache.mu.Unlock()
 					continue
 				case <-l.ctx.Done():
+					l.revCache.mu.Lock()
+					delete(l.revCache.waitingOn, l)
+					l.revCache.mu.Unlock()
 					return nil, l.ctx.Err()
 				}
 			}
 			doneCh = make(chan struct{})
 			l.revCache.inflight[cacheKey] = doneCh
+			l.revCache.inflightOwner[cacheKey] = l
 			l.revCache.mu.Unlock()
 			break
 		}
 		defer func() {
 			l.revCache.mu.Lock()
 			delete(l.revCache.inflight, cacheKey)
+			delete(l.revCache.inflightOwner, cacheKey)
 			l.revCache.mu.Unlock()
 			close(doneCh)
 		}()
@@ -3442,6 +3659,9 @@ func (l *lookupLoader) loadInRepoTestBasePackage(importPath, dirInRepo string) (
 			}
 
 			if canMerkle && len(matchedEntries) > 0 {
+				slices.SortFunc(matchedEntries, func(a, b *repoFileEntry) int {
+					return strings.Compare(a.path, b.path)
+				})
 				impMap := make(map[string]bool)
 				for _, e := range matchedEntries {
 					for _, imp := range e.imports {
@@ -3456,44 +3676,14 @@ func (l *lookupLoader) loadInRepoTestBasePackage(importPath, dirInRepo string) (
 				}
 				slices.Sort(directImports)
 
-				impDigests := make(map[string]string, len(directImports))
-				for _, imp := range directImports {
-					if l.loading[imp] {
-						canMerkle = false
-						break
-					}
-					impPkg, err := l.Import(imp)
-					if err != nil || impPkg == nil {
-						canMerkle = false
-						break
-					}
-					var d string
-					if impPkg == types.Unsafe {
-						d = "unsafe"
-					} else if l.diskCache != nil && l.diskCache.has(impPkg) {
-						d = "disk:" + impPkg.Path() + "@" + l.diskCache.dirFor(impPkg)
-					} else if cd := l.crossRevPkgs.digestFor(impPkg); cd != "" {
-						d = "repo:" + cd
-					} else {
-						canMerkle = false
-						break
-					}
-					impDigests[imp] = d
-				}
-
-				if canMerkle {
+				if impDigests, ok := l.computeImportDigests(directImports); ok {
 					merkleDigest = computePkgMerkleDigest(
 						l.req.RepoRoot, importPath+"#testbase", dirInRepo, l.goos, l.goarch, l.buildTagsSig(),
 						matchedEntries, directImports, impDigests,
 					)
 					if hit := l.crossRevPkgs.get(merkleDigest); hit != nil {
-						l.revCache.registerPkg(hit.pkg)
-						l.revCache.put(cacheKey, hit.pkg)
-						if hit.fset != nil {
-							l.revCache.registerPkgFset(hit.pkg, hit.fset)
-						}
+						l.publishCrossRevPkgHit(cacheKey, hit)
 						l.testBasePkgs[importPath] = hit.pkg
-						l.inRepoPkgs[importPath] = hit.pkg
 						return hit.pkg, nil
 					}
 				}
@@ -3596,16 +3786,14 @@ func (l *lookupLoader) loadInRepoTestBasePackage(importPath, dirInRepo string) (
 	if pkg != nil {
 		if l.ctx.Err() == nil {
 			if merkleDigest != "" && l.crossRevPkgs != nil {
-				l.crossRevPkgs.put(l.req.RepoRoot, merkleDigest, pkg, targetFset)
+				l.crossRevPkgs.put(l.req.RepoRoot, merkleDigest, pkg, targetFset, l.collectDepFsets(pkg))
 			}
 			if useRevCache {
-				l.revCache.put(cacheKey, pkg)
-				l.revCache.registerPkg(pkg)
-				l.revCache.registerPkgFset(pkg, targetFset)
+				l.registerDepFsets(pkg)
+				l.revCache.putWithMeta(cacheKey, pkg, "", targetFset)
 			}
 		}
 		l.testBasePkgs[importPath] = pkg
-		l.inRepoPkgs[importPath] = pkg
 		return pkg, nil
 	}
 	stub := types.NewPackage(importPath, basePkgName)
@@ -3625,7 +3813,7 @@ func (l *lookupLoader) loadDiskTestBasePackage(importPath, absDir string) (*type
 		return pkg, nil
 	}
 
-	useDiskCache := l.diskCache != nil
+	useDiskCache := l.diskCache != nil && isImmutableDiskDir(l.env, absDir)
 	var cacheKey diskCacheKey
 	var doneCh chan struct{}
 	if useDiskCache {
@@ -3638,22 +3826,37 @@ func (l *lookupLoader) loadDiskTestBasePackage(importPath, absDir string) (*type
 				return pkg, nil
 			}
 			if ch, ok := l.diskCache.inflight[cacheKey]; ok {
+				if l.diskCache.wouldDeadlockLocked(l, cacheKey) {
+					l.diskCache.mu.Unlock()
+					stub := types.NewPackage(importPath, guessPkgName(importPath))
+					stub.MarkComplete()
+					return stub, nil
+				}
+				l.diskCache.waitingOn[l] = cacheKey
 				l.diskCache.mu.Unlock()
 				select {
 				case <-ch:
+					l.diskCache.mu.Lock()
+					delete(l.diskCache.waitingOn, l)
+					l.diskCache.mu.Unlock()
 					continue
 				case <-l.ctx.Done():
+					l.diskCache.mu.Lock()
+					delete(l.diskCache.waitingOn, l)
+					l.diskCache.mu.Unlock()
 					return nil, l.ctx.Err()
 				}
 			}
 			doneCh = make(chan struct{})
 			l.diskCache.inflight[cacheKey] = doneCh
+			l.diskCache.inflightOwner[cacheKey] = l
 			l.diskCache.mu.Unlock()
 			break
 		}
 		defer func() {
 			l.diskCache.mu.Lock()
 			delete(l.diskCache.inflight, cacheKey)
+			delete(l.diskCache.inflightOwner, cacheKey)
 			l.diskCache.mu.Unlock()
 			close(doneCh)
 		}()
@@ -3671,10 +3874,7 @@ func (l *lookupLoader) loadDiskTestBasePackage(importPath, absDir string) (*type
 	}
 
 	bctx, fc := l.makeBuildContextWithCache()
-	targetFset := l.fset
-	if useDiskCache {
-		targetFset = l.diskCache.fset
-	}
+	targetFset := token.NewFileSet()
 	var astFiles []*ast.File
 	var basePkgName string
 
@@ -3688,15 +3888,7 @@ func (l *lookupLoader) loadDiskTestBasePackage(importPath, absDir string) (*type
 			continue
 		}
 		filePath := filepath.Join(absDir, name)
-		var f *ast.File
-		var err error
-		if useDiskCache {
-			l.diskCache.fsetMu.Lock()
-			f, err = parser.ParseFile(targetFset, filePath, data, parser.SkipObjectResolution)
-			l.diskCache.fsetMu.Unlock()
-		} else {
-			f, err = parser.ParseFile(targetFset, filePath, data, parser.SkipObjectResolution)
-		}
+		f, err := parseGoFile(targetFset, filePath, data, parser.SkipObjectResolution, true)
 		if err != nil || f == nil {
 			continue
 		}
@@ -3739,13 +3931,13 @@ func (l *lookupLoader) loadDiskTestBasePackage(importPath, absDir string) (*type
 
 	pkg, err := conf.Check(importPath, targetFset, astFiles, nil)
 	if pkg != nil {
+		if l.localPkgFsets != nil {
+			l.localPkgFsets[pkg] = targetFset
+		}
 		if useDiskCache && l.ctx.Err() == nil {
-			l.diskCache.put(cacheKey, pkg)
-			l.diskCache.registerPkg(pkg)
-			l.diskCache.registerPkgDir(pkg, absDir)
+			l.diskCache.putWithMeta(cacheKey, pkg, absDir, targetFset)
 		}
 		l.testBasePkgs[importPath] = pkg
-		l.inRepoPkgs[importPath] = pkg
 		return pkg, nil
 	}
 	stub := types.NewPackage(importPath, basePkgName)
@@ -3761,11 +3953,16 @@ func parseBuildConstraints(content []byte) constraint.Expr {
 	scanner := bufio.NewScanner(bytes.NewReader(content))
 	var goBuildExpr constraint.Expr
 	var plusBuildExprs []constraint.Expr
+	var pendingPlusBuild []constraint.Expr
 	inBlockComment := false
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
+			if !inBlockComment && len(pendingPlusBuild) > 0 {
+				plusBuildExprs = append(plusBuildExprs, pendingPlusBuild...)
+				pendingPlusBuild = pendingPlusBuild[:0]
+			}
 			continue
 		}
 
@@ -3803,8 +4000,9 @@ func parseBuildConstraints(content []byte) constraint.Expr {
 					}
 				}
 			} else if constraint.IsPlusBuild(line) {
+				// Legacy // +build lines only apply if followed by a blank line before package.
 				if expr, err := constraint.Parse(line); err == nil && expr != nil {
-					plusBuildExprs = append(plusBuildExprs, expr)
+					pendingPlusBuild = append(pendingPlusBuild, expr)
 				}
 			}
 			continue
@@ -3865,12 +4063,24 @@ func collectTags(expr constraint.Expr) (allTags []string, posTags []string) {
 	return allTags, posTags
 }
 
+var unixGOOS = map[string]bool{
+	"aix": true, "android": true, "darwin": true, "dragonfly": true,
+	"freebsd": true, "hurd": true, "illumos": true, "ios": true,
+	"linux": true, "netbsd": true, "openbsd": true, "solaris": true,
+}
+
 var knownGOOS = map[string]bool{
 	"aix": true, "android": true, "darwin": true, "dragonfly": true,
 	"freebsd": true, "hurd": true, "illumos": true, "ios": true,
 	"js": true, "linux": true, "nacl": true, "netbsd": true,
 	"openbsd": true, "plan9": true, "solaris": true, "wasip1": true,
 	"windows": true, "zos": true,
+}
+
+var orderedGOOS = []string{
+	"linux", "darwin", "freebsd", "windows", "plan9",
+	"openbsd", "netbsd", "dragonfly", "solaris", "illumos",
+	"android", "ios", "aix", "hurd", "zos", "wasip1", "js", "nacl",
 }
 
 var knownGOARCH = map[string]bool{
@@ -3880,6 +4090,13 @@ var knownGOARCH = map[string]bool{
 	"s390x": true, "sparc": true, "sparc64": true, "wasm": true,
 }
 
+var orderedGOARCH = []string{
+	"amd64", "arm64", "386", "arm", "riscv64",
+	"ppc64le", "ppc64", "s390x", "loong64",
+	"mips64", "mips64le", "mips", "mipsle",
+	"sparc64", "sparc", "wasm",
+}
+
 func inferBuildConfig(clickedBytes []byte, defaultGOOS, defaultGOARCH string, defaultReleaseTags []string) (goos, goarch string, buildTags, releaseTags []string, custom bool) {
 	expr := parseBuildConstraints(clickedBytes)
 	if expr == nil {
@@ -3887,14 +4104,18 @@ func inferBuildConfig(clickedBytes []byte, defaultGOOS, defaultGOARCH string, de
 	}
 
 	eval := func(gos, garch string, tags []string, rels []string) bool {
-		tagSet := make(map[string]bool, len(tags)+len(rels)+3)
+		tagSet := make(map[string]bool, len(tags)+len(rels)+5)
 		if gos != "" {
 			tagSet[gos] = true
+			if unixGOOS[gos] {
+				tagSet["unix"] = true
+			}
 		}
 		if garch != "" {
 			tagSet[garch] = true
 		}
 		tagSet["cgo"] = true
+		tagSet["gc"] = true
 		for _, rt := range rels {
 			tagSet[rt] = true
 		}
@@ -3917,25 +4138,42 @@ func inferBuildConfig(clickedBytes []byte, defaultGOOS, defaultGOARCH string, de
 	}
 
 	var customTags []string
-	var candidateGOOS []string
-	var candidateGOARCH []string
-
-	candidateGOOS = append(candidateGOOS, defaultGOOS)
-	candidateGOARCH = append(candidateGOARCH, defaultGOARCH)
+	candidateGOOS := []string{defaultGOOS}
+	candidateGOARCH := []string{defaultGOARCH}
+	hasGOOS := false
+	hasGOARCH := false
 
 	for _, tag := range allTags {
 		if knownGOOS[tag] {
+			hasGOOS = true
 			if !slices.Contains(candidateGOOS, tag) {
 				candidateGOOS = append(candidateGOOS, tag)
 			}
+		} else if tag == "unix" {
+			hasGOOS = true
 		} else if knownGOARCH[tag] {
+			hasGOARCH = true
 			if !slices.Contains(candidateGOARCH, tag) {
 				candidateGOARCH = append(candidateGOARCH, tag)
 			}
-		} else if strings.HasPrefix(tag, "go1.") || tag == "cgo" {
-			// standard release / cgo tag
+		} else if strings.HasPrefix(tag, "go1.") || tag == "cgo" || tag == "gc" {
+			// standard release / compiler / cgo tag
 		} else {
 			customTags = append(customTags, tag)
+		}
+	}
+	if hasGOOS {
+		for _, fb := range orderedGOOS {
+			if !slices.Contains(candidateGOOS, fb) {
+				candidateGOOS = append(candidateGOOS, fb)
+			}
+		}
+	}
+	if hasGOARCH {
+		for _, fb := range orderedGOARCH {
+			if !slices.Contains(candidateGOARCH, fb) {
+				candidateGOARCH = append(candidateGOARCH, fb)
+			}
 		}
 	}
 

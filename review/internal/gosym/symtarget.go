@@ -39,24 +39,8 @@ func buildSymbolTarget(req LookupRequest, target *resolvedTarget) *SymbolTarget 
 		return nil
 	}
 
-	// 1. Built-ins and universe objects (e.g. error, error.Error, append, make)
-	if obj.Pkg() == nil {
-		name := obj.Name()
-		if name == "" {
-			return nil
-		}
-		owner := ""
-		if name == "Error" {
-			owner = "error"
-		}
-		return &SymbolTarget{
-			Kind:  "builtin",
-			Name:  name,
-			Owner: owner,
-		}
-	}
-
-	// 2. Package names (imports and package clauses)
+	// 1. Package names (imports and package clauses). Check before obj.Pkg() == nil
+	// because synthetic PkgNames (e.g. from doclinks or external symbols) may have nil Pkg().
 	if pkgName, ok := obj.(*types.PkgName); ok {
 		imported := pkgName.Imported()
 		if imported == nil || imported.Path() == "C" {
@@ -98,6 +82,23 @@ func buildSymbolTarget(req LookupRequest, target *resolvedTarget) *SymbolTarget 
 			st.Origin = filepath.ToSlash(req.FilePath)
 		}
 		return st
+	}
+
+	// 2. Built-ins and universe objects (e.g. error, error.Error, append, make)
+	if obj.Pkg() == nil {
+		name := obj.Name()
+		if name == "" {
+			return nil
+		}
+		owner := ""
+		if name == "Error" {
+			owner = "error"
+		}
+		return &SymbolTarget{
+			Kind:  "builtin",
+			Name:  name,
+			Owner: owner,
+		}
 	}
 
 	// 3. Declared package-level symbols, methods, and struct fields
@@ -315,10 +316,11 @@ func (a *Analyzer) resolveTargetBySymbol(ctx context.Context, req LookupRequest,
 				return nil, nil
 			}
 
+			var restoreBase func()
 			if isExternalTest {
 				basePkgImport := cleanPathToImport(mod, dirInRepo)
 				if basePkg, err := loader.loadInRepoTestBasePackage(basePkgImport, dirInRepo); err == nil && basePkg != nil {
-					loader.inRepoPkgs[basePkgImport] = basePkg
+					restoreBase = loader.swapInRepoPkg(basePkgImport, basePkg)
 				}
 			}
 
@@ -335,6 +337,9 @@ func (a *Analyzer) resolveTargetBySymbol(ctx context.Context, req LookupRequest,
 				Error:            func(error) {},
 			}
 			rootPkg, _ = conf.Check(rootImportPath, loader.fset, pkgASTFiles, info)
+			if restoreBase != nil {
+				restoreBase()
+			}
 			if rootPkg == nil {
 				return nil, nil
 			}
@@ -434,7 +439,7 @@ func (a *Analyzer) resolveTargetBySymbol(ctx context.Context, req LookupRequest,
 			pName = guessPkgName(st.Pkg)
 		}
 		imported := types.NewPackage(st.Pkg, pName)
-		pkgObj := types.NewPkgName(token.NoPos, nil, pName, imported)
+		pkgObj := types.NewPkgName(token.NoPos, imported, pName, imported)
 		return &resolvedTarget{
 			rev:            rev,
 			isChained:      true,

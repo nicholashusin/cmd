@@ -9614,3 +9614,631 @@ func TestSecurityImportPathTraversal(t *testing.T) {
 		}
 	}
 }
+
+func TestGoSymPolishRegressions(t *testing.T) {
+	t.Run("FormatSignatureAliasGenericsTypeParam", func(t *testing.T) {
+		src := `package p
+type MyInt = int
+type Box[T comparable] struct { V T }
+func ID[T any](v T) T { return v }
+`
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, "p.go", src, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var conf types.Config
+		pkg, err := conf.Check("example.com/p", fset, []*ast.File{f}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := formatSignature(pkg.Scope().Lookup("MyInt"), pkg); got != "type MyInt = int" {
+			t.Errorf("alias signature = %q, want %q", got, "type MyInt = int")
+		}
+		if got := formatSignature(pkg.Scope().Lookup("Box"), pkg); got != "type Box[T comparable] struct" {
+			t.Errorf("generic struct signature = %q, want %q", got, "type Box[T comparable] struct")
+		}
+		fn := pkg.Scope().Lookup("ID").(*types.Func)
+		tpObj := fn.Type().(*types.Signature).TypeParams().At(0).Obj()
+		if got := formatSignature(tpObj, pkg); got != "type parameter T any" {
+			t.Errorf("type param signature = %q, want %q", got, "type parameter T any")
+		}
+	})
+
+	t.Run("FilenamePlatformAndBuildConstraints", func(t *testing.T) {
+		cases := []struct {
+			path       string
+			goos, arch string
+		}{
+			{"foo_linux_arm64.go", "linux", "arm64"},
+			{"foo_windows_test.go", "windows", ""},
+			{"foo_amd64_test.go", "", "amd64"},
+			{"my_linux_helper.go", "", ""},
+			{"arm_support.go", "", ""},
+		}
+		for _, tc := range cases {
+			g, a := inferPlatformFromFilename(tc.path)
+			if g != tc.goos || a != tc.arch {
+				t.Errorf("inferPlatformFromFilename(%q) = (%q, %q), want (%q, %q)", tc.path, g, a, tc.goos, tc.arch)
+			}
+		}
+
+		// Legacy // +build without a blank line before package must be ignored.
+		if expr := parseBuildConstraints([]byte("// +build ignore\npackage p\n")); expr != nil {
+			t.Errorf("expected +build without blank line to be ignored, got %v", expr)
+		}
+		if expr := parseBuildConstraints([]byte("// +build ignore\n\npackage p\n")); expr == nil {
+			t.Errorf("expected +build with blank line to be parsed")
+		}
+		// Implicit unix and gc tags must be recognized without treating them as custom tags.
+		goos, _, tags, _, custom := inferBuildConfig([]byte("//go:build unix && gc\n\npackage p\n"), "linux", "amd64", build.Default.ReleaseTags)
+		if custom || goos != "linux" || len(tags) != 0 {
+			t.Errorf("unix&&gc on linux = (%q, %v, custom=%v), want default", goos, tags, custom)
+		}
+		goos, _, tags, _, custom = inferBuildConfig([]byte("//go:build unix\n\npackage p\n"), "windows", "amd64", build.Default.ReleaseTags)
+		if !custom || goos != "linux" || len(tags) != 0 {
+			t.Errorf("unix on windows = (%q, %v, custom=%v), want linux without custom tags", goos, tags, custom)
+		}
+		goos, _, tags, _, custom = inferBuildConfig([]byte("//go:build unix && !linux\n\npackage p\n"), "linux", "amd64", build.Default.ReleaseTags)
+		if !custom || goos != "darwin" || len(tags) != 0 {
+			t.Errorf("unix && !linux on linux = (%q, %v, custom=%v), want darwin without custom tags", goos, tags, custom)
+		}
+		goos, _, tags, _, custom = inferBuildConfig([]byte("//go:build !unix\n\npackage p\n"), "linux", "amd64", build.Default.ReleaseTags)
+		if !custom || goos != "windows" || len(tags) != 0 {
+			t.Errorf("!unix on linux = (%q, %v, custom=%v), want windows without custom tags", goos, tags, custom)
+		}
+		goos, _, tags, _, custom = inferBuildConfig([]byte("//go:build !unix && !windows\n\npackage p\n"), "linux", "amd64", build.Default.ReleaseTags)
+		if !custom || goos != "plan9" || len(tags) != 0 {
+			t.Errorf("!unix && !windows on linux = (%q, %v, custom=%v), want plan9 without custom tags", goos, tags, custom)
+		}
+		goos, _, tags, _, custom = inferBuildConfig([]byte("//go:build !linux\n\npackage p\n"), "linux", "amd64", build.Default.ReleaseTags)
+		if !custom || goos != "darwin" || len(tags) != 0 {
+			t.Errorf("!linux on linux = (%q, %v, custom=%v), want darwin without custom tags", goos, tags, custom)
+		}
+		_, goarch, tags, _, custom := inferBuildConfig([]byte("//go:build !amd64\n\npackage p\n"), "linux", "amd64", build.Default.ReleaseTags)
+		if !custom || goarch != "arm64" || len(tags) != 0 {
+			t.Errorf("!amd64 on amd64 = (%q, %v, custom=%v), want arm64 without custom tags", goarch, tags, custom)
+		}
+		_, goarch, tags, _, custom = inferBuildConfig([]byte("//go:build !amd64 && !arm64 && !386\n\npackage p\n"), "linux", "amd64", build.Default.ReleaseTags)
+		if !custom || goarch != "arm" || len(tags) != 0 {
+			t.Errorf("!amd64 && !arm64 && !386 on amd64 = (%q, %v, custom=%v), want arm without custom tags", goarch, tags, custom)
+		}
+		_, goarch, tags, _, custom = inferBuildConfig([]byte("//go:build !amd64 && !386 && !arm && !arm64 && !loong64 && !ppc64 && !ppc64le && !riscv64 && !s390x\n\npackage p\n"), "linux", "amd64", build.Default.ReleaseTags)
+		if !custom || goarch != "mips64" || len(tags) != 0 {
+			t.Errorf("stdlib generic fallback arch = (%q, %v, custom=%v), want mips64 without custom tags", goarch, tags, custom)
+		}
+		for _, td := range []string{"testdata", "testdata/a.go", "pkg/testdata", "pkg/testdata/a.go"} {
+			if !isTestdataPath(td) {
+				t.Errorf("isTestdataPath(%q) = false, want true", td)
+			}
+		}
+		for _, nonTD := range []string{"pkg/testdatas/a.go", "mytestdata/a.go", "a.go"} {
+			if isTestdataPath(nonTD) {
+				t.Errorf("isTestdataPath(%q) = true, want false", nonTD)
+			}
+		}
+	})
+
+	t.Run("CleanPathToImportLongestPrefixAndNilSafe", func(t *testing.T) {
+		if got := cleanPathToImport(nil, "a/b"); got != "a/b" {
+			t.Errorf("nil mod cleanPathToImport = %q, want a/b", got)
+		}
+		mod := &moduleInfo{
+			modPath: "example.com/root",
+			modDir:  "",
+			siblingMods: map[string]string{
+				"example.com/sub":        "sub",
+				"example.com/sub/nested": "sub/nested",
+			},
+		}
+		if got := cleanPathToImport(mod, "sub/nested/pkg"); got != "example.com/sub/nested/pkg" {
+			t.Errorf("nested sibling = %q, want example.com/sub/nested/pkg", got)
+		}
+		if got := cleanPathToImport(mod, "sub/other"); got != "example.com/sub/other" {
+			t.Errorf("sibling = %q, want example.com/sub/other", got)
+		}
+	})
+
+	t.Run("FindInterfaceMethodUnexportedPkgDisambiguation", func(t *testing.T) {
+		p1 := types.NewPackage("example.com/p1", "p1")
+		p2 := types.NewPackage("example.com/p2", "p2")
+		sig := types.NewSignatureType(nil, nil, nil, nil, nil, false)
+		m1 := types.NewFunc(token.NoPos, p1, "secret", sig)
+		m2 := types.NewFunc(token.NoPos, p2, "secret", sig)
+		iface := types.NewInterfaceType([]*types.Func{m1, m2}, nil).Complete()
+		if got := findInterfaceMethod(iface, m2); got != m2 {
+			t.Errorf("findInterfaceMethod(m2) = %v, want %v", got, m2)
+		}
+	})
+
+	t.Run("DocLinkStubBlankInitBuiltinAndBatchSymTarget", func(t *testing.T) {
+		dir := t.TempDir()
+		runGit := func(args ...string) string {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(),
+				"GIT_AUTHOR_NAME=Tester",
+				"GIT_AUTHOR_EMAIL=tester@example.com",
+				"GIT_COMMITTER_NAME=Tester",
+				"GIT_COMMITTER_EMAIL=tester@example.com",
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		runGit("init", "-b", "main")
+		_ = os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/reg\n\ngo 1.22\n"), 0644)
+		src := `package reg
+
+import _ "fmt"
+
+// Handles [read/write] and [error.Error].
+func init() {
+	_, _ = 1, 2
+}
+
+func Helper() int { return 42 }
+func Use() int { return Helper() }
+`
+		_ = os.WriteFile(filepath.Join(dir, "reg.go"), []byte(src), 0644)
+		runGit("add", ".")
+		runGit("commit", "-m", "init")
+		rev := runGit("rev-parse", "HEAD")
+
+		repo, err := vcs.Open(dir, vcs.NewCache())
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := NewAnalyzer()
+		defer a.Close()
+		ctx := context.Background()
+
+		// Prose [read/write] must NOT resolve as a bogus stub package.
+		if res, err := a.Lookup(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "reg.go", Line: 5, UTF16Col: 14,
+		}); err != nil || res.Found {
+			t.Errorf("expected [read/write] not to resolve, got %+v err=%v", res, err)
+		}
+
+		// Builtin doclink [error.Error] should resolve with builtin#error URL.
+		if res, err := a.Lookup(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "reg.go", Line: 5, UTF16Col: 31,
+		}); err != nil || !res.Found || res.PkgGoDevURL != "https://pkg.go.dev/builtin#error" {
+			t.Errorf("expected [error.Error] builtin#error, got %+v err=%v", res, err)
+		}
+
+		// func init() must not emit a SymTarget.
+		if res, err := a.Lookup(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "reg.go", Line: 6, UTF16Col: 6,
+		}); err != nil || !res.Found || res.SymTarget != nil {
+			t.Errorf("expected func init() Found=true SymTarget=nil, got %+v err=%v", res, err)
+		}
+
+		// Blank identifier '_' must not resolve.
+		if res, err := a.Lookup(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "reg.go", Line: 7, UTF16Col: 1,
+		}); err != nil || res.Found {
+			t.Errorf("expected blank '_' Found=false, got %+v err=%v", res, err)
+		}
+
+		// ReferencesBatch with >=2 requests exercises the real batched path and populates SymTarget.
+		batch, err := a.ReferencesBatch(ctx, []LookupRequest{
+			{
+				Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+				Side: "R", FilePath: "reg.go", Line: 10, UTF16Col: 6,
+			},
+			{
+				Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+				Side: "R", FilePath: "reg.go", Line: 11, UTF16Col: 6,
+			},
+		})
+		if err != nil || len(batch) != 2 || !batch[0].Found || batch[0].SymTarget == nil || batch[0].SymTarget.Name != "Helper" {
+			t.Errorf("expected ReferencesBatch[0] SymTarget=Helper, got %+v err=%v", batch, err)
+		}
+		if len(batch) == 2 && (!batch[1].Found || batch[1].SymTarget == nil || batch[1].SymTarget.Name != "Use") {
+			t.Errorf("expected ReferencesBatch[1] SymTarget=Use, got %+v", batch)
+		}
+
+		// Chained lookup in builtin.go on "append" should resolve append, not error.
+		if bc := getParsedBuiltin(getGoEnv().goroot); bc != nil {
+			for i, l := range bc.lines {
+				if idx := strings.Index(l, "func append("); idx >= 0 {
+					res, err := a.Lookup(ctx, LookupRequest{
+						Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+						Side: "R", PkgImportPath: "builtin", PkgFile: "builtin.go",
+						Line: i + 1, UTF16Col: idx + 6,
+					})
+					if err != nil || !res.Found || res.SymbolName != "append" {
+						t.Errorf("chained builtin append = %+v err=%v", res, err)
+					}
+					break
+				}
+			}
+		}
+	})
+
+	t.Run("AuditPass1GoSymEdgeCases", func(t *testing.T) {
+		// 1. buildPkgGoDevURL must match exact interface method and skip type aliases.
+		srcIface := `package dup
+type Alpha interface { Close() error }
+type AliasBeta = Beta
+type Beta interface { Close() error }
+`
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, "dup.go", srcIface, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var conf types.Config
+		pkg, err := conf.Check("example.com/dup", fset, []*ast.File{f}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		betaIface := pkg.Scope().Lookup("Beta").Type().Underlying().(*types.Interface)
+		betaClose := betaIface.ExplicitMethod(0)
+		gotURL := buildPkgGoDevURL(betaClose, nil, nil, "", false, nil, goEnv{})
+		if gotURL != "https://pkg.go.dev/example.com/dup#Beta.Close" {
+			t.Errorf("buildPkgGoDevURL(Beta.Close) = %q, want #Beta.Close", gotURL)
+		}
+
+		// 2. Repo-level tests: blank/aliased doclinks, PkgName vs var shadowing,
+		//    external symbol declInRepo=false, and embedded unexported interface method impls.
+		dir := t.TempDir()
+		runGit := func(args ...string) string {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(),
+				"GIT_AUTHOR_NAME=Tester",
+				"GIT_AUTHOR_EMAIL=tester@example.com",
+				"GIT_COMMITTER_NAME=Tester",
+				"GIT_COMMITTER_EMAIL=tester@example.com",
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		runGit("init", "-b", "main")
+		_ = os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/audit1\n\ngo 1.22\n"), 0644)
+		_ = os.MkdirAll(filepath.Join(dir, "p1"), 0755)
+		_ = os.MkdirAll(filepath.Join(dir, "p2"), 0755)
+		_ = os.MkdirAll(filepath.Join(dir, "shadow"), 0755)
+
+		// p1 defines unexported method secret() in exported interface Secret, plus export_test.go helper.
+		_ = os.WriteFile(filepath.Join(dir, "p1", "p1.go"), []byte(`package p1
+
+type Secret interface {
+	secret()
+}
+
+type ValidImpl struct{}
+func (ValidImpl) secret() {}
+`), 0644)
+		_ = os.WriteFile(filepath.Join(dir, "p1", "export_test.go"), []byte(`package p1
+
+func ExportedForTest() int { return 7 }
+`), 0644)
+		_ = os.WriteFile(filepath.Join(dir, "p1", "p1_test.go"), []byte(`package p1_test
+
+import myp1 "example.com/audit1/p1"
+
+// Doclink via aliased import: [myp1.ExportedForTest] and full path [example.com/audit1/p1.ExportedForTest].
+func UseExportedForTest() int {
+	return myp1.ExportedForTest()
+}
+`), 0644)
+
+		// p2 embeds p1.Secret in Wrapper and defines a fake type with its own p2.secret() (must NOT match!).
+		_ = os.WriteFile(filepath.Join(dir, "p2", "p2.go"), []byte(`package p2
+
+import (
+	_ "io"
+	myfmt "fmt"
+	"example.com/audit1/p1"
+)
+
+type Wrapper interface {
+	p1.Secret
+}
+
+type FakeImpl struct{}
+func (FakeImpl) secret() {}
+
+type RealImpl struct{ p1.ValidImpl }
+
+// Links: [io] [io.Reader] [fmt] [fmt.Println] [myfmt.Println]
+func Use() {
+	_, _ = myfmt.Println("hi")
+}
+`), 0644)
+
+		// shadow package has `var fmt = 1`, `func Get()`, `type Box struct { Get int }`, and `func (*Box) Get()`.
+		_ = os.WriteFile(filepath.Join(dir, "shadow", "a.go"), []byte(`package shadow
+
+var fmt = 1
+
+func ReadVar() int { return fmt }
+
+func Get() int { return 1 }
+
+type Box struct {
+	Get int
+}
+
+type Holder struct{}
+func (*Holder) Get() int { return 2 }
+
+func UseGet(b Box, h *Holder) int {
+	Get := 99
+	return Get + b.Get + h.Get()
+}
+
+func RealUseGet() int { return Get() }
+`), 0644)
+		_ = os.WriteFile(filepath.Join(dir, "shadow", "b.go"), []byte(`package shadow
+
+import "fmt"
+
+func PrintHi() { _ = fmt.Sprint("hi") }
+`), 0644)
+
+		runGit("add", ".")
+		runGit("commit", "-m", "init")
+		rev := runGit("rev-parse", "HEAD")
+
+		repo, err := vcs.Open(dir, vcs.NewCache())
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := NewAnalyzer()
+		defer a.Close()
+		ctx := context.Background()
+
+		// Blank-imported [io] / [io.Reader] and differently-aliased [fmt] / [fmt.Println] must NOT resolve.
+		for _, tc := range []struct {
+			label string
+			col   int
+		}{
+			{"[io]", 12},
+			{"[io.Reader]", 20},
+			{"[fmt]", 29},
+			{"[fmt.Println]", 39},
+		} {
+			res, err := a.Lookup(ctx, LookupRequest{
+				Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+				Side: "R", FilePath: "p2/p2.go", Line: 18, UTF16Col: tc.col,
+			})
+			if err != nil || res.Found {
+				t.Errorf("expected blank/aliased doclink %s not to resolve, got %+v err=%v", tc.label, res, err)
+			}
+		}
+		// Aliased [myfmt.Println] MUST resolve.
+		resAlias, err := a.Lookup(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "p2/p2.go", Line: 18, UTF16Col: 55,
+		})
+		if err != nil || !resAlias.Found || resAlias.SymbolName != "Println" {
+			t.Errorf("expected [myfmt.Println] to resolve Println, got %+v err=%v", resAlias, err)
+		}
+
+		// References on `var fmt` in shadow/a.go must NOT match `import "fmt"` in shadow/b.go.
+		refsVar, err := a.References(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "shadow/a.go", Line: 3, UTF16Col: 5,
+		})
+		if err != nil || !refsVar.Found {
+			t.Fatalf("References(var fmt) failed: %+v err=%v", refsVar, err)
+		}
+		for _, r := range refsVar.Refs {
+			if r.Path == "shadow/b.go" {
+				t.Errorf("References(var fmt) falsely matched PkgName in shadow/b.go: %+v", r)
+			}
+		}
+
+		// References on package-level `func Get` must ONLY match RealUseGet (line 21),
+		// NOT local var `Get`, struct field `b.Get`, or method `h.Get()`.
+		refsGet, err := a.References(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "shadow/a.go", Line: 7, UTF16Col: 6,
+		})
+		if err != nil || !refsGet.Found {
+			t.Fatalf("References(func Get) failed: %+v err=%v", refsGet, err)
+		}
+		if len(refsGet.Refs) != 1 || refsGet.Refs[0].Line != 21 {
+			t.Errorf("References(func Get) = %+v, want single ref on line 21", refsGet.Refs)
+		}
+
+		// Implementations on p1.Secret invoked from p2/p2.go (where p1 is already in revCache)
+		// must still report valid file/line for p1.ValidImpl.
+		implsFromP2, err := a.Implementations(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "p2/p2.go", Line: 10, UTF16Col: 5,
+		})
+		if err != nil || !implsFromP2.Found {
+			t.Fatalf("Implementations(p1.Secret from p2) failed: %+v err=%v", implsFromP2, err)
+		}
+		foundP1ValidPos := false
+		for _, im := range implsFromP2.Implementations {
+			if strings.Contains(im.Name, "ValidImpl") && im.Path == "p1/p1.go" && im.Line == 7 {
+				foundP1ValidPos = true
+			}
+		}
+		if !foundP1ValidPos {
+			t.Errorf("expected ValidImpl at p1/p1.go:7 from p2 lookup, got %+v", implsFromP2.Implementations)
+		}
+
+		// Implementations on p1.Secret.secret must find p1.ValidImpl (and p2.RealImpl), NOT p2.FakeImpl.
+		impls, err := a.Implementations(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "p1/p1.go", Line: 4, UTF16Col: 3,
+		})
+		if err != nil || !impls.Found {
+			t.Fatalf("Implementations(p1.Secret.secret) failed: %+v err=%v", impls, err)
+		}
+		var sawValid, sawReal, sawFake bool
+		for _, im := range impls.Implementations {
+			switch {
+			case strings.Contains(im.Name, "ValidImpl"):
+				sawValid = true
+			case strings.Contains(im.Name, "RealImpl"):
+				sawReal = true
+			case strings.Contains(im.Name, "FakeImpl"):
+				sawFake = true
+			}
+		}
+		if !sawValid || !sawReal || sawFake {
+			t.Errorf("Implementations(p1.Secret.secret): sawValid=%v sawReal=%v sawFake=%v; got %+v", sawValid, sawReal, sawFake, impls.Implementations)
+		}
+
+		// Clicking stdlib fmt.Println in p2/p2.go must classify refs with declInRepo=false
+		// (so shadow/b.go is in RefGroupRepo, not RefGroupPackage).
+		refsPrint, err := a.References(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "p2/p2.go", Line: 20, UTF16Col: 17,
+		})
+		if err != nil || !refsPrint.Found {
+			t.Fatalf("References(fmt.Println) failed: %+v err=%v", refsPrint, err)
+		}
+		for _, r := range refsPrint.Refs {
+			if r.Path == "p2/p2.go" && r.Group == RefGroupPackage {
+				t.Errorf("external stdlib symbol fmt.Println falsely marked RefGroupPackage in caller package p2: %+v", r)
+			}
+		}
+
+		// Aliased import doclink in external *_test package must resolve export_test.go symbols via info.Defs.
+		resExtAlias, err := a.Lookup(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "p1/p1_test.go", Line: 5, UTF16Col: 42,
+		})
+		if err != nil || !resExtAlias.Found || resExtAlias.SymbolName != "ExportedForTest" {
+			t.Errorf("expected [myp1.ExportedForTest] to resolve ExportedForTest, got %+v err=%v", resExtAlias, err)
+		}
+
+		// Full-path doclink in external *_test package must also resolve base package's export_test.go symbols.
+		resExtFull, err := a.Lookup(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev, TargetRev: rev,
+			Side: "R", FilePath: "p1/p1_test.go", Line: 5, UTF16Col: 95,
+		})
+		if err != nil || !resExtFull.Found || resExtFull.SymbolName != "ExportedForTest" {
+			t.Errorf("expected [example.com/audit1/p1.ExportedForTest] to resolve ExportedForTest, got %+v err=%v", resExtFull, err)
+		}
+
+		// ResolveExternalFile must fall back from "<pkg>_test" to "<pkg>" for external test files.
+		if _, data, ok := a.ResolveExternalFile(ctx, ExternalFileRequest{
+			Repo: repo, Rev: rev,
+			PkgImportPath: "example.com/audit1/p1_test", PkgFile: "p1_test.go",
+		}); !ok || !strings.Contains(string(data), "UseExportedForTest") {
+			t.Errorf("ResolveExternalFile(example.com/audit1/p1_test/p1_test.go) failed: ok=%v len=%d", ok, len(data))
+		}
+		if _, data, ok := a.ResolveExternalFile(ctx, ExternalFileRequest{
+			Repo: repo, Rev: rev,
+			PkgImportPath: "strings_test", PkgFile: "strings_test.go",
+		}); !ok || len(data) == 0 {
+			t.Errorf("ResolveExternalFile(strings_test/strings_test.go) failed: ok=%v len=%d", ok, len(data))
+		}
+	})
+
+	t.Run("CrossRevPkgCacheDepFsetsAfterEviction", func(t *testing.T) {
+		dir := t.TempDir()
+		runGit := func(args ...string) string {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(),
+				"GIT_AUTHOR_NAME=Tester",
+				"GIT_AUTHOR_EMAIL=tester@example.com",
+				"GIT_COMMITTER_NAME=Tester",
+				"GIT_COMMITTER_EMAIL=tester@example.com",
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		runGit("init", "-b", "main")
+		_ = os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/fsetevict\n\ngo 1.22\n"), 0644)
+		_ = os.MkdirAll(filepath.Join(dir, "a"), 0755)
+		_ = os.MkdirAll(filepath.Join(dir, "b"), 0755)
+		_ = os.MkdirAll(filepath.Join(dir, "c"), 0755)
+		_ = os.WriteFile(filepath.Join(dir, "a", "a.go"), []byte("package a\n\ntype Base struct {\n\tValue int\n}\n"), 0644)
+		_ = os.WriteFile(filepath.Join(dir, "b", "b.go"), []byte("package b\n\nimport \"example.com/fsetevict/a\"\n\ntype Wrap struct {\n\ta.Base\n}\n"), 0644)
+		_ = os.WriteFile(filepath.Join(dir, "c", "c.go"), []byte("package c\n\nfunc Dummy() int { return 1 }\n"), 0644)
+		mainSrc := `package main
+
+import (
+	"example.com/fsetevict/b"
+	"example.com/fsetevict/c"
+)
+
+func Use(w b.Wrap) int {
+	return w.Value + c.Dummy()
+}
+`
+		_ = os.WriteFile(filepath.Join(dir, "main.go"), []byte(mainSrc), 0644)
+		runGit("add", ".")
+		runGit("commit", "-m", "rev1")
+		rev1 := runGit("rev-parse", "HEAD")
+
+		// Second revision modifies only main.go so rev2 has a fresh revCache while a & b are unchanged.
+		_ = os.WriteFile(filepath.Join(dir, "main.go"), []byte("// rev2\n"+mainSrc), 0644)
+		runGit("add", ".")
+		runGit("commit", "-m", "rev2")
+		rev2 := runGit("rev-parse", "HEAD")
+
+		repo, err := vcs.Open(dir, vcs.NewCache())
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := NewAnalyzer()
+		defer a.Close()
+		// Cap=2 forces FIFO eviction of a_v1 once c is cached, while b_v1 stays cached.
+		a.crossRevPkgs = &crossRevPkgCache{
+			cap:      2,
+			byDigest: make(map[string]*crossRevPkgEntry, 2),
+			byPkg:    make(map[*types.Package]crossRevPkgMeta, 2),
+		}
+		a.crossRevChecked = nil
+		ctx := context.Background()
+
+		res1, err := a.Lookup(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev1, TargetRev: rev1,
+			Side: "R", FilePath: "main.go", Line: 9, UTF16Col: 12,
+		})
+		if err != nil || !res1.Found || res1.DefPath != "a/a.go" || res1.DefLine != 4 {
+			t.Fatalf("rev1 Lookup(w.Value) = %+v err=%v, want a/a.go:4", res1, err)
+		}
+
+		// Verify a_v1 was actually evicted while b_v1 remained cached in crossRevPkgs.
+		var sawA, sawB bool
+		a.crossRevPkgs.mu.RLock()
+		for _, e := range a.crossRevPkgs.byDigest {
+			switch e.pkg.Path() {
+			case "example.com/fsetevict/a":
+				sawA = true
+			case "example.com/fsetevict/b":
+				sawB = true
+			}
+		}
+		a.crossRevPkgs.mu.RUnlock()
+		if sawA || !sawB {
+			t.Fatalf("unexpected crossRevPkgs state before rev2: sawA=%v sawB=%v (want sawA=false sawB=true)", sawA, sawB)
+		}
+
+		// rev2 hits cached b_v1 in crossRevPkgs even though a_v1 was evicted;
+		// depFsets must still resolve w.Value to a/a.go:4.
+		res2, err := a.Lookup(ctx, LookupRequest{
+			Repo: repo, RepoRoot: dir, BaseRev: rev2, TargetRev: rev2,
+			Side: "R", FilePath: "main.go", Line: 10, UTF16Col: 12,
+		})
+		if err != nil || !res2.Found || res2.DefPath != "a/a.go" || res2.DefLine != 4 {
+			t.Fatalf("rev2 Lookup(w.Value) after crossRevPkgs eviction = %+v err=%v, want a/a.go:4", res2, err)
+		}
+	})
+}
