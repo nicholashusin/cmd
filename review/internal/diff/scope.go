@@ -60,8 +60,8 @@ func ExtractScopes(filename string, src []byte, lines []string) []ScopeSpan {
 			for _, decl := range astFile.Decls {
 				switch d := decl.(type) {
 				case *ast.FuncDecl:
-					startLine := fset.Position(d.Pos()).Line
-					endLine := fset.Position(d.End()).Line
+					startLine := fset.PositionFor(d.Pos(), false).Line
+					endLine := fset.PositionFor(d.End(), false).Line
 					if startLine < 1 {
 						startLine = 1
 					}
@@ -82,7 +82,7 @@ func ExtractScopes(filename string, src []byte, lines []string) []ScopeSpan {
 						hdr = truncateRunes(hdr, 120)
 						var nameLine, nameCol int
 						if d.Name != nil {
-							nameLine, nameCol = identLineAndUTF16Col(lines, fset.Position(d.Name.Pos()))
+							nameLine, nameCol = identLineAndUTF16Col(lines, fset.PositionFor(d.Name.Pos(), false))
 						}
 						spans = append(spans, ScopeSpan{
 							StartLine: startLine,
@@ -98,14 +98,14 @@ func ExtractScopes(filename string, src []byte, lines []string) []ScopeSpan {
 					}
 					for _, spec := range d.Specs {
 						ts, ok := spec.(*ast.TypeSpec)
-						if !ok {
+						if !ok || ts.Name == nil {
 							continue
 						}
-						startLine := fset.Position(ts.Pos()).Line
+						startLine := fset.PositionFor(ts.Pos(), false).Line
 						if len(d.Specs) == 1 {
-							startLine = fset.Position(d.Pos()).Line
+							startLine = fset.PositionFor(d.Pos(), false).Line
 						}
-						endLine := fset.Position(ts.End()).Line
+						endLine := fset.PositionFor(ts.End(), false).Line
 						if startLine < 1 {
 							startLine = 1
 						}
@@ -136,10 +136,7 @@ func ExtractScopes(filename string, src []byte, lines []string) []ScopeSpan {
 						}
 						hdr := collapseSpaces("type " + ts.Name.Name + typeParams + " " + kindWord)
 						hdr = truncateRunes(hdr, 120)
-						var nameLine, nameCol int
-						if ts.Name != nil {
-							nameLine, nameCol = identLineAndUTF16Col(lines, fset.Position(ts.Name.Pos()))
-						}
+						nameLine, nameCol := identLineAndUTF16Col(lines, fset.PositionFor(ts.Name.Pos(), false))
 						spans = append(spans, ScopeSpan{
 							StartLine: startLine,
 							EndLine:   endLine,
@@ -201,17 +198,27 @@ func extractScopesPython(lines []string) []ScopeSpan {
 		opened     bool
 	}
 	var stack []pyScope
+	var inTriple byte
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		lineNum := i + 1
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-
-		codeWithoutComment, openParens, closeParens := pythonCodeAndParens(trimmed)
-		if codeWithoutComment == "" {
-			continue
+		var codeWithoutComment string
+		var openParens, closeParens int
+		if inTriple != 0 {
+			codeWithoutComment, openParens, closeParens, inTriple = pythonCodeAndParens(trimmed, inTriple)
+			// Docstring lines inside an already-opened scope must never close scopes via indent.
+			if len(stack) == 0 || stack[len(stack)-1].opened {
+				continue
+			}
+		} else {
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			codeWithoutComment, openParens, closeParens, inTriple = pythonCodeAndParens(trimmed, 0)
+			if codeWithoutComment == "" {
+				continue
+			}
 		}
 
 		indent := countLeadingSpaces(line)
@@ -219,14 +226,14 @@ func extractScopesPython(lines []string) []ScopeSpan {
 		// If top of stack is not opened yet, it's accumulating a multi-line def/class signature
 		if len(stack) > 0 && !stack[len(stack)-1].opened {
 			top := &stack[len(stack)-1]
-			if lineNum > top.startLine {
-				top.header += " " + trimmed
+			if lineNum > top.startLine && codeWithoutComment != "" {
+				top.header += " " + codeWithoutComment
 			}
 			top.parenDepth += openParens - closeParens
 			if top.parenDepth < 0 {
 				top.parenDepth = 0
 			}
-			if top.parenDepth == 0 && strings.HasSuffix(codeWithoutComment, ":") {
+			if inTriple == 0 && top.parenDepth == 0 && strings.HasSuffix(codeWithoutComment, ":") {
 				hdr := strings.TrimSuffix(top.header, ":")
 				hdr = cleanSignature(hdr)
 				hdr = truncateRunes(hdr, 120)
@@ -253,15 +260,15 @@ func extractScopesPython(lines []string) []ScopeSpan {
 			}
 		}
 
-		isDef := strings.HasPrefix(trimmed, "def ") || strings.HasPrefix(trimmed, "async def ")
-		isClass := strings.HasPrefix(trimmed, "class ")
+		isDef := strings.HasPrefix(codeWithoutComment, "def ") || strings.HasPrefix(codeWithoutComment, "async def ")
+		isClass := strings.HasPrefix(codeWithoutComment, "class ")
 		if (isDef || isClass) && indent <= 8 {
 			initParen := openParens - closeParens
 			if initParen < 0 {
 				initParen = 0
 			}
-			opened := (initParen == 0 && strings.HasSuffix(codeWithoutComment, ":"))
-			hdr := trimmed
+			opened := (inTriple == 0 && initParen == 0 && strings.HasSuffix(codeWithoutComment, ":"))
+			hdr := codeWithoutComment
 			if opened {
 				hdr = strings.TrimSuffix(hdr, ":")
 				hdr = cleanSignature(hdr)
@@ -301,9 +308,9 @@ func extractScopesPython(lines []string) []ScopeSpan {
 	return spans
 }
 
-func pythonCodeAndParens(s string) (codeWithoutComment string, openCount, closeCount int) {
-	inQuote := byte(0)
-	isTriple := false
+func pythonCodeAndParens(s string, inTriple byte) (codeWithoutComment string, openCount, closeCount int, outTriple byte) {
+	inQuote := inTriple
+	isTriple := inTriple != 0
 	var code strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -355,7 +362,10 @@ func pythonCodeAndParens(s string) (codeWithoutComment string, openCount, closeC
 			closeCount++
 		}
 	}
-	return strings.TrimSpace(code.String()), openCount, closeCount
+	if isTriple {
+		outTriple = inQuote
+	}
+	return strings.TrimSpace(code.String()), openCount, closeCount, outTriple
 }
 
 func isRustCharLiteral(s string, i int) bool {
@@ -363,12 +373,23 @@ func isRustCharLiteral(s string, i int) bool {
 		return false
 	}
 	if s[i+1] == '\\' {
-		// e.g. '\n', '\t', '\'', '\\', '\x7f', '\u{1234}'
-		rest := s[i+2:]
-		idx := strings.IndexByte(rest, '\'')
-		return idx >= 1 && idx <= 8
+		// e.g. '\n', '\t', '\'', '\\', '\x7f', '\u{10FFFF}'
+		if i+2 >= len(s) {
+			return false
+		}
+		idx := strings.IndexByte(s[i+3:], '\'')
+		return idx >= 0 && idx <= 8
 	}
-	return i+2 < len(s) && s[i+2] == '\''
+	_, w := utf8.DecodeRuneInString(s[i+1:])
+	return w > 0 && i+1+w < len(s) && s[i+1+w] == '\''
+}
+
+func isShellCommentStart(s string, i int) bool {
+	if i == 0 {
+		return true
+	}
+	prev := s[i-1]
+	return prev == ' ' || prev == '\t' || prev == ';' || prev == ')'
 }
 
 func stripLineComment(s string, lang Lang) string {
@@ -410,6 +431,9 @@ func stripLineComment(s string, lang Lang) string {
 				inQuote = c
 			}
 			continue
+		}
+		if lang == LangShell && c == '#' && isShellCommentStart(s, i) {
+			return strings.TrimSpace(s[:i])
 		}
 		if c == '/' && i+1 < len(s) {
 			if s[i+1] == '/' {
@@ -596,6 +620,9 @@ func countBraces(s string, inBlockComment *bool, lang Lang) (open, close, openPa
 				inQuote = c
 			}
 			continue
+		}
+		if lang == LangShell && c == '#' && isShellCommentStart(s, i) {
+			break
 		}
 		if c == '/' && i+1 < len(s) {
 			if s[i+1] == '/' {

@@ -489,3 +489,34 @@ func FuzzExtractScopes(f *testing.F) {
 		}
 	})
 }
+
+func TestExtractScopesEdgeCases(t *testing.T) {
+	// 1. Go file with //line directive must report physical line numbers.
+	goSrc := "package p\n\n//line fake.go:999\nfunc Physical() {\n\tprintln(1)\n}\n"
+	goScopes := ExtractScopes("p.go", []byte(goSrc), SplitLines([]byte(goSrc)))
+	if len(goScopes) != 1 || goScopes[0].StartLine != 4 || goScopes[0].EndLine != 6 {
+		t.Fatalf("Go //line directive scopes = %+v, want physical [4..6]", goScopes)
+	}
+
+	// 2. Python multi-line docstring with unindented text must not close def early,
+	//    and trailing # comment on def line must not leak into header.
+	pySrc := "def greet(name): # greeting\n    \"\"\"\ncolumn zero docstring line\n    \"\"\"\n    return name\n"
+	pyScopes := ExtractScopes("g.py", []byte(pySrc), SplitLines([]byte(pySrc)))
+	if len(pyScopes) != 1 || pyScopes[0].StartLine != 1 || pyScopes[0].EndLine != 5 || pyScopes[0].Header != "def greet(name)" {
+		t.Fatalf("Python docstring/comment scopes = %+v, want [1..5] 'def greet(name)'", pyScopes)
+	}
+
+	// 3. Rust escaped single-quote and max-length Unicode char literals must not desync brace tracking.
+	rsSrc := "fn parse<'a>(s: &'a str) -> char {\n    let a = '\\'';\n    let b = '\\u{10FFFF}';\n    if a == '}' { return b; }\n    a\n}\n"
+	rsScopes := ExtractScopes("p.rs", []byte(rsSrc), SplitLines([]byte(rsSrc)))
+	if len(rsScopes) != 1 || rsScopes[0].StartLine != 1 || rsScopes[0].EndLine != 6 {
+		t.Fatalf("Rust escaped char literal scopes = %+v, want [1..6]", rsScopes)
+	}
+
+	// 4. Python def with multi-line triple-quoted default argument must still close signature and parse following defs.
+	pyDefaultSrc := "def query(sql=\"\"\"SELECT *\nFROM t\"\"\"):\n    return sql\n\ndef after():\n    return 1\n"
+	pyDefaultScopes := ExtractScopes("q.py", []byte(pyDefaultSrc), SplitLines([]byte(pyDefaultSrc)))
+	if len(pyDefaultScopes) != 2 || pyDefaultScopes[0].StartLine != 1 || pyDefaultScopes[0].EndLine != 3 || pyDefaultScopes[1].StartLine != 5 || pyDefaultScopes[1].EndLine != 6 {
+		t.Fatalf("Python triple-quoted default arg scopes = %+v, want [1..3] and [5..6]", pyDefaultScopes)
+	}
+}

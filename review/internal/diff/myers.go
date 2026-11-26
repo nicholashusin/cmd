@@ -73,14 +73,30 @@ func SplitLines(data []byte) []string {
 	if len(data) == 0 {
 		return nil
 	}
-	raw := bytes.Split(data, []byte("\n"))
-	if len(raw) > 0 && len(raw[len(raw)-1]) == 0 {
-		raw = raw[:len(raw)-1]
+	if data[len(data)-1] == '\n' {
+		data = data[:len(data)-1]
+		if len(data) == 0 {
+			return []string{""}
+		}
 	}
-	lines := make([]string, len(raw))
-	for i, b := range raw {
-		b = bytes.TrimSuffix(b, []byte("\r"))
-		lines[i] = string(b)
+	n := bytes.Count(data, []byte{'\n'}) + 1
+	lines := make([]string, 0, n)
+	for {
+		idx := bytes.IndexByte(data, '\n')
+		var line []byte
+		if idx < 0 {
+			line = data
+		} else {
+			line = data[:idx]
+		}
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		lines = append(lines, string(line))
+		if idx < 0 {
+			break
+		}
+		data = data[idx+1:]
 	}
 	return lines
 }
@@ -97,7 +113,7 @@ func IsBinary(data []byte) bool {
 // Edits computes the shortest edit script (SES) transforming a into b using linear-space
 // divide-and-conquer (Hirschberg / Myers LCS) with O(min(N, M)) memory.
 func Edits[T comparable](a, b []T) []Edit {
-	var res []Edit
+	res := make([]Edit, 0, max(len(a), len(b)))
 	var scratch []int
 	editsRecursive(a, b, 0, 0, &res, 0, &scratch)
 	return res
@@ -194,24 +210,34 @@ func editsRecursive[T comparable](a, b []T, aOff, bOff int, out *[]Edit, depth i
 		}
 	} else {
 		uA, uB, vA, vB, ok := findMiddleSnake(a, b, scratch)
-		validSnake := ok && 0 <= uA && uA <= vA && vA <= n && 0 <= uB && uB <= vB && vB <= m && (vA-uA == vB-uB)
-		if !validSnake || (uA == 0 && uB == 0 && vA == 0 && vB == 0) || (uA == n && uB == m && vA == n && vB == m) {
-			// Fallback: split in half
-			midA := n / 2
-			midB := m / 2
-			editsRecursive(a[:midA], b[:midB], aOff, bOff, out, depth+1, scratch)
-			editsRecursive(a[midA:], b[midB:], aOff+midA, bOff+midB, out, depth+1, scratch)
-		} else {
-			// Recurse left
-			editsRecursive(a[:uA], b[:uB], aOff, bOff, out, depth+1, scratch)
-
-			// Emit middle snake equals
-			for k := 0; k < vA-uA; k++ {
-				*out = append(*out, Edit{Op: OpEqual, AIndex: aOff + uA + k, BIndex: bOff + uB + k})
+		if !ok {
+			// Exceeded maxD search budget: emit replace directly instead of cascading 2^k cutoffs.
+			for i := 0; i < n; i++ {
+				*out = append(*out, Edit{Op: OpDelete, AIndex: aOff + i, BIndex: -1})
 			}
+			for j := 0; j < m; j++ {
+				*out = append(*out, Edit{Op: OpInsert, AIndex: -1, BIndex: bOff + j})
+			}
+		} else {
+			validSnake := 0 <= uA && uA <= vA && vA <= n && 0 <= uB && uB <= vB && vB <= m && (vA-uA == vB-uB)
+			if !validSnake || (uA == 0 && uB == 0 && vA == 0 && vB == 0) || (uA == n && uB == m && vA == n && vB == m) {
+				// Fallback: split in half
+				midA := n / 2
+				midB := m / 2
+				editsRecursive(a[:midA], b[:midB], aOff, bOff, out, depth+1, scratch)
+				editsRecursive(a[midA:], b[midB:], aOff+midA, bOff+midB, out, depth+1, scratch)
+			} else {
+				// Recurse left
+				editsRecursive(a[:uA], b[:uB], aOff, bOff, out, depth+1, scratch)
 
-			// Recurse right
-			editsRecursive(a[vA:], b[vB:], aOff+vA, bOff+vB, out, depth+1, scratch)
+				// Emit middle snake equals
+				for k := 0; k < vA-uA; k++ {
+					*out = append(*out, Edit{Op: OpEqual, AIndex: aOff + uA + k, BIndex: bOff + uB + k})
+				}
+
+				// Recurse right
+				editsRecursive(a[vA:], b[vB:], aOff+vA, bOff+vB, out, depth+1, scratch)
+			}
 		}
 	}
 
@@ -231,13 +257,11 @@ func findMiddleSnake[T comparable](a, b []T, scratch *[]int) (snakeStartA, snake
 		maxD = 8192
 	}
 
-	absDelta := delta
-	if absDelta < 0 {
-		absDelta = -absDelta
-	}
-
-	offset := maxD + absDelta + 4
-	size := 2*offset + 8
+	// Separate offsets for vf (k in [-maxD, maxD]) and vb (k in [delta-maxD, delta+maxD])
+	// keep scratch size bounded by O(maxD) independent of |n-m|.
+	offF := maxD + 2
+	offB := maxD - delta + 2
+	size := 2*maxD + 6
 	need := 2 * size
 	if scratch != nil {
 		if cap(*scratch) < need {
@@ -256,17 +280,17 @@ func findMiddleSnake[T comparable](a, b []T, scratch *[]int) (snakeStartA, snake
 		vf[i] = -1
 		vb[i] = n + 1
 	}
-	vf[offset+1] = 0
-	vb[offset+delta-1] = n
+	vf[offF+1] = 0
+	vb[delta-1+offB] = n
 
 	for d := 0; d <= maxD; d++ {
 		// Forward pass
 		for k := -d; k <= d; k += 2 {
 			var x int
-			if k == -d || (k != d && vf[k-1+offset] < vf[k+1+offset]) {
-				x = vf[k+1+offset]
+			if k == -d || (k != d && vf[k-1+offF] < vf[k+1+offF]) {
+				x = vf[k+1+offF]
 			} else {
-				x = vf[k-1+offset] + 1
+				x = vf[k-1+offF] + 1
 			}
 			y := x - k
 			startX := x
@@ -276,10 +300,10 @@ func findMiddleSnake[T comparable](a, b []T, scratch *[]int) (snakeStartA, snake
 				x++
 				y++
 			}
-			vf[k+offset] = x
+			vf[k+offF] = x
 
 			if odd && k >= delta-(d-1) && k <= delta+(d-1) {
-				if vb[k+offset] <= n && x >= vb[k+offset] {
+				if vb[k+offB] <= n && x >= vb[k+offB] {
 					if startX >= 0 && startX <= n && startY >= 0 && startY <= m && x >= 0 && x <= n && y >= 0 && y <= m {
 						return startX, startY, x, y, true
 					}
@@ -290,10 +314,10 @@ func findMiddleSnake[T comparable](a, b []T, scratch *[]int) (snakeStartA, snake
 		// Backward pass
 		for k := delta - d; k <= delta+d; k += 2 {
 			var x int
-			if k == delta+d || (k != delta-d && vb[k-1+offset] <= vb[k+1+offset]) {
-				x = vb[k-1+offset]
+			if k == delta+d || (k != delta-d && vb[k-1+offB] < vb[k+1+offB]) {
+				x = vb[k-1+offB]
 			} else {
-				x = vb[k+1+offset] - 1
+				x = vb[k+1+offB] - 1
 			}
 			y := x - k
 			endX := x
@@ -303,10 +327,10 @@ func findMiddleSnake[T comparable](a, b []T, scratch *[]int) (snakeStartA, snake
 				x--
 				y--
 			}
-			vb[k+offset] = x
+			vb[k+offB] = x
 
 			if !odd && k >= -d && k <= d {
-				if vf[k+offset] >= 0 && vf[k+offset] >= x {
+				if vf[k+offF] >= 0 && vf[k+offF] >= x {
 					if x >= 0 && x <= n && y >= 0 && y <= m && endX >= 0 && endX <= n && endY >= 0 && endY <= m {
 						return x, y, endX, endY, true
 					}

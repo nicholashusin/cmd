@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -108,7 +109,11 @@ func BuildRelationChain(changes []*vcs.Change, currentKey string, summaries map[
 	}
 	findVisibleParent := func(rev string) string {
 		curr := rev
+		var seen map[string]bool
 		for curr != "" {
+			if seen != nil && seen[curr] {
+				break
+			}
 			ch, ok := allByRev[curr]
 			if !ok {
 				break
@@ -116,6 +121,10 @@ func BuildRelationChain(changes []*vcs.Change, currentKey string, summaries map[
 			if isVisible(ch) {
 				return ch.Rev
 			}
+			if seen == nil {
+				seen = make(map[string]bool)
+			}
+			seen[curr] = true
 			curr = ch.Parent
 		}
 		return ""
@@ -156,7 +165,7 @@ func BuildRelationChain(changes []*vcs.Change, currentKey string, summaries map[
 	if curr == "" && target.Parent != "" {
 		curr = findVisibleParent(target.Parent)
 	}
-	for curr != "" {
+	for curr != "" && !connected[curr] {
 		if _, ok := byRev[curr]; !ok {
 			break
 		}
@@ -177,15 +186,9 @@ func BuildRelationChain(changes []*vcs.Change, currentKey string, summaries map[
 		}
 	}
 
-	var chainChanges []*vcs.Change
-	for _, ch := range changes {
-		if connected[ch.Rev] {
-			chainChanges = append(chainChanges, ch)
-		}
-	}
-
-	graphRows := vcs.BuildGraph(chainChanges, func(c *vcs.Change) bool {
-		return true
+	// Pass all changes so BuildGraph can bridge invisible empty intermediate commits.
+	graphRows := vcs.BuildGraph(changes, func(c *vcs.Change) bool {
+		return connected[c.Rev]
 	})
 	var rows []RelationRow
 	for _, gr := range graphRows {
@@ -412,17 +415,18 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 			targetDesc = "Live Snapshot"
 		}
 	} else if strings.HasPrefix(targetSel, "snap:") {
-		var num int
-		if _, err := fmt.Sscanf(targetSel, "snap:%d", &num); err == nil {
-			for _, s := range snaps {
-				if s.Num == num {
-					targetSnapNum = s.Num
-					isLiveTarget = false
-					snapshotPending = false
-					targetRev = s.Rev
-					targetDesc = fmt.Sprintf("Snapshot %d", s.Num)
-					break
-				}
+		num, err := strconv.Atoi(strings.TrimPrefix(targetSel, "snap:"))
+		if err != nil || num <= 0 {
+			return nil, fmt.Errorf("invalid target snapshot %q", targetSel)
+		}
+		for _, s := range snaps {
+			if s.Num == num {
+				targetSnapNum = s.Num
+				isLiveTarget = false
+				snapshotPending = false
+				targetRev = s.Rev
+				targetDesc = fmt.Sprintf("Snapshot %d", s.Num)
+				break
 			}
 		}
 	} else {
@@ -449,15 +453,16 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 	baseSnapNum := 0
 
 	if strings.HasPrefix(baseSel, "snap:") {
-		var num int
-		if _, err := fmt.Sscanf(baseSel, "snap:%d", &num); err == nil {
-			for _, s := range snaps {
-				if s.Num == num {
-					baseSnapNum = s.Num
-					baseRev = s.Rev
-					baseDesc = fmt.Sprintf("Snapshot %d", s.Num)
-					break
-				}
+		num, err := strconv.Atoi(strings.TrimPrefix(baseSel, "snap:"))
+		if err != nil || num <= 0 {
+			return nil, fmt.Errorf("invalid base snapshot %q", baseSel)
+		}
+		for _, s := range snaps {
+			if s.Num == num {
+				baseSnapNum = s.Num
+				baseRev = s.Rev
+				baseDesc = fmt.Sprintf("Snapshot %d", s.Num)
+				break
 			}
 		}
 	} else if baseSel != "" && baseSel != "parent" {
@@ -521,21 +526,6 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 	// Re-anchor view-visible threads onto targetRev (or baseRev for effective side "L")
 	threadsByFile := make(map[string][]*db.Thread)
 	linesCache := make(map[string][]string)
-	getLines := func(rev, path string) []string {
-		norm := strings.TrimPrefix(path, "/")
-		key := rev + "\x00" + norm
-		if lines, ok := linesCache[key]; ok {
-			return lines
-		}
-		data, err := repo.Content(rev, path)
-		if err != nil || len(data) == 0 {
-			linesCache[key] = nil
-			return nil
-		}
-		lines := diff.SplitLines(data)
-		linesCache[key] = lines
-		return lines
-	}
 
 	hasCommitMsgBase := CommitMsgHasBase(repo, c, snaps, baseRev, targetRev)
 	oldPathByNew := make(map[string]string)
@@ -561,19 +551,22 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 			if th.StartLine == 0 {
 				th.Stale = false
 			} else if rev != "" && repo != nil {
-				lines := getLines(rev, th.Path)
+				lines := cachedRepoLines(repo, rev, th.Path, linesCache)
 				if lines == nil && effectiveSide == "L" {
 					if oldP := oldPathByNew[strings.TrimPrefix(th.Path, "/")]; oldP != "" {
-						lines = getLines(rev, oldP)
+						lines = cachedRepoLines(repo, rev, oldP, linesCache)
 					}
 				}
-				if lines == nil {
+				if len(lines) == 0 {
 					th.Stale = true
 				} else if newStart, newEnd, matched := matchAnchorLines(lines, th.StartLine, th.AnchorLines); matched {
 					th.StartLine = newStart
 					th.EndLine = newEnd
 					th.Stale = false
-				} else if th.AnchorLines != "" {
+				} else if th.AnchorLines == "" && th.StartLine >= 1 && th.StartLine <= len(lines) {
+					th.EndLine = min(max(th.EndLine, th.StartLine), len(lines))
+					th.Stale = false
+				} else {
 					th.Stale = true
 				}
 			}
@@ -581,9 +574,6 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 		visibleThreads = append(visibleThreads, th)
 		norm := strings.TrimPrefix(th.Path, "/")
 		threadsByFile[norm] = append(threadsByFile[norm], th)
-		if norm != th.Path {
-			threadsByFile[th.Path] = append(threadsByFile[th.Path], th)
-		}
 	}
 
 	// 5. Load file marks (and apply carry-forward for unchanged files)
@@ -608,14 +598,11 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 	}
 
 	commitMsgPath := strings.TrimPrefix(vcs.CommitMsgPath, "/")
-	var includeCommitMsg bool
-	if !hasCommitMsgBase {
-		includeCommitMsg = true
-	} else if baseRev != targetRev && targetCommit != nil && repo != nil {
+	includeCommitMsg := !hasCommitMsgBase || onlyFile == vcs.CommitMsgPath || len(threadsByFile[commitMsgPath]) > 0
+	if !includeCommitMsg && baseRev != targetRev && targetCommit != nil && repo != nil {
 		if baseCommit, err := repo.Commit(baseRev); err == nil && baseCommit != nil {
 			includeCommitMsg = strings.TrimSpace(baseCommit.Message) != strings.TrimSpace(targetCommit.Message) ||
-				baseCommit.Author != targetCommit.Author ||
-				len(threadsByFile[commitMsgPath]) > 0
+				baseCommit.Author != targetCommit.Author
 		}
 	}
 
@@ -967,42 +954,34 @@ func ReanchorThreadsForView(repo vcs.Repo, c *vcs.Change, snaps []*db.Snapshot, 
 	return reanchorThreads(repo, c, snaps, &scope, targetRev, baseRev, threads, linesCache)
 }
 
-func reanchorThreads(repo vcs.Repo, c *vcs.Change, snaps []*db.Snapshot, scope *ViewScope, targetRev, baseRev string, threads []*db.Thread, linesCache map[string][]string) []*ThreadView {
-	views := make([]*ThreadView, len(threads))
-	if linesCache == nil {
-		linesCache = make(map[string][]string)
+func cachedRepoLines(repo vcs.Repo, rev, path string, linesCache map[string][]string) []string {
+	if repo == nil || rev == "" {
+		return nil
 	}
-	getLines := func(rev, path string) []string {
-		norm := strings.TrimPrefix(path, "/")
-		key := rev + "\x00" + norm
+	norm := strings.TrimPrefix(path, "/")
+	key := rev + "\x00" + norm
+	if linesCache != nil {
 		if lines, seen := linesCache[key]; seen {
 			return lines
 		}
-		data, err := repo.Content(rev, path)
-		if err != nil || len(data) == 0 {
-			linesCache[key] = nil
-			return nil
-		}
-		lines := diff.SplitLines(data)
+	}
+	data, err := repo.Content(rev, path)
+	var lines []string
+	if err == nil && len(data) > 0 {
+		lines = diff.SplitLines(data)
+	}
+	if linesCache != nil {
 		linesCache[key] = lines
-		return lines
 	}
+	return lines
+}
 
-	var commitMsgBaseChecked bool
-	var hasCommitMsgBase bool
-	checkCommitMsgBase := func() bool {
-		if !commitMsgBaseChecked {
-			hasCommitMsgBase = CommitMsgHasBase(repo, c, snaps, baseRev, targetRev)
-			commitMsgBaseChecked = true
-		}
-		return hasCommitMsgBase
-	}
-
-	var renamedOldPathChecked bool
+func lazyRenameOldPaths(repo vcs.Repo, baseRev, targetRev string) func(path string) string {
+	var checked bool
 	var oldPathByNew map[string]string
-	lookupOldPath := func(path string) string {
-		if !renamedOldPathChecked {
-			renamedOldPathChecked = true
+	return func(path string) string {
+		if !checked {
+			checked = true
 			if repo != nil && baseRev != "" && targetRev != "" && baseRev != targetRev {
 				if files, err := repo.Files(baseRev, targetRev); err == nil {
 					for _, f := range files {
@@ -1018,6 +997,25 @@ func reanchorThreads(repo vcs.Repo, c *vcs.Change, snaps []*db.Snapshot, scope *
 		}
 		return oldPathByNew[strings.TrimPrefix(path, "/")]
 	}
+}
+
+func reanchorThreads(repo vcs.Repo, c *vcs.Change, snaps []*db.Snapshot, scope *ViewScope, targetRev, baseRev string, threads []*db.Thread, linesCache map[string][]string) []*ThreadView {
+	views := make([]*ThreadView, len(threads))
+	if linesCache == nil {
+		linesCache = make(map[string][]string)
+	}
+
+	var commitMsgBaseChecked bool
+	var hasCommitMsgBase bool
+	checkCommitMsgBase := func() bool {
+		if !commitMsgBaseChecked {
+			hasCommitMsgBase = CommitMsgHasBase(repo, c, snaps, baseRev, targetRev)
+			commitMsgBaseChecked = true
+		}
+		return hasCommitMsgBase
+	}
+
+	lookupOldPath := lazyRenameOldPaths(repo, baseRev, targetRev)
 
 	for i, th := range threads {
 		effectiveSide := th.Side
@@ -1054,19 +1052,23 @@ func reanchorThreads(repo vcs.Repo, c *vcs.Change, snaps []*db.Snapshot, scope *
 		if th.StartLine == 0 {
 			tv.Stale = false
 		} else if rev != "" && repo != nil {
-			lines := getLines(rev, th.Path)
+			lines := cachedRepoLines(repo, rev, th.Path, linesCache)
 			if lines == nil && effectiveSide == "L" {
 				if oldP := lookupOldPath(th.Path); oldP != "" {
-					lines = getLines(rev, oldP)
+					lines = cachedRepoLines(repo, rev, oldP, linesCache)
 				}
 			}
-			if lines == nil {
+			if len(lines) == 0 {
 				tv.Stale = true
 			} else if newStart, newEnd, matched := matchAnchorLines(lines, th.StartLine, th.AnchorLines); matched {
 				tv.CurrentStart = newStart
 				tv.CurrentEnd = newEnd
 				tv.Stale = false
-			} else if th.AnchorLines != "" {
+			} else if th.AnchorLines == "" && th.StartLine >= 1 && th.StartLine <= len(lines) {
+				tv.CurrentStart = th.StartLine
+				tv.CurrentEnd = min(max(th.EndLine, th.StartLine), len(lines))
+				tv.Stale = false
+			} else {
 				tv.Stale = true
 			}
 		}
@@ -1120,10 +1122,18 @@ func anchorThreadWithLines(th *db.Thread, effectiveSide string, snaps []*db.Snap
 		} else {
 			rightThreads[tv.CurrentEnd] = append(rightThreads[tv.CurrentEnd], tv)
 		}
-	} else {
-		if th.AnchorLines != "" {
-			tv.Stale = true
+	} else if th.AnchorLines == "" && th.StartLine >= 1 && th.StartLine <= len(targetLines) {
+		// Blank-line comments have an empty anchor string; keep them anchored inline if the line exists.
+		tv.CurrentStart = th.StartLine
+		tv.CurrentEnd = min(max(th.EndLine, th.StartLine), len(targetLines))
+		tv.Stale = false
+		if side == "L" {
+			leftThreads[tv.CurrentEnd] = append(leftThreads[tv.CurrentEnd], tv)
+		} else {
+			rightThreads[tv.CurrentEnd] = append(rightThreads[tv.CurrentEnd], tv)
 		}
+	} else {
+		tv.Stale = true
 		fileThreads = append(fileThreads, tv)
 	}
 	return fileThreads
@@ -1166,24 +1176,7 @@ func ReanchorViewThreadsWithLines(leftLines, rightLines []string, baseRev, targe
 // reusing linesCache.
 func GetThreadContextCached(repo vcs.Repo, tv *ThreadView, ctxLines int, linesCache map[string][]string) string {
 	if repo != nil && tv.Thread != nil && tv.Thread.Rev != "" && tv.Thread.Path != "" {
-		var lines []string
-		norm := strings.TrimPrefix(tv.Thread.Path, "/")
-		key := tv.Thread.Rev + "\x00" + norm
-		var seen bool
-		if linesCache != nil {
-			lines, seen = linesCache[key]
-		}
-		if !seen {
-			data, err := repo.Content(tv.Thread.Rev, tv.Thread.Path)
-			if err == nil && len(data) > 0 {
-				lines = diff.SplitLines(data)
-			} else {
-				lines = nil
-			}
-			if linesCache != nil {
-				linesCache[key] = lines
-			}
-		}
+		lines := cachedRepoLines(repo, tv.Thread.Rev, tv.Thread.Path, linesCache)
 		if len(lines) > 0 {
 			start := tv.Thread.StartLine - ctxLines
 			if start < 1 {
@@ -1280,14 +1273,16 @@ func AddCommentRangeWithTarget(d *db.DB, repo vcs.Repo, repoID int64, c *vcs.Cha
 			}
 		}
 	}
+	if startLine > 0 && endLine < startLine {
+		endLine = startLine
+	}
 	if err == nil && len(data) > 0 {
 		lines := diff.SplitLines(data)
 		if startLine > 0 && startLine <= len(lines) {
-			end := endLine
-			if end < startLine || end > len(lines) {
-				end = startLine
+			if endLine > len(lines) {
+				endLine = len(lines)
 			}
-			anchorLines = strings.Join(lines[startLine-1:end], "\n")
+			anchorLines = strings.Join(lines[startLine-1:endLine], "\n")
 		}
 	}
 
@@ -1439,9 +1434,7 @@ type patchHunk struct {
 	inserted []string
 }
 
-func extractPatchHunks(parentData, fileData []byte) []patchHunk {
-	pLines := diff.SplitLines(parentData)
-	fLines := diff.SplitLines(fileData)
+func extractPatchHunksLines(pLines, fLines []string) []patchHunk {
 	edits := diff.Edits(pLines, fLines)
 	var hunks []patchHunk
 	for i := 0; i < len(edits); {
@@ -1463,9 +1456,9 @@ func extractPatchHunks(parentData, fileData []byte) []patchHunk {
 	return hunks
 }
 
-func sameOwnPatchHunks(dataPA, dataA, dataPB, dataB []byte) bool {
-	hunksA := extractPatchHunks(dataPA, dataA)
-	hunksB := extractPatchHunks(dataPB, dataB)
+func sameOwnPatchHunksLines(pLinesA, fLinesA, pLinesB, fLinesB []string) bool {
+	hunksA := extractPatchHunksLines(pLinesA, fLinesA)
+	hunksB := extractPatchHunksLines(pLinesB, fLinesB)
 	if len(hunksA) != len(hunksB) {
 		return false
 	}
@@ -1549,8 +1542,8 @@ func RevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB *vcs.Ch
 			return cached
 		}
 	}
-	res := computeRevisionsHaveNoOwnDiff(repo, revA, parentA, commitB)
-	if cacheKey != "" {
+	res, cacheable := computeRevisionsHaveNoOwnDiff(repo, revA, parentA, commitB)
+	if cacheKey != "" && cacheable {
 		noOwnDiffCacheMu.Lock()
 		if len(noOwnDiffCache) >= noOwnDiffCacheMax {
 			clear(noOwnDiffCache)
@@ -1561,10 +1554,10 @@ func RevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB *vcs.Ch
 	return res
 }
 
-func computeRevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB *vcs.Change) bool {
+func computeRevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB *vcs.Change) (same, cacheable bool) {
 	commitA, err := repo.Commit(revA)
 	if err != nil || commitA == nil {
-		return false
+		return false, false
 	}
 	if parentA == "" && commitA.Parent != "" {
 		parentA = commitA.Parent
@@ -1573,12 +1566,12 @@ func computeRevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB 
 	parentB := commitB.Parent
 
 	if strings.TrimSpace(commitA.Message) != strings.TrimSpace(commitB.Message) || commitA.Author != commitB.Author {
-		return false
+		return false, true
 	}
 
 	files, err := repo.Files(revA, revB)
 	if err != nil {
-		return false
+		return false, false
 	}
 	var changedFiles []*vcs.File
 	for _, f := range files {
@@ -1588,10 +1581,10 @@ func computeRevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB 
 		changedFiles = append(changedFiles, f)
 	}
 	if len(changedFiles) == 0 {
-		return true
+		return true, true
 	}
 	if parentA == "" || parentB == "" || parentA == parentB {
-		return false
+		return false, true
 	}
 
 	isOKOrMissing := func(err error) bool {
@@ -1630,23 +1623,26 @@ func computeRevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB 
 			eqANew, _, _, ok2 := blobsEqual(revA, f.Path, parentA, f.Path)
 			eqBOld, _, _, ok3 := blobsEqual(revB, f.OldPath, parentB, f.OldPath)
 			eqBNew, _, _, ok4 := blobsEqual(revB, f.Path, parentB, f.Path)
-			if ok1 && ok2 && ok3 && ok4 && eqAOld && eqANew && eqBOld && eqBNew {
+			if !ok1 || !ok2 || !ok3 || !ok4 {
+				return false, false
+			}
+			if eqAOld && eqANew && eqBOld && eqBNew {
 				continue
 			}
-			return false
+			return false, true
 		}
 
 		p := f.Path
 		eqA, _, _, okA := blobsEqual(revA, p, parentA, p)
 		eqB, _, _, okB := blobsEqual(revB, p, parentB, p)
 		if !okA || !okB {
-			return false
+			return false, false
 		}
 		if eqA && eqB {
 			continue
 		}
 		if eqA != eqB {
-			return false
+			return false, true
 		}
 
 		dataA, errA := repo.Content(revA, p)
@@ -1655,10 +1651,10 @@ func computeRevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB 
 		dataPB, errPB := repo.Content(parentB, p)
 
 		if !isOKOrMissing(errA) || !isOKOrMissing(errPA) || !isOKOrMissing(errB) || !isOKOrMissing(errPB) {
-			return false
+			return false, false
 		}
 		if (errA == nil) != (errB == nil) || (errPA == nil) != (errPB == nil) {
-			return false
+			return false, true
 		}
 		if errA != nil && errB != nil {
 			continue
@@ -1669,18 +1665,21 @@ func computeRevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB 
 			(errB == nil && diff.IsBinary(dataB)) ||
 			(errPB == nil && diff.IsBinary(dataPB)) {
 			if !bytes.Equal(dataA, dataB) {
-				return false
+				return false, true
 			}
 			continue
 		}
 
-		if !sameOwnPatchHunks(dataPA, dataA, dataPB, dataB) {
-			return false
+		linesA := diff.SplitLines(dataA)
+		linesPA := diff.SplitLines(dataPA)
+		linesB := diff.SplitLines(dataB)
+		linesPB := diff.SplitLines(dataPB)
+
+		if !sameOwnPatchHunksLines(linesPA, linesA, linesPB, linesB) {
+			return false, true
 		}
 
-		interLinesA := diff.SplitLines(dataA)
-		interLinesB := diff.SplitLines(dataB)
-		rows := diff.BuildRows(interLinesA, interLinesB, diff.Edits(interLinesA, interLinesB))
+		rows := diff.BuildRows(linesA, linesB, diff.Edits(linesA, linesB))
 		allEqual := true
 		for _, r := range rows {
 			if r.Type != diff.RowEqual {
@@ -1691,13 +1690,13 @@ func computeRevisionsHaveNoOwnDiff(repo vcs.Repo, revA, parentA string, commitB 
 		if allEqual {
 			continue
 		}
-		diff.MarkRebased(rows, dataA, dataB, dataPA, dataPB)
+		diff.MarkRebasedLines(rows, linesA, linesB, linesPA, linesPB)
 		if !diff.AllRebased(rows) {
-			return false
+			return false, true
 		}
 	}
 
-	return true
+	return true, true
 }
 
 func precomputeThreadUpdates(repo vcs.Repo, threads []*db.Thread, oldSnapByNum map[int]*db.Snapshot, pendingOnOld *db.Snapshot, newRev, newParent string, linesCache map[string][]string) (updates []db.ThreadAnchorUpdate, unmatchedRevs []string) {
@@ -1707,24 +1706,7 @@ func precomputeThreadUpdates(repo vcs.Repo, threads []*db.Thread, oldSnapByNum m
 	if linesCache == nil {
 		linesCache = make(map[string][]string)
 	}
-	getLines := func(rev, path string) []string {
-		if repo == nil || rev == "" {
-			return nil
-		}
-		norm := strings.TrimPrefix(path, "/")
-		key := rev + "\x00" + norm
-		if lines, seen := linesCache[key]; seen {
-			return lines
-		}
-		data, err := repo.Content(rev, path)
-		if err != nil || len(data) == 0 {
-			linesCache[key] = nil
-			return nil
-		}
-		lines := diff.SplitLines(data)
-		linesCache[key] = lines
-		return lines
-	}
+	lookupOldPath := lazyRenameOldPaths(repo, newParent, newRev)
 
 	for _, th := range threads {
 		if th == nil {
@@ -1744,8 +1726,10 @@ func precomputeThreadUpdates(repo vcs.Repo, threads []*db.Thread, oldSnapByNum m
 		oldRev := oldSnap.Rev
 
 		targetRev := newRev
+		isLeftParent := false
 		if th.Side == "L" && th.Rev != oldRev {
 			targetRev = newParent
+			isLeftParent = true
 		}
 
 		if targetRev == "" {
@@ -1766,13 +1750,30 @@ func precomputeThreadUpdates(repo vcs.Repo, threads []*db.Thread, oldSnapByNum m
 			continue
 		}
 
-		lines := getLines(targetRev, th.Path)
+		lines := cachedRepoLines(repo, targetRev, th.Path, linesCache)
+		if lines == nil && isLeftParent {
+			if oldP := lookupOldPath(th.Path); oldP != "" {
+				lines = cachedRepoLines(repo, targetRev, oldP, linesCache)
+			}
+		}
 		if newStart, newEnd, matched := matchAnchorLinesRebase(lines, th.StartLine, th.AnchorLines); matched {
 			if th.Rev != targetRev || th.StartLine != newStart || th.EndLine != newEnd {
 				updates = append(updates, db.ThreadAnchorUpdate{
 					ID:        th.ID,
 					Rev:       targetRev,
 					StartLine: newStart,
+					EndLine:   newEnd,
+				})
+			}
+			continue
+		}
+		if th.AnchorLines == "" && th.StartLine >= 1 && th.StartLine <= len(lines) && lines[th.StartLine-1] == "" {
+			newEnd := min(max(th.EndLine, th.StartLine), len(lines))
+			if th.Rev != targetRev || th.EndLine != newEnd {
+				updates = append(updates, db.ThreadAnchorUpdate{
+					ID:        th.ID,
+					Rev:       targetRev,
+					StartLine: th.StartLine,
 					EndLine:   newEnd,
 				})
 			}

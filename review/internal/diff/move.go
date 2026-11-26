@@ -85,7 +85,7 @@ func lineSim(s1, s2 string) float64 {
 	if maxLen == 0 {
 		return 1.0
 	}
-	if float64(minLen)/float64(maxLen) < 0.55 {
+	if maxLen > 1000 || float64(minLen)/float64(maxLen) < 0.55 {
 		return 0.0
 	}
 	r1 := []rune(s1)
@@ -230,10 +230,12 @@ func DetectMoves(files []MoveFile, ignoreWS bool) {
 	}
 
 	// Guard total work: if total deleted + added lines exceeds 15,000 across files,
-	// run DetectMoves per-file individually (intra-file only).
-	if len(files) > 1 && totalDelLines+totalAddLines > 15000 {
-		for i := range files {
-			DetectMoves(files[i:i+1], ignoreWS)
+	// run DetectMoves per-file individually; skip single files exceeding the cap.
+	if totalDelLines+totalAddLines > 15000 {
+		if len(files) > 1 {
+			for i := range files {
+				DetectMoves(files[i:i+1], ignoreWS)
+			}
 		}
 		return
 	}
@@ -480,6 +482,11 @@ func DetectMoves(files []MoveFile, ignoreWS bool) {
 		blockModified := false
 		var curBlockLeft []*MoveInfo
 		var curBlockRight []*MoveInfo
+		type pairDelta struct {
+			modified bool
+			rSpans   []Span
+		}
+		pairDeltas := make(map[int]pairDelta, len(pairedDelLine))
 
 		for d := cand.d0; d <= cand.d1; d++ {
 			lLine := dChunk.lines[d]
@@ -507,17 +514,22 @@ func DetectMoves(files []MoveFile, ignoreWS bool) {
 				} else {
 					modified = strings.TrimSpace(lRaw) != strings.TrimSpace(rRaw)
 				}
+				var pd pairDelta
 				if modified {
 					info.Modified = true
 					blockModified = true
-					lSpans, _, ok := Intraline(lRaw, rRaw)
+					pd.modified = true
+					lSpans, rSpans, ok := Intraline(lRaw, rRaw)
 					if ok {
 						if ignoreWS {
 							lSpans = trimWS(lRaw, wsData[dChunk.fileIdx].leftStrs[lLine-1], lSpans)
+							rSpans = trimWS(rRaw, wsData[aChunk.fileIdx].rightStrs[rLine-1], rSpans)
 						}
 						info.MovedIntra = lSpans
+						pd.rSpans = rSpans
 					}
 				}
+				pairDeltas[rLine] = pd
 			}
 			curBlockLeft = append(curBlockLeft, info)
 			leftMoveInfos[fileLineKey{fileIdx: dChunk.fileIdx, line: lLine}] = info
@@ -538,28 +550,10 @@ func DetectMoves(files []MoveFile, ignoreWS bool) {
 			if lLine == 0 {
 				info.Modified = true
 				blockModified = true
-			} else {
-				lRaw := files[dChunk.fileIdx].LeftLines[lLine-1]
-				rRaw := files[aChunk.fileIdx].RightLines[rLine-1]
-				modified := false
-				if ignoreWS {
-					lKey := wsData[dChunk.fileIdx].leftKeys[lLine-1]
-					rKey := wsData[aChunk.fileIdx].rightKeys[rLine-1]
-					modified = lKey != rKey
-				} else {
-					modified = strings.TrimSpace(lRaw) != strings.TrimSpace(rRaw)
-				}
-				if modified {
-					info.Modified = true
-					blockModified = true
-					_, rSpans, ok := Intraline(lRaw, rRaw)
-					if ok {
-						if ignoreWS {
-							rSpans = trimWS(rRaw, wsData[aChunk.fileIdx].rightStrs[rLine-1], rSpans)
-						}
-						info.MovedIntra = rSpans
-					}
-				}
+			} else if pd, ok := pairDeltas[rLine]; ok && pd.modified {
+				info.Modified = true
+				blockModified = true
+				info.MovedIntra = pd.rSpans
 			}
 			curBlockRight = append(curBlockRight, info)
 			rightMoveInfos[fileLineKey{fileIdx: aChunk.fileIdx, line: rLine}] = info
@@ -756,7 +750,22 @@ func findCandidateBlocks(aligned []alignedPair, dChunk, aChunk moveChunk, dChunk
 			nextP0 = p0 + 1
 		}
 		startIdx := p0
-		p0 = nextP0
+
+		// If a candidate starting at a coincidental anchor fails validation because of
+		// an early unmatched gap, retry from the first anchor after that gap instead of
+		// skipping over a valid moved block that starts later in [startIdx..p1].
+		retryAfterFirstGap := func() int {
+			sawGap := false
+			for k := startIdx + 1; k <= p1; k++ {
+				pk := aligned[k]
+				if pk.dIdx < 0 || pk.aIdx < 0 || pk.sim < 0.55 {
+					sawGap = true
+				} else if sawGap && (pk.sim == 1.0 || pk.sim >= 0.70) {
+					return k
+				}
+			}
+			return nextP0
+		}
 
 		// Determine line bounds in dChunk and aChunk
 		minD, maxD := -1, -1
@@ -766,10 +775,8 @@ func findCandidateBlocks(aligned []alignedPair, dChunk, aChunk moveChunk, dChunk
 		exactSigLines := 0
 		sumSim := 0.0
 
-		var subPairs []alignedPair
 		for k := startIdx; k <= p1; k++ {
 			pair := aligned[k]
-			subPairs = append(subPairs, pair)
 			if pair.dIdx >= 0 {
 				if minD == -1 || pair.dIdx < minD {
 					minD = pair.dIdx
@@ -800,6 +807,7 @@ func findCandidateBlocks(aligned []alignedPair, dChunk, aChunk moveChunk, dChunk
 		}
 
 		if minD == -1 || maxD == -1 || minA == -1 || maxA == -1 {
+			p0 = nextP0
 			continue
 		}
 
@@ -812,22 +820,28 @@ func findCandidateBlocks(aligned []alignedPair, dChunk, aChunk moveChunk, dChunk
 
 		// 1. Overall aligned ratio >= 0.65
 		if float64(exactAligned+fuzzyAligned)/float64(maxLen) < 0.65 {
+			p0 = retryAfterFirstGap()
 			continue
 		}
 
 		// 2. At least 2 exact-norm significant lines or average similarity >= 0.75
 		avgSim := sumSim / float64(maxLen)
 		if exactSigLines < 2 && avgSim < 0.75 {
+			p0 = retryAfterFirstGap()
 			continue
 		}
 
 		// 3. Minimum significance threshold on both deleted and added sides
 		if !meetsSignificanceThreshold(dChunk.normLines[minD:maxD+1], dChunk.rawLines[minD:maxD+1]) {
+			p0 = retryAfterFirstGap()
 			continue
 		}
 		if !meetsSignificanceThreshold(aChunk.normLines[minA:maxA+1], aChunk.rawLines[minA:maxA+1]) {
+			p0 = retryAfterFirstGap()
 			continue
 		}
+
+		p0 = nextP0
 
 		// Score computation
 		nonWS := 0
@@ -843,6 +857,7 @@ func findCandidateBlocks(aligned []alignedPair, dChunk, aChunk moveChunk, dChunk
 			score += 1.0 // Intra-file tie breaker
 		}
 
+		subPairs := append([]alignedPair(nil), aligned[startIdx:p1+1]...)
 		results = append(results, candidateMatch{
 			dChunkIdx: dChunkIdx,
 			aChunkIdx: aChunkIdx,
@@ -1045,33 +1060,30 @@ func applyMovesToFiles(files []MoveFile, leftMoveInfos, rightMoveInfos map[fileL
 			}
 		}
 
-		// Set BlockStart = true on the first row of each contiguous GroupID run
+		// Set BlockStart = true on the first row of each contiguous GroupID run.
+		// Rows already own unique MoveInfo copies created above.
 		prevLGroupID := 0
 		prevRGroupID := 0
 		for idx := range newRows {
 			r := &newRows[idx]
 			if r.MovedL != nil {
-				cp := *r.MovedL
-				if cp.GroupID != prevLGroupID {
-					cp.BlockStart = true
-					prevLGroupID = cp.GroupID
+				if r.MovedL.GroupID != prevLGroupID {
+					r.MovedL.BlockStart = true
+					prevLGroupID = r.MovedL.GroupID
 				} else {
-					cp.BlockStart = false
+					r.MovedL.BlockStart = false
 				}
-				r.MovedL = &cp
 			} else {
 				prevLGroupID = 0
 			}
 
 			if r.MovedR != nil {
-				cp := *r.MovedR
-				if cp.GroupID != prevRGroupID {
-					cp.BlockStart = true
-					prevRGroupID = cp.GroupID
+				if r.MovedR.GroupID != prevRGroupID {
+					r.MovedR.BlockStart = true
+					prevRGroupID = r.MovedR.GroupID
 				} else {
-					cp.BlockStart = false
+					r.MovedR.BlockStart = false
 				}
-				r.MovedR = &cp
 			} else {
 				prevRGroupID = 0
 			}

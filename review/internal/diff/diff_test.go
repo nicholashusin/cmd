@@ -1279,3 +1279,67 @@ func TestGoDocLinkHighlighting(t *testing.T) {
 		}
 	})
 }
+
+func TestDiffCorrectnessRegressions(t *testing.T) {
+	t.Run("IntralineThreeEditsSmallGapsPreservesFirstSpan", func(t *testing.T) {
+		// 3 edits separated by <=5 rune gaps: previously reading blocks[j-1] erased the first edit.
+		left := "long_unchanged_prefix_alpha_bb_gamma_cc_delta_long_unchanged_suffix"
+		right := "long_unchanged_prefix_ALPHA_bb_GAMMA_cc_DELTA_long_unchanged_suffix"
+		lSpans, rSpans, ok := Intraline(left, right)
+		if !ok || len(lSpans) != 1 || len(rSpans) != 1 {
+			t.Fatalf("Intraline = (%+v, %+v, %v), want 1 merged span each", lSpans, rSpans, ok)
+		}
+		if got := left[lSpans[0].Start:lSpans[0].End]; got != "alpha_bb_gamma_cc_delta" {
+			t.Errorf("left span = %q, want %q", got, "alpha_bb_gamma_cc_delta")
+		}
+		if got := right[rSpans[0].Start:rSpans[0].End]; got != "ALPHA_bb_GAMMA_cc_DELTA" {
+			t.Errorf("right span = %q, want %q", got, "ALPHA_bb_GAMMA_cc_DELTA")
+		}
+	})
+
+	t.Run("MarkRebasedDoesNotDimOwnDeletionOrRestoredLine", func(t *testing.T) {
+		oldParent := []byte("a\nb\nc\n")
+		newParent := []byte("a\nupstream\nb\nc\n")
+		// Commit deleted "b" between old and new while upstream only inserted "upstream".
+		oldFile := []byte("a\nb\nc\n")
+		newFile := []byte("a\nupstream\nc\n")
+		rows := BuildRows(SplitLines(oldFile), SplitLines(newFile), Edits(SplitLines(oldFile), SplitLines(newFile)))
+		MarkRebased(rows, oldFile, newFile, oldParent, newParent)
+		for _, r := range rows {
+			if r.LeftText == "b" && r.RebasedL {
+				t.Errorf("own deletion of line 'b' was falsely marked RebasedL")
+			}
+			if r.RightText == "upstream" && !r.RebasedR {
+				t.Errorf("upstream insertion was not marked RebasedR")
+			}
+		}
+		if AllRebased(rows) {
+			t.Errorf("AllRebased = true despite own deletion of 'b'")
+		}
+	})
+
+	t.Run("RustLifetimesAndMultilineJSTemplate", func(t *testing.T) {
+		rs := []string{`fn foo<'a>(s: &'a str) -> char { 'x' }`}
+		rsToks := HighlightLines(rs, LangRust)[0]
+		for _, tok := range rsToks {
+			if tok.Class == TokenString && rs[0][tok.Start:tok.End] != "'x'" {
+				t.Errorf("Rust lifetime mis-highlighted as string: %q", rs[0][tok.Start:tok.End])
+			}
+		}
+
+		js := []string{"const s = `hello", "world`; const x = 1;"}
+		jsToks := HighlightLines(js, LangJS)
+		if len(jsToks[1]) < 2 || jsToks[1][0].Class != TokenString || js[1][jsToks[1][0].Start:jsToks[1][0].End] != "world`" {
+			t.Errorf("JS multi-line template continuation = %+v, want world` as TokenString", jsToks[1])
+		}
+	})
+
+	t.Run("CountDiffLinesMatchesBuildDiffRows", func(t *testing.T) {
+		left := []string{"func f() {", "\tx := 1", "\ty := \"a b\"", "}"}
+		right := []string{"func f() {", "    x := 1", "\ty := \"a  b\"", "\tz := 2", "}"}
+		added, deleted := CountDiffLines(left, right, LangGo, true)
+		if added != 2 || deleted != 1 {
+			t.Errorf("CountDiffLines(ignoreWS=true) = (+%d, -%d), want (+2, -1)", added, deleted)
+		}
+	})
+}

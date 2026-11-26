@@ -2972,3 +2972,29 @@ func TestCodeSearch(t *testing.T) {
 		t.Fatalf("expected module-qualified p: filter to find 2 files in pkg/auth, got %+v", resModPkgFiles.Files)
 	}
 }
+
+func TestEngineBlankLineAnchorAndRelationBridging(t *testing.T) {
+	// 1. Blank-line comment must stay anchored on its line, not jump to file-level.
+	lines := []string{"package main", "", "func main() {}"}
+	th := &db.Thread{ID: 1, Path: "main.go", Side: "R", StartLine: 2, EndLine: 2, AnchorLines: ""}
+	fileThreads, _, rightThreads := ReanchorThreadsWithLines(lines, lines, []*db.Thread{th})
+	if len(fileThreads) != 0 || len(rightThreads[2]) != 1 || rightThreads[2][0].Stale {
+		t.Fatalf("blank-line thread drifted: fileThreads=%+v rightThreads=%+v", fileThreads, rightThreads)
+	}
+
+	// 2. BuildRelationChain must keep parent-child graph edges bridged across empty commits.
+	c1 := &vcs.Change{Key: "k1", Rev: "r1", Subject: "bottom"}
+	cEmpty := &vcs.Change{Key: "k2", Rev: "r2", Parent: "r1", Subject: "empty", Empty: true}
+	c3 := &vcs.Change{Key: "k3", Rev: "r3", Parent: "r2", Subject: "top"}
+	rel := BuildRelationChain([]*vcs.Change{c3, cEmpty, c1}, "k3", nil)
+	if len(rel) != 2 {
+		t.Fatalf("BuildRelationChain len = %d, want 2", len(rel))
+	}
+	// Both commits should remain in lane 0 connected by a bottom edge across the bridged empty commit.
+	if rel[0].Lane != 0 || rel[1].Lane != 0 {
+		t.Errorf("expected bridged relation chain in lane 0, got lanes %d, %d", rel[0].Lane, rel[1].Lane)
+	}
+	if len(rel[0].BottomEdges) == 0 || len(rel[1].TopLanes) == 0 {
+		t.Errorf("expected bridged parent edge from c3 across empty commit to c1, got rel[0]=%+v rel[1]=%+v", rel[0], rel[1])
+	}
+}

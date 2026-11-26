@@ -1,10 +1,8 @@
 package diff
 
 import (
-	"html"
 	"html/template"
 	"path/filepath"
-	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -92,9 +90,12 @@ const (
 	stateNormal scanState = iota
 	stateBlockComment
 	stateRawStringGo
+	stateTemplateStringJS
 	stateTripleQuotePyDouble
 	stateTripleQuotePySingle
 )
+
+const maxHighlightLineBytes = 16384
 
 // HighlightLines tokenizes lines while maintaining multi-line state across lines.
 func HighlightLines(lines []string, lang Lang) [][]TokenSpan {
@@ -114,7 +115,7 @@ func HighlightLinesKeep(lines []string, lang Lang, keep []bool) [][]TokenSpan {
 	goImportBlock := false
 
 	for idx, line := range lines {
-		shouldKeep := (keep == nil || (idx < len(keep) && keep[idx]))
+		shouldKeep := (keep == nil || (idx < len(keep) && keep[idx])) && len(line) <= maxHighlightLineBytes
 		var spans []TokenSpan
 		addSpan := func(cls TokenClass, start, end int) {
 			if shouldKeep {
@@ -146,13 +147,37 @@ func HighlightLinesKeep(lines []string, lang Lang, keep []bool) [][]TokenSpan {
 				continue
 			}
 		case stateRawStringGo:
-			end := strings.Index(line, "`")
+			end := strings.IndexByte(line, '`')
 			if end != -1 {
 				addSpan(TokenString, 0, end+1)
 				pos = end + 1
 				state = stateNormal
 			} else {
 				addSpan(TokenString, 0, n)
+				result[idx] = spans
+				continue
+			}
+		case stateTemplateStringJS:
+			closed := false
+			for pos < n {
+				if line[pos] == '\\' {
+					pos += 2
+					if pos > n {
+						pos = n
+					}
+					continue
+				}
+				if line[pos] == '`' {
+					pos++
+					closed = true
+					break
+				}
+				pos++
+			}
+			addSpan(TokenString, 0, pos)
+			if closed {
+				state = stateNormal
+			} else {
 				result[idx] = spans
 				continue
 			}
@@ -264,8 +289,36 @@ func HighlightLinesKeep(lines []string, lang Lang, keep []bool) [][]TokenSpan {
 				}
 			}
 
-			// Strings
-			if line[pos] == '"' || line[pos] == '\'' || (lang == LangJS && line[pos] == '`') {
+			// JS template strings `...` (may span multiple lines)
+			if lang == LangJS && line[pos] == '`' {
+				start := pos
+				pos++
+				closed := false
+				for pos < n {
+					if line[pos] == '\\' {
+						pos += 2
+						if pos > n {
+							pos = n
+						}
+						continue
+					}
+					if line[pos] == '`' {
+						pos++
+						closed = true
+						break
+					}
+					pos++
+				}
+				addSpan(TokenString, start, pos)
+				if !closed {
+					state = stateTemplateStringJS
+					break
+				}
+				continue
+			}
+
+			// Strings (avoid treating Rust lifetimes like 'a as char literals)
+			if line[pos] == '"' || (line[pos] == '\'' && (lang != LangRust || isRustCharLiteral(line, pos))) {
 				quote := line[pos]
 				start := pos
 				pos++
@@ -511,6 +564,36 @@ func RenderTokensHTML(line string, tokens []TokenSpan, intra []Span) template.HT
 	return RenderTokensHTMLWS(line, tokens, intra, true)
 }
 
+// writeHTMLEscaped appends HTML-escaped s to sb matching html.EscapeString without allocating.
+func writeHTMLEscaped(sb *strings.Builder, s string) {
+	last := 0
+	for i := 0; i < len(s); i++ {
+		var esc string
+		switch s[i] {
+		case '&':
+			esc = "&amp;"
+		case '<':
+			esc = "&lt;"
+		case '>':
+			esc = "&gt;"
+		case '"':
+			esc = "&#34;"
+		case '\'':
+			esc = "&#39;"
+		default:
+			continue
+		}
+		if i > last {
+			sb.WriteString(s[last:i])
+		}
+		sb.WriteString(esc)
+		last = i + 1
+	}
+	if last < len(s) {
+		sb.WriteString(s[last:])
+	}
+}
+
 // RenderTokensHTMLWS renders line text, optionally highlighting trailing whitespace.
 func RenderTokensHTMLWS(line string, tokens []TokenSpan, intra []Span, showWS bool) template.HTML {
 	n := len(line)
@@ -526,47 +609,57 @@ func RenderTokensHTMLWS(line string, tokens []TokenSpan, intra []Span, showWS bo
 		}
 	}
 
-	// Collect all split points
-	var ptsBuf [32]int
-	points := append(ptsBuf[:0], 0, n)
-	if wsStart < n {
-		points = append(points, wsStart)
-	}
-	for _, tok := range tokens {
-		if tok.Start >= 0 && tok.Start <= n {
-			points = append(points, tok.Start)
-		}
-		if tok.End >= 0 && tok.End <= n {
-			points = append(points, tok.End)
-		}
-	}
-	for _, span := range intra {
-		if span.Start >= 0 && span.Start <= n {
-			points = append(points, span.Start)
-		}
-		if span.End >= 0 && span.End <= n {
-			points = append(points, span.End)
-		}
-	}
-	slices.Sort(points)
-	points = slices.Compact(points)
-
 	var sb strings.Builder
+	sb.Grow(n + len(tokens)*28 + len(intra)*28)
+
+	ti := 0
+	ii := 0
+	pos := 0
 	openTokIdx := -1
 
-	for i := 0; i < len(points)-1; i++ {
-		start := points[i]
-		end := points[i+1]
-		if start >= end {
-			continue
+	for pos < n {
+		for ti < len(tokens) && (tokens[ti].End <= pos || tokens[ti].Start >= tokens[ti].End || tokens[ti].Class == TokenNone || tokens[ti].Start >= n) {
+			ti++
+		}
+		for ii < len(intra) && (intra[ii].End <= pos || intra[ii].Start >= intra[ii].End || intra[ii].Start >= n) {
+			ii++
+		}
+
+		next := n
+		if showWS && pos < wsStart && wsStart < next {
+			next = wsStart
 		}
 
 		tokIdx := -1
-		for ti, tok := range tokens {
-			if tok.Start <= start && tok.End >= end && tok.Class != TokenNone {
+		if ti < len(tokens) {
+			tStart := max(tokens[ti].Start, 0)
+			tEnd := min(tokens[ti].End, n)
+			if tStart <= pos {
 				tokIdx = ti
-				break
+				if tEnd < next {
+					next = tEnd
+				}
+			} else if tStart < next {
+				next = tStart
 			}
+		}
+
+		isIntra := false
+		if ii < len(intra) {
+			iStart := max(intra[ii].Start, 0)
+			iEnd := min(intra[ii].End, n)
+			if iStart <= pos {
+				isIntra = true
+				if iEnd < next {
+					next = iEnd
+				}
+			} else if iStart < next {
+				next = iStart
+			}
+		}
+
+		if next <= pos {
+			next = pos + 1
 		}
 
 		if tokIdx != openTokIdx {
@@ -574,32 +667,28 @@ func RenderTokensHTMLWS(line string, tokens []TokenSpan, intra []Span, showWS bo
 				sb.WriteString("</span>")
 			}
 			if tokIdx >= 0 {
-				sb.WriteString(`<span class="` + string(tokens[tokIdx].Class) + `">`)
+				sb.WriteString(`<span class="`)
+				sb.WriteString(string(tokens[tokIdx].Class))
+				sb.WriteString(`">`)
 			}
 			openTokIdx = tokIdx
 		}
 
-		// Check if segment is in intra span
-		isIntra := false
-		for _, s := range intra {
-			if s.Start <= start && s.End >= end {
-				isIntra = true
-				break
-			}
+		isWS := pos >= wsStart
+		if isIntra {
+			sb.WriteString(`<mark class="intra">`)
 		}
-
-		isWS := (start >= wsStart)
-
-		chunk := html.EscapeString(line[start:end])
-
 		if isWS {
-			chunk = `<span class="ws">` + chunk + `</span>`
+			sb.WriteString(`<span class="ws">`)
+		}
+		writeHTMLEscaped(&sb, line[pos:next])
+		if isWS {
+			sb.WriteString("</span>")
 		}
 		if isIntra {
-			chunk = `<mark class="intra">` + chunk + `</mark>`
+			sb.WriteString("</mark>")
 		}
-
-		sb.WriteString(chunk)
+		pos = next
 	}
 
 	if openTokIdx >= 0 {
@@ -618,6 +707,8 @@ func RenderLineHTML(line string, lang Lang, intra []Span) template.HTML {
 	return RenderTokensHTML(line, tokens, intra)
 }
 
+const maxGoDocLinkScan = 257
+
 func addCommentWithDocLinks(addSpan func(TokenClass, int, int), line string, commentStart, commentEnd, bodyStart, bodyEnd int) {
 	cur := commentStart
 	scanPos := bodyStart
@@ -627,9 +718,11 @@ func addCommentWithDocLinks(addSpan func(TokenClass, int, int), line string, com
 			break
 		}
 		openBracket := scanPos + open
-		close := strings.IndexByte(line[openBracket+1:bodyEnd], ']')
+		searchEnd := min(openBracket+1+maxGoDocLinkScan, bodyEnd)
+		close := strings.IndexByte(line[openBracket+1:searchEnd], ']')
 		if close == -1 {
-			break
+			scanPos = openBracket + 1
+			continue
 		}
 		closeBracket := openBracket + 1 + close
 		inner := line[openBracket+1 : closeBracket]
@@ -669,9 +762,11 @@ func ExtractGoDocLinkInRange(line string, bodyStart, bodyEnd, byteIdx int) (stri
 			break
 		}
 		openBracket := scanPos + open
-		close := strings.IndexByte(line[openBracket+1:bodyEnd], ']')
+		searchEnd := min(openBracket+1+maxGoDocLinkScan, bodyEnd)
+		close := strings.IndexByte(line[openBracket+1:searchEnd], ']')
 		if close == -1 {
-			break
+			scanPos = openBracket + 1
+			continue
 		}
 		closeBracket := openBracket + 1 + close
 		inner := line[openBracket+1 : closeBracket]

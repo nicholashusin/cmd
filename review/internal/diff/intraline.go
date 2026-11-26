@@ -1,6 +1,7 @@
 package diff
 
 import (
+	"bytes"
 	"strings"
 	"unicode/utf8"
 )
@@ -18,10 +19,10 @@ type runeSpan struct {
 }
 
 // Intraline computes rune-level intraline diff spans for modified lines.
-// It merges tiny gaps (<= 4 runes), abandons intraline highlights if > 50%
+// It merges tiny gaps (<= 5 runes), abandons intraline highlights if > 50%
 // of runes changed, and converts rune offsets to UTF-8 byte offsets with zero string allocations.
 func Intraline(left, right string) (lSpans, rSpans []Span, ok bool) {
-	if left == right {
+	if left == right || len(left)+len(right) > 4096 {
 		return nil, nil, false
 	}
 
@@ -95,57 +96,47 @@ func Intraline(left, right string) (lSpans, rSpans []Span, ok bool) {
 		}
 	}
 
-	// Merge tiny equal gaps (<= 5 runes) between non-equal blocks
+	// Merge tiny equal gaps (<= 5 runes) between non-equal blocks in a single pass.
 	const maxGap = 5
-	merged := true
-	for merged {
-		merged = false
-		var newBlocks []block
-		j := 0
-		for j < len(blocks) {
-			if j > 0 && j+1 < len(blocks) && blocks[j].isEqual {
-				eqLen := blocks[j].aEnd - blocks[j].aStart
-				if eqLen <= maxGap && !blocks[j-1].isEqual && !blocks[j+1].isEqual {
-					// Merge prev, curr, next into one non-equal block
-					prev := blocks[j-1]
-					next := blocks[j+1]
+	newBlocks := make([]block, 0, len(blocks))
+	for j := 0; j < len(blocks); {
+		if len(newBlocks) > 0 && !newBlocks[len(newBlocks)-1].isEqual &&
+			j+1 < len(blocks) && blocks[j].isEqual && !blocks[j+1].isEqual &&
+			blocks[j].aEnd-blocks[j].aStart <= maxGap {
+			prev := newBlocks[len(newBlocks)-1]
+			next := blocks[j+1]
 
-					aStart := prev.aStart
-					if aStart == -1 || (next.aStart != -1 && blocks[j].aStart < aStart) {
-						aStart = blocks[j].aStart
-					}
-					aEnd := next.aEnd
-					if aEnd == -1 || (prev.aEnd != -1 && blocks[j].aEnd > aEnd) {
-						aEnd = blocks[j].aEnd
-					}
-
-					bStart := prev.bStart
-					if bStart == -1 || (next.bStart != -1 && blocks[j].bStart < bStart) {
-						bStart = blocks[j].bStart
-					}
-					bEnd := next.bEnd
-					if bEnd == -1 || (prev.bEnd != -1 && blocks[j].bEnd > bEnd) {
-						bEnd = blocks[j].bEnd
-					}
-
-					newBlock := block{
-						isEqual: false,
-						aStart:  aStart,
-						aEnd:    aEnd,
-						bStart:  bStart,
-						bEnd:    bEnd,
-					}
-					newBlocks[len(newBlocks)-1] = newBlock
-					j += 2
-					merged = true
-					continue
-				}
+			aStart := prev.aStart
+			if aStart == -1 {
+				aStart = blocks[j].aStart
 			}
-			newBlocks = append(newBlocks, blocks[j])
-			j++
+			aEnd := next.aEnd
+			if aEnd == -1 {
+				aEnd = blocks[j].aEnd
+			}
+			bStart := prev.bStart
+			if bStart == -1 {
+				bStart = blocks[j].bStart
+			}
+			bEnd := next.bEnd
+			if bEnd == -1 {
+				bEnd = blocks[j].bEnd
+			}
+
+			newBlocks[len(newBlocks)-1] = block{
+				isEqual: false,
+				aStart:  aStart,
+				aEnd:    aEnd,
+				bStart:  bStart,
+				bEnd:    bEnd,
+			}
+			j += 2
+			continue
 		}
-		blocks = newBlocks
+		newBlocks = append(newBlocks, blocks[j])
+		j++
 	}
+	blocks = newBlocks
 
 	var rawL []runeSpan
 	var rawR []runeSpan
@@ -173,45 +164,8 @@ func Intraline(left, right string) (lSpans, rSpans []Span, ok bool) {
 	}
 
 	// Compute non-whitespace changed vs unchanged runes for noise suppression
-	unchangedNonWSL := 0
-	changedNonWSL := 0
-	for idx, r := range leftRunes {
-		if r == ' ' || r == '\t' {
-			continue
-		}
-		inSpan := false
-		for _, sp := range mergedL {
-			if idx >= sp.Start && idx < sp.End {
-				inSpan = true
-				break
-			}
-		}
-		if inSpan {
-			changedNonWSL++
-		} else {
-			unchangedNonWSL++
-		}
-	}
-
-	unchangedNonWSR := 0
-	changedNonWSR := 0
-	for idx, r := range rightRunes {
-		if r == ' ' || r == '\t' {
-			continue
-		}
-		inSpan := false
-		for _, sp := range mergedR {
-			if idx >= sp.Start && idx < sp.End {
-				inSpan = true
-				break
-			}
-		}
-		if inSpan {
-			changedNonWSR++
-		} else {
-			unchangedNonWSR++
-		}
-	}
+	unchangedNonWSL, changedNonWSL := countNonWSChanges(leftRunes, mergedL)
+	unchangedNonWSR, changedNonWSR := countNonWSChanges(rightRunes, mergedR)
 
 	if unchangedNonWSL == 0 || (changedNonWSL > 0 && unchangedNonWSL <= 2 && changedNonWSL > unchangedNonWSL*2) ||
 		unchangedNonWSR == 0 || (changedNonWSR > 0 && unchangedNonWSR <= 2 && changedNonWSR > unchangedNonWSR*2) {
@@ -219,7 +173,7 @@ func Intraline(left, right string) (lSpans, rSpans []Span, ok bool) {
 	}
 
 	// Abandon intraline highlight if > 50% of the runes changed
-	if changedRunes > (len(leftRunes)+len(rightRunes)) || changedRunes > maxLen {
+	if changedRunes > maxLen {
 		return nil, nil, false
 	}
 
@@ -227,6 +181,24 @@ func Intraline(left, right string) (lSpans, rSpans []Span, ok bool) {
 	byteSpansR := runeSpansToByteSpans(right, mergedR)
 
 	return byteSpansL, byteSpansR, true
+}
+
+func countNonWSChanges(runes []rune, spans []runeSpan) (unchanged, changed int) {
+	spIdx := 0
+	for idx, r := range runes {
+		if r == ' ' || r == '\t' {
+			continue
+		}
+		for spIdx < len(spans) && spans[spIdx].End <= idx {
+			spIdx++
+		}
+		if spIdx < len(spans) && idx >= spans[spIdx].Start {
+			changed++
+		} else {
+			unchanged++
+		}
+	}
+	return unchanged, changed
 }
 
 func mergeRuneSpans(spans []runeSpan, maxGap int) []runeSpan {
@@ -430,35 +402,15 @@ func buildDiffRows(left, right []string, edits []Edit) []Row {
 			return rows
 		}
 
-		// Step B: Multi-line hunk character diff
-		aStart := make([]int, numA)
-		aNL := make([]int, numA)
-		var aRunes []rune
-		for la := 0; la < numA; la++ {
-			aStart[la] = len(aRunes)
-			r := []rune(hLinesA[la])
-			aRunes = append(aRunes, r...)
-			aNL[la] = len(aRunes)
-			aRunes = append(aRunes, '\n')
-		}
-
-		bStart := make([]int, numB)
-		bNL := make([]int, numB)
-		var bRunes []rune
-		for lb := 0; lb < numB; lb++ {
-			bStart[lb] = len(bRunes)
-			r := []rune(hLinesB[lb])
-			bRunes = append(bRunes, r...)
-			bNL[lb] = len(bRunes)
-			bRunes = append(bRunes, '\n')
-		}
-
-		if len(aRunes)+len(bRunes) > 20000 {
+		// Step B: Multi-line hunk character diff (check rune budget before allocating rune slices)
+		totalA := countHunkRunes(hLinesA)
+		totalB := countHunkRunes(hLinesB)
+		if totalA+totalB > 20000 {
 			minLen := numA
 			if numB < minLen {
 				minLen = numB
 			}
-			var rows []Row
+			rows := make([]Row, 0, max(numA, numB))
 			for k := 0; k < minLen; k++ {
 				lSpans, rSpans, ok := Intraline(hLinesA[k], hLinesB[k])
 				r := Row{
@@ -489,6 +441,30 @@ func buildDiffRows(left, right []string, edits []Edit) []Row {
 				})
 			}
 			return rows
+		}
+
+		aStart := make([]int, numA)
+		aNL := make([]int, numA)
+		aRunes := make([]rune, 0, totalA)
+		for la := 0; la < numA; la++ {
+			aStart[la] = len(aRunes)
+			for _, r := range hLinesA[la] {
+				aRunes = append(aRunes, r)
+			}
+			aNL[la] = len(aRunes)
+			aRunes = append(aRunes, '\n')
+		}
+
+		bStart := make([]int, numB)
+		bNL := make([]int, numB)
+		bRunes := make([]rune, 0, totalB)
+		for lb := 0; lb < numB; lb++ {
+			bStart[lb] = len(bRunes)
+			for _, r := range hLinesB[lb] {
+				bRunes = append(bRunes, r)
+			}
+			bNL[lb] = len(bRunes)
+			bRunes = append(bRunes, '\n')
 		}
 
 		charEditsRaw := Edits(aRunes, bRunes)
@@ -611,45 +587,43 @@ func buildDiffRows(left, right []string, edits []Edit) []Row {
 			numLines := len(hLines)
 			lineSpans := make([][]Span, numLines)
 			hasEdits := make([]bool, numLines)
+			editStart := 0
 			for l := 0; l < numLines; l++ {
 				st := starts[l]
 				nl := nls[l]
 				lineRunes := runes[st:nl]
 
+				for editStart < len(cEdits) {
+					_, ee := getBounds(cEdits[editStart])
+					if ee > st {
+						break
+					}
+					editStart++
+				}
+
 				wholeLine := false
 				hasAny := false
-				for _, e := range cEdits {
-					es, ee := getBounds(e)
-					if es < nl+1 && ee > st {
+				var spans []runeSpan
+				for ei := editStart; ei < len(cEdits); ei++ {
+					es, ee := getBounds(cEdits[ei])
+					if es >= nl+1 {
+						break
+					}
+					if ee > st {
 						hasAny = true
 					}
 					if es <= st && ee >= nl+1 {
 						wholeLine = true
 						break
 					}
-				}
-				hasEdits[l] = hasAny
-				if wholeLine {
-					lineSpans[l] = nil
-					continue
-				}
-
-				var spans []runeSpan
-				for _, e := range cEdits {
-					es, ee := getBounds(e)
-					s := es
-					if s < st {
-						s = st
-					}
-					end := ee
-					if end > nl {
-						end = nl
-					}
+					s := max(es, st)
+					end := min(ee, nl)
 					if s < end {
 						spans = append(spans, runeSpan{Start: s - st, End: end - st})
 					}
 				}
-				if len(spans) == 0 {
+				hasEdits[l] = hasAny
+				if wholeLine || len(spans) == 0 {
 					lineSpans[l] = nil
 					continue
 				}
@@ -679,25 +653,7 @@ func buildDiffRows(left, right []string, edits []Edit) []Row {
 				}
 
 				merged := mergeRuneSpans(spans, 0)
-				unchangedNonWS := 0
-				changedNonWS := 0
-				for idx, r := range lineRunes {
-					if r == ' ' || r == '\t' {
-						continue
-					}
-					inSpan := false
-					for _, sp := range merged {
-						if idx >= sp.Start && idx < sp.End {
-							inSpan = true
-							break
-						}
-					}
-					if inSpan {
-						changedNonWS++
-					} else {
-						unchangedNonWS++
-					}
-				}
+				unchangedNonWS, changedNonWS := countNonWSChanges(lineRunes, merged)
 				if unchangedNonWS == 0 || (changedNonWS > 0 && unchangedNonWS <= 2 && changedNonWS > unchangedNonWS*2) {
 					lineSpans[l] = nil
 				} else {
@@ -921,42 +877,55 @@ func buildDiffRows(left, right []string, edits []Edit) []Row {
 	return rows
 }
 
-// ownLines returns a boolean slice for lines in file (1-based index mapped to 0-based),
-// where true means the line was added or modified relative to parent.
-func ownLines(parent, file []byte) []bool {
-	fLines := SplitLines(file)
-	if len(fLines) == 0 {
-		return nil
+// MarkRebased marks lines in rows that came from upstream parent changes
+// (oldParent -> newParent) rather than edits made by the change itself.
+func MarkRebased(rows []Row, old, new, oldParent, newParent []byte) {
+	if bytes.Equal(oldParent, newParent) {
+		return
 	}
-	if len(parent) == 0 {
-		owned := make([]bool, len(fLines))
-		for i := range owned {
-			owned[i] = true
-		}
-		return owned
-	}
-
-	pLines := SplitLines(parent)
-	edits := Edits(pLines, fLines)
-	owned := make([]bool, len(fLines))
-	for _, e := range edits {
-		if e.Op == OpInsert {
-			owned[e.BIndex] = true
-		}
-	}
-	return owned
+	MarkRebasedLines(rows, SplitLines(old), SplitLines(new), SplitLines(oldParent), SplitLines(newParent))
 }
 
-// MarkRebased marks lines in rows that were not introduced by the commit relative
-// to its own parent (e.g. changes introduced purely by rebasing over upstream changes).
-func MarkRebased(rows []Row, old, new, oldParent, newParent []byte) {
-	var leftOwned []bool
-	if len(oldParent) > 0 && len(old) > 0 {
-		leftOwned = ownLines(oldParent, old)
+// MarkRebasedLines is like MarkRebased on pre-split line slices.
+func MarkRebasedLines(rows []Row, oldLines, newLines, oldParentLines, newParentLines []string) {
+	if len(oldParentLines) == 0 && len(newParentLines) == 0 {
+		return
 	}
-	var rightOwned []bool
-	if len(newParent) > 0 && len(new) > 0 {
-		rightOwned = ownLines(newParent, new)
+	pEdits := Edits(oldParentLines, newParentLines)
+	parentDel := make([]bool, len(oldParentLines))
+	parentAdd := make([]bool, len(newParentLines))
+	hasParentDiff := false
+	for _, e := range pEdits {
+		switch e.Op {
+		case OpDelete:
+			parentDel[e.AIndex] = true
+			hasParentDiff = true
+		case OpInsert:
+			parentAdd[e.BIndex] = true
+			hasParentDiff = true
+		}
+	}
+	if !hasParentDiff {
+		return
+	}
+
+	var leftRebased []bool
+	if len(oldParentLines) > 0 && len(oldLines) > 0 {
+		leftRebased = make([]bool, len(oldLines))
+		for _, e := range Edits(oldParentLines, oldLines) {
+			if e.Op == OpEqual && parentDel[e.AIndex] {
+				leftRebased[e.BIndex] = true
+			}
+		}
+	}
+	var rightRebased []bool
+	if len(newParentLines) > 0 && len(newLines) > 0 {
+		rightRebased = make([]bool, len(newLines))
+		for _, e := range Edits(newParentLines, newLines) {
+			if e.Op == OpEqual && parentAdd[e.AIndex] {
+				rightRebased[e.BIndex] = true
+			}
+		}
 	}
 
 	for i := range rows {
@@ -964,15 +933,11 @@ func MarkRebased(rows []Row, old, new, oldParent, newParent []byte) {
 		if r.Type == RowEqual || r.Type == RowSkip {
 			continue
 		}
-		if leftOwned != nil && r.LeftLine > 0 && r.LeftLine <= len(leftOwned) {
-			if !leftOwned[r.LeftLine-1] {
-				r.RebasedL = true
-			}
+		if leftRebased != nil && r.LeftLine > 0 && r.LeftLine <= len(leftRebased) && leftRebased[r.LeftLine-1] {
+			r.RebasedL = true
 		}
-		if rightOwned != nil && r.RightLine > 0 && r.RightLine <= len(rightOwned) {
-			if !rightOwned[r.RightLine-1] {
-				r.RebasedR = true
-			}
+		if rightRebased != nil && r.RightLine > 0 && r.RightLine <= len(rightRebased) && rightRebased[r.RightLine-1] {
+			r.RebasedR = true
 		}
 	}
 }
