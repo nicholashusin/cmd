@@ -205,7 +205,92 @@ type DirGoBlobRepo interface {
 	ReadDirGoFiles(rev, dir string) ([]GoFileBlobContent, error)
 }
 
-const jjCacheTTL = 250 * time.Millisecond
+// DiffStat holds the aggregate file and line diff counts for a commit.
+type DiffStat struct {
+	Files          int
+	Added          int
+	Deleted        int
+	WhitespaceOnly bool
+}
+
+// HasChanges reports whether the diff stat records any modified files or lines.
+func (d DiffStat) HasChanges() bool {
+	return d.Files > 0 || d.Added > 0 || d.Deleted > 0
+}
+
+// Summary returns a concise tooltip description such as "2 files changed (+7 −1)".
+func (d DiffStat) Summary() string {
+	unit := "files"
+	if d.Files == 1 {
+		unit = "file"
+	}
+	base := fmt.Sprintf("%d %s changed", d.Files, unit)
+	if d.WhitespaceOnly {
+		return base + " (whitespace only)"
+	}
+	if d.Added == 0 && d.Deleted == 0 {
+		return base
+	}
+	var parts []string
+	if d.Added > 0 {
+		parts = append(parts, fmt.Sprintf("+%d", d.Added))
+	}
+	if d.Deleted > 0 {
+		parts = append(parts, fmt.Sprintf("−%d", d.Deleted))
+	}
+	return fmt.Sprintf("%s (%s)", base, strings.Join(parts, " "))
+}
+
+// DiffStatRepo is an optional interface for repositories that can batch-compute
+// per-commit diff statistics for a set of changes, keyed by change Rev.
+type DiffStatRepo interface {
+	ChangeDiffStats(changes []*Change) map[string]DiffStat
+}
+
+// ChangeDiffStats returns total diff statistics for changes, keyed by c.Rev.
+// Repositories implementing DiffStatRepo use cached batched queries; others fall
+// back to per-change Files lookups.
+func ChangeDiffStats(repo Repo, changes []*Change) map[string]DiffStat {
+	if repo == nil || len(changes) == 0 {
+		return nil
+	}
+	if dr, ok := repo.(DiffStatRepo); ok {
+		return dr.ChangeDiffStats(changes)
+	}
+	out := make(map[string]DiffStat, len(changes))
+	for _, c := range changes {
+		if c == nil || c.Rev == "" || c.Empty {
+			continue
+		}
+		if files, err := repo.Files(c.Parent, c.Rev); err == nil {
+			out[c.Rev] = diffStatFromFiles(files)
+		}
+	}
+	return out
+}
+
+func diffStatFromFiles(files []*File) DiffStat {
+	var st DiffStat
+	for _, f := range files {
+		if f == nil || IsCommitMsgPath(f.Path) {
+			continue
+		}
+		st.Files++
+		st.Added += f.AddedLines
+		st.Deleted += f.DeletedLines
+	}
+	return st
+}
+
+const (
+	jjCacheTTL         = 250 * time.Millisecond
+	maxCachedDiffStats = 4096
+)
+
+type diffStatKey struct {
+	parent string
+	rev    string
+}
 
 type jjCacheEntry struct {
 	opID    string
@@ -220,6 +305,7 @@ type Cache struct {
 	repoGitDirs map[string]string
 	jjChanges   map[string]jjCacheEntry
 	repoUsers   map[string]string
+	diffStats   map[diffStatKey]DiffStat
 }
 
 // NewCache creates an initialized VCS cache.
@@ -229,7 +315,30 @@ func NewCache() *Cache {
 		repoGitDirs: make(map[string]string),
 		jjChanges:   make(map[string]jjCacheEntry),
 		repoUsers:   make(map[string]string),
+		diffStats:   make(map[diffStatKey]DiffStat),
 	}
+}
+
+func (c *Cache) getDiffStat(parent, rev string) (DiffStat, bool) {
+	if c == nil || !IsImmutableHexRev(rev) || (parent != "" && !IsImmutableHexRev(parent)) {
+		return DiffStat{}, false
+	}
+	c.mu.Lock()
+	st, ok := c.diffStats[diffStatKey{parent: parent, rev: rev}]
+	c.mu.Unlock()
+	return st, ok
+}
+
+func (c *Cache) putDiffStat(parent, rev string, st DiffStat) {
+	if c == nil || !IsImmutableHexRev(rev) || (parent != "" && !IsImmutableHexRev(parent)) {
+		return
+	}
+	c.mu.Lock()
+	if c.diffStats == nil || len(c.diffStats) >= maxCachedDiffStats {
+		c.diffStats = make(map[diffStatKey]DiffStat)
+	}
+	c.diffStats[diffStatKey{parent: parent, rev: rev}] = st
+	c.mu.Unlock()
 }
 
 func (c *Cache) user(root string, detect func() string) string {
@@ -632,6 +741,78 @@ func gitDiffFiles(gitDir, workDir, baseRev, targetRev string) ([]*File, error) {
 	}
 
 	return files, nil
+}
+
+// gitBatchCommitDiffStats computes per-commit diff stats against each commit's
+// first parent (or empty tree for root commits) in batched git log subprocesses.
+func gitBatchCommitDiffStats(gitDir, workDir string, revs []string) (map[string]DiffStat, error) {
+	result := make(map[string]DiffStat, len(revs))
+	if len(revs) == 0 {
+		return result, nil
+	}
+	const chunkSize = 128
+	for start := 0; start < len(revs); start += chunkSize {
+		end := min(start+chunkSize, len(revs))
+		var args []string
+		if gitDir != "" {
+			args = append(args, "--git-dir="+gitDir)
+		}
+		args = append(args, "--no-optional-locks", "log", "--no-walk", "-m", "--first-parent", "--numstat", "-M", "-z", "--format=%x1e%H")
+		args = append(args, revs[start:end]...)
+		args = append(args, "--")
+
+		cmd := exec.Command("git", args...)
+		if gitDir == "" && workDir != "" {
+			cmd.Dir = workDir
+		}
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, err
+		}
+
+		parts := bytes.Split(out, []byte{0})
+		curSHA := ""
+		for i := 0; i < len(parts); i++ {
+			p := bytes.TrimLeft(parts[i], "\n")
+			if len(p) == 0 {
+				continue
+			}
+			if p[0] == 0x1e {
+				curSHA = strings.TrimSpace(string(p[1:]))
+				if curSHA != "" {
+					if _, exists := result[curSHA]; !exists {
+						result[curSHA] = DiffStat{}
+					}
+				}
+				continue
+			}
+			if curSHA == "" {
+				continue
+			}
+			tabs := bytes.SplitN(p, []byte{'\t'}, 3)
+			if len(tabs) < 3 {
+				continue
+			}
+			if len(tabs[2]) == 0 {
+				// Rename/copy entry in -z mode: empty path followed by NUL-separated old and new paths.
+				i += 2
+			}
+			st := result[curSHA]
+			st.Files++
+			if addStr := string(tabs[0]); addStr != "-" {
+				if n, err := strconv.Atoi(addStr); err == nil {
+					st.Added += n
+				}
+			}
+			if delStr := string(tabs[1]); delStr != "-" {
+				if n, err := strconv.Atoi(delStr); err == nil {
+					st.Deleted += n
+				}
+			}
+			result[curSHA] = st
+		}
+	}
+	return result, nil
 }
 
 const commitMsgDateFormat = "2006-01-02 15:04:05 -0700"

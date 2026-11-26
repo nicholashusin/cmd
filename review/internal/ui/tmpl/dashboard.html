@@ -57,6 +57,19 @@
                 {{end}}
               </div>
               <div class="commit-meta">
+                {{$ds := index $repo.DiffStats .Change.Rev}}
+                {{if $ds.HasChanges}}
+                  <span class="commit-diff-stat" title="{{$ds.Summary}}">
+                    {{if $ds.WhitespaceOnly}}
+                      <span class="badge badge-ws-only">whitespace only</span>
+                    {{else if or (gt $ds.Added 0) (gt $ds.Deleted 0)}}
+                      {{if gt $ds.Added 0}}<span class="lines-add">+{{$ds.Added}}</span>{{end}}
+                      {{if gt $ds.Deleted 0}}<span class="lines-del">&minus;{{$ds.Deleted}}</span>{{end}}
+                    {{else}}
+                      <span class="commit-diff-files">{{$ds.Files}} {{if eq $ds.Files 1}}file{{else}}files{{end}}</span>
+                    {{end}}
+                  </span>
+                {{end}}
                 <span>{{.Change.Author}}</span>
                 {{$ct := CommitTime .Change}}
                 {{if not $ct.IsZero}}<time class="commit-time rel-time" datetime="{{ISOTime $ct}}" title="{{ExactTime $ct}}">{{RelTime $ct}}</time>{{end}}

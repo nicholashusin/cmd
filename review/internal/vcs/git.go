@@ -530,3 +530,56 @@ func (r *GitRepo) ReadDirGoFiles(rev, dir string) ([]GoFileBlobContent, error) {
 	}
 	return cf.ReadDirGoFiles(rev, dir)
 }
+
+// ChangeDiffStats implements DiffStatRepo for GitRepo using cached batched git log queries.
+func (r *GitRepo) ChangeDiffStats(changes []*Change) map[string]DiffStat {
+	out := make(map[string]DiffStat, len(changes))
+	var batchChanges []*Change
+	var batchRevs []string
+	seenBatch := make(map[string]bool)
+	var fallback []*Change
+
+	for _, c := range changes {
+		if c == nil || c.Rev == "" || c.Empty {
+			continue
+		}
+		if st, ok := r.cache.getDiffStat(c.Parent, c.Rev); ok {
+			out[c.Rev] = st
+			continue
+		}
+		if IsImmutableHexRev(c.Rev) && (c.Parent == "" || IsImmutableHexRev(c.Parent)) {
+			batchChanges = append(batchChanges, c)
+			if !seenBatch[c.Rev] {
+				seenBatch[c.Rev] = true
+				batchRevs = append(batchRevs, c.Rev)
+			}
+		} else {
+			fallback = append(fallback, c)
+		}
+	}
+
+	if len(batchRevs) > 0 {
+		stats, err := gitBatchCommitDiffStats(r.gitDir, r.root, batchRevs)
+		if err == nil {
+			for _, c := range batchChanges {
+				if st, ok := stats[c.Rev]; ok {
+					out[c.Rev] = st
+					r.cache.putDiffStat(c.Parent, c.Rev, st)
+				} else {
+					fallback = append(fallback, c)
+				}
+			}
+		} else {
+			fallback = append(fallback, batchChanges...)
+		}
+	}
+
+	for _, c := range fallback {
+		if files, err := r.Files(c.Parent, c.Rev); err == nil {
+			st := diffStatFromFiles(files)
+			out[c.Rev] = st
+			r.cache.putDiffStat(c.Parent, c.Rev, st)
+		}
+	}
+	return out
+}

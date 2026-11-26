@@ -1720,3 +1720,175 @@ func FuzzParseGitTreeAndSpecs(f *testing.F) {
 		_ = parseJJTimestamp(specStr)
 	})
 }
+
+func TestChangeDiffStats(t *testing.T) {
+	dir := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init", "-b", "main")
+	runGit("config", "user.name", "Diff Stat Tester")
+	runGit("config", "user.email", "stat@example.com")
+
+	// 1. Root commit: 1 file, +3 -0
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("one\ntwo\nthree\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "a.txt")
+	runGit("commit", "-m", "root commit")
+	rootSHA := runGit("rev-parse", "HEAD")
+
+	// 2. Side branch commit for merge test
+	runGit("checkout", "-b", "side")
+	if err := os.WriteFile(filepath.Join(dir, "side.txt"), []byte("s1\ns2\ns3\ns4\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "side.txt")
+	runGit("commit", "-m", "side commit")
+	sideSHA := runGit("rev-parse", "HEAD")
+
+	// 3. Main branch edit: modify a.txt (+2 -1) and add b.txt (+2 -0) -> 2 files, +4 -1
+	runGit("checkout", "main")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("one\ntwo-edited\nextra\nthree\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b1\nb2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "edit and add")
+	editSHA := runGit("rev-parse", "HEAD")
+
+	// 4. Pure rename + binary file commit -> 2 files, +0 -0
+	runGit("mv", "b.txt", "b_renamed.txt")
+	if err := os.WriteFile(filepath.Join(dir, "bin.dat"), []byte{0x00, 0x01, 0x02, 0x03}, 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "rename and binary")
+	renameBinSHA := runGit("rev-parse", "HEAD")
+
+	// 5. Merge commit against first parent (renameBinSHA) bringing in side.txt (+4 -0, 1 file)
+	runGit("merge", "--no-ff", "-m", "merge side", sideSHA)
+	mergeSHA := runGit("rev-parse", "HEAD")
+
+	cache := NewCache()
+	defer cache.Close()
+	repo, err := Open(dir, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changes := []*Change{
+		{Rev: rootSHA, Parent: ""},
+		{Rev: editSHA, Parent: rootSHA},
+		{Rev: renameBinSHA, Parent: editSHA},
+		{Rev: mergeSHA, Parent: renameBinSHA},
+	}
+
+	stats := ChangeDiffStats(repo, changes)
+	want := map[string]DiffStat{
+		rootSHA:      {Files: 1, Added: 3, Deleted: 0},
+		editSHA:      {Files: 2, Added: 4, Deleted: 1},
+		renameBinSHA: {Files: 2, Added: 0, Deleted: 0},
+		mergeSHA:     {Files: 1, Added: 4, Deleted: 0},
+	}
+	for rev, w := range want {
+		if got := stats[rev]; got != w {
+			t.Errorf("Git ChangeDiffStats[%s] = %+v, want %+v", rev[:8], got, w)
+		}
+	}
+
+	// Verify cached entries are populated and reused on second call.
+	for _, c := range changes {
+		if got, ok := cache.getDiffStat(c.Parent, c.Rev); !ok || got != want[c.Rev] {
+			t.Errorf("expected cached diff stat for %s = %+v, got ok=%v %+v", c.Rev[:8], want[c.Rev], ok, got)
+		}
+	}
+	stats2 := ChangeDiffStats(repo, changes)
+	for rev, w := range want {
+		if got := stats2[rev]; got != w {
+			t.Errorf("cached ChangeDiffStats[%s] = %+v, want %+v", rev[:8], got, w)
+		}
+	}
+
+	// Test JJ repo (including a conflicted commit that takes the jj diff.stat() fallback).
+	if _, err := exec.LookPath("jj"); err == nil {
+		jjDir := t.TempDir()
+		runJJ := func(args ...string) string {
+			t.Helper()
+			cmd := exec.Command("jj", append([]string{"--config", `ui.paginate="never"`}, args...)...)
+			cmd.Dir = jjDir
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("jj %v failed: %s (%v)", args, string(out), err)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		runJJ("git", "init", "--colocate")
+		runJJ("config", "set", "--repo", "user.name", "JJ Tester")
+		runJJ("config", "set", "--repo", "user.email", "jj@example.com")
+
+		if err := os.WriteFile(filepath.Join(jjDir, "f.txt"), []byte("line1\nline2\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		runJJ("commit", "-m", "base jj")
+		baseJJ := runJJ("log", "--no-graph", "-r", "@-", "-T", "change_id")
+
+		if err := os.WriteFile(filepath.Join(jjDir, "f.txt"), []byte("line1\nline2-mod\nline3\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		runJJ("commit", "-m", "edit jj")
+
+		// Create a sibling branch that modifies the same line, then rebase to produce a conflicted commit.
+		runJJ("new", baseJJ)
+		if err := os.WriteFile(filepath.Join(jjDir, "f.txt"), []byte("line1\nline2-other\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		runJJ("commit", "-m", "conflict jj")
+		runJJ("rebase", "-r", "@-", "-d", `description(exact:"edit jj\n")`)
+
+		jjCache := NewCache()
+		defer jjCache.Close()
+		jjRepo, err := Open(jjDir, jjCache)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jjChanges, err := jjRepo.Changes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		jjStats := ChangeDiffStats(jjRepo, jjChanges)
+		foundBase, foundEdit, foundConflict := false, false, false
+		for _, c := range jjChanges {
+			switch c.Subject {
+			case "base jj":
+				foundBase = true
+				if got := jjStats[c.Rev]; got != (DiffStat{Files: 1, Added: 2, Deleted: 0}) {
+					t.Errorf("JJ base diff stat = %+v, want {Files:1 Added:2 Deleted:0}", got)
+				}
+			case "edit jj":
+				foundEdit = true
+				if got := jjStats[c.Rev]; got != (DiffStat{Files: 1, Added: 2, Deleted: 1}) {
+					t.Errorf("JJ edit diff stat = %+v, want {Files:1 Added:2 Deleted:1}", got)
+				}
+			case "conflict jj":
+				foundConflict = true
+				if got := jjStats[c.Rev]; got.Files != 1 || (got.Added == 0 && got.Deleted == 0) {
+					t.Errorf("JJ conflict diff stat = %+v, want Files=1 with non-zero line changes", got)
+				}
+			}
+		}
+		if !foundBase || !foundEdit || !foundConflict {
+			t.Fatalf("expected all JJ commits in Changes(), foundBase=%v foundEdit=%v foundConflict=%v", foundBase, foundEdit, foundConflict)
+		}
+	}
+}

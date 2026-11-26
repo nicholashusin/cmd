@@ -64,7 +64,7 @@
       });
     } catch (e) {}
 
-    if (document.querySelector('.diff-container, .diff-all-files, .file-summary-card')) {
+    if (document.querySelector('.diff-container, .diff-all-files, .file-summary-card, .commit-graph')) {
       beginSelfReload();
       window.location.reload();
     }

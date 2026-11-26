@@ -22927,3 +22927,99 @@ vm.runInContext(code, ctx);
 		t.Fatalf("TestUI_FloatingPopupCodeSearchButton failed: %v\n%s", err, string(out))
 	}
 }
+
+func TestDashboardAndRepoCommitDiffStats(t *testing.T) {
+	srv, ts, d, repoDir := setupTestServer(t)
+	defer srv.broker.Close()
+	defer ts.Close()
+	defer d.Close()
+
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+		}
+	}
+
+	// Commit 1: modify hello.go (+4 -1) and add extra.go (+3 -0) -> 2 files, +7 -1
+	if err := os.WriteFile(filepath.Join(repoDir, "hello.go"), []byte("package main\n\nfunc main() {\n\tprintln(\"hi\")\n\tprintln(\"again\")\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "extra.go"), []byte("package main\n\nvar x = 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "hello.go", "extra.go")
+	runGit("commit", "-m", "Modify hello and add extra\n\nChange-Id: I7777777777777777777777777777777777777777")
+
+	// Commit 2: pure rename -> 1 file, +0 -0 (shows "1 file")
+	runGit("mv", "extra.go", "extra_renamed.go")
+	runGit("commit", "-m", "Pure rename extra\n\nChange-Id: I8888888888888888888888888888888888888888")
+
+	// Commit 3: whitespace-only re-indentation of hello.go (+2 -2 raw, whitespace-only when ignore_ws=on)
+	if err := os.WriteFile(filepath.Join(repoDir, "hello.go"), []byte("package main\n\nfunc main() {\n\t\tprintln(\"hi\")\n\t\tprintln(\"again\")\n}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "hello.go")
+	runGit("commit", "-m", "Reindent hello\n\nChange-Id: I9999999999999999999999999999999999999999")
+
+	rec, err := d.EnsureRepo(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Default ignore_ws=on: whitespace-only commit shows "whitespace only" badge instead of +2/-2.
+	for _, urlPath := range []string{"/", "/r/" + rec.Slug} {
+		resp, err := http.Get(ts.URL + urlPath)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s failed: status=%v err=%v", urlPath, resp.StatusCode, err)
+		}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		html := string(bodyBytes)
+
+		if !strings.Contains(html, `class="commit-diff-stat"`) {
+			t.Errorf("GET %s missing .commit-diff-stat", urlPath)
+		}
+		if !strings.Contains(html, `title="2 files changed (&#43;7 −1)"`) {
+			t.Errorf("GET %s missing expected tooltip for +7 -1 commit", urlPath)
+		}
+		if !strings.Contains(html, `<span class="lines-add">+7</span>`) || !strings.Contains(html, `<span class="lines-del">&minus;1</span>`) {
+			t.Errorf("GET %s missing +7/-1 diff stat spans", urlPath)
+		}
+		if !strings.Contains(html, `<span class="commit-diff-files">1 file</span>`) {
+			t.Errorf("GET %s missing '1 file' stat for pure rename commit", urlPath)
+		}
+		if !strings.Contains(html, `title="1 file changed (whitespace only)"`) || !strings.Contains(html, `<span class="badge badge-ws-only">whitespace only</span>`) {
+			t.Errorf("GET %s expected whitespace-only badge when ignore_ws=on", urlPath)
+		}
+	}
+
+	// With ignore_ws=off: whitespace-only commit shows raw +2/-2 counts instead of whitespace-only badge.
+	if err := d.SetPref("ignore_ws", "off"); err != nil {
+		t.Fatal(err)
+	}
+	for _, urlPath := range []string{"/", "/r/" + rec.Slug} {
+		resp, err := http.Get(ts.URL + urlPath)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s (ignore_ws=off) failed: status=%v err=%v", urlPath, resp.StatusCode, err)
+		}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		html := string(bodyBytes)
+
+		if strings.Contains(html, `badge-ws-only`) {
+			t.Errorf("GET %s (ignore_ws=off) should not show whitespace-only badge", urlPath)
+		}
+		if !strings.Contains(html, `title="1 file changed (&#43;2 −2)"`) || !strings.Contains(html, `<span class="lines-add">+2</span>`) || !strings.Contains(html, `<span class="lines-del">&minus;2</span>`) {
+			t.Errorf("GET %s (ignore_ws=off) expected raw +2/-2 for reindent commit", urlPath)
+		}
+	}
+}

@@ -66,6 +66,186 @@ type FileDiffData struct {
 	ScopesRJSON        string
 }
 
+type wsDiffStatKey struct {
+	parent string
+	rev    string
+}
+
+const maxCachedWSDiffStats = 4096
+
+func (s *Server) getWSDiffStat(parent, rev string) (vcs.DiffStat, bool) {
+	if !vcs.IsImmutableHexRev(rev) || (parent != "" && !vcs.IsImmutableHexRev(parent)) {
+		return vcs.DiffStat{}, false
+	}
+	s.wsStatMu.Lock()
+	st, ok := s.wsStats[wsDiffStatKey{parent: parent, rev: rev}]
+	s.wsStatMu.Unlock()
+	return st, ok
+}
+
+func (s *Server) putWSDiffStat(parent, rev string, st vcs.DiffStat) {
+	if !vcs.IsImmutableHexRev(rev) || (parent != "" && !vcs.IsImmutableHexRev(parent)) {
+		return
+	}
+	s.wsStatMu.Lock()
+	if s.wsStats == nil || len(s.wsStats) >= maxCachedWSDiffStats {
+		s.wsStats = make(map[wsDiffStatKey]vcs.DiffStat)
+	}
+	s.wsStats[wsDiffStatKey{parent: parent, rev: rev}] = st
+	s.wsStatMu.Unlock()
+}
+
+func computeWSCommitDiffStat(repo vcs.Repo, c *vcs.Change) (vcs.DiffStat, bool) {
+	if repo == nil || c == nil || c.Rev == "" || c.Empty {
+		return vcs.DiffStat{}, false
+	}
+	files, err := repo.Files(c.Parent, c.Rev)
+	if err != nil {
+		return vcs.DiffStat{}, false
+	}
+
+	var st vcs.DiffStat
+	wsOnlyFiles := 0
+	hasParent := c.Parent != "" && strings.Trim(c.Parent, "0") != ""
+
+	for _, f := range files {
+		if f == nil || vcs.IsCommitMsgPath(f.Path) {
+			continue
+		}
+		st.Files++
+		if f.Binary {
+			continue
+		}
+		if f.Status == vcs.FileAdded && f.AddedLines > 0 {
+			st.Added += f.AddedLines
+			continue
+		}
+		if f.Status == vcs.FileDeleted && f.DeletedLines > 0 {
+			st.Deleted += f.DeletedLines
+			continue
+		}
+
+		cleanPath := strings.TrimPrefix(f.Path, "/")
+		basePath := f.Path
+		if f.Status == vcs.FileRenamed && f.OldPath != "" {
+			basePath = f.OldPath
+		}
+
+		var baseData, targetData []byte
+		if hasParent && f.Status != vcs.FileAdded {
+			baseData, _ = repo.Content(c.Parent, basePath)
+		}
+		if f.Status != vcs.FileDeleted {
+			targetData, _ = repo.Content(c.Rev, f.Path)
+		}
+
+		if bytes.Equal(baseData, targetData) {
+			continue
+		}
+		if diff.IsBinary(baseData) || diff.IsBinary(targetData) {
+			continue
+		}
+		if len(baseData) == 0 {
+			st.Added += len(diff.SplitLines(targetData))
+			continue
+		}
+		if len(targetData) == 0 {
+			st.Deleted += len(diff.SplitLines(baseData))
+			continue
+		}
+
+		baseLines := diff.SplitLines(baseData)
+		targetLines := diff.SplitLines(targetData)
+		if len(baseLines) > 25000 || len(targetLines) > 25000 {
+			st.Added += f.AddedLines
+			st.Deleted += f.DeletedLines
+			continue
+		}
+
+		lang := diff.DetectLang(cleanPath)
+		if lang == diff.LangNone && basePath != f.Path {
+			lang = diff.DetectLang(basePath)
+		}
+		rows := diff.BuildDiffRows(baseLines, targetLines, lang, true)
+		added, deleted := countDiffRows(rows)
+		st.Added += added
+		st.Deleted += deleted
+		if added == 0 && deleted == 0 {
+			wsOnlyFiles++
+		}
+	}
+
+	if st.Added == 0 && st.Deleted == 0 && wsOnlyFiles > 0 && wsOnlyFiles == st.Files {
+		st.WhitespaceOnly = true
+	}
+	return st, true
+}
+
+func (s *Server) changeDiffStatsForRows(repo vcs.Repo, rows []vcs.GraphRow, ignoreWS bool) map[string]vcs.DiffStat {
+	if repo == nil || len(rows) == 0 {
+		return nil
+	}
+	changes := make([]*vcs.Change, len(rows))
+	for i, gr := range rows {
+		changes[i] = gr.Change
+	}
+	if !ignoreWS {
+		return vcs.ChangeDiffStats(repo, changes)
+	}
+
+	out := make(map[string]vcs.DiffStat, len(changes))
+	var misses []*vcs.Change
+	seenMiss := make(map[string]bool)
+	for _, c := range changes {
+		if c == nil || c.Rev == "" || c.Empty {
+			continue
+		}
+		if st, ok := s.getWSDiffStat(c.Parent, c.Rev); ok {
+			out[c.Rev] = st
+			continue
+		}
+		if !seenMiss[c.Rev] {
+			seenMiss[c.Rev] = true
+			misses = append(misses, c)
+		}
+	}
+	if len(misses) == 0 {
+		return out
+	}
+
+	results := make([]vcs.DiffStat, len(misses))
+	okFlags := make([]bool, len(misses))
+	if len(misses) == 1 {
+		results[0], okFlags[0] = computeWSCommitDiffStat(repo, misses[0])
+	} else {
+		workers := min(len(misses), 4)
+		ch := make(chan int, len(misses))
+		for i := range misses {
+			ch <- i
+		}
+		close(ch)
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for w := 0; w < workers; w++ {
+			go func() {
+				defer wg.Done()
+				for idx := range ch {
+					results[idx], okFlags[idx] = computeWSCommitDiffStat(repo, misses[idx])
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	for i, c := range misses {
+		if okFlags[i] {
+			out[c.Rev] = results[i]
+			s.putWSDiffStat(c.Parent, c.Rev, results[i])
+		}
+	}
+	return out
+}
+
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	repos, err := s.d.Repos()
 	if err != nil {
@@ -77,6 +257,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		Record    *db.RepoRecord
 		GraphRows []vcs.GraphRow
 		Summaries map[string]*db.ChangeSummary
+		DiffStats map[string]vcs.DiffStat
 		Available bool
 	}
 
@@ -88,6 +269,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ignoreWS := s.ignoreWhitespace()
 	repoIDs := make([]int64, len(repos))
 	for i, rec := range repos {
 		repoIDs[i] = rec.ID
@@ -136,6 +318,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 					Record:    rec,
 					GraphRows: graphRows,
 					Summaries: sums,
+					DiffStats: s.changeDiffStatsForRows(repo, graphRows, ignoreWS),
 					Available: true,
 				}
 			}
@@ -179,6 +362,7 @@ func (s *Server) handleRepo(w http.ResponseWriter, r *http.Request) {
 		"Record":        rec,
 		"GraphRows":     graphRows,
 		"Summaries":     sums,
+		"DiffStats":     s.changeDiffStatsForRows(repo, graphRows, s.ignoreWhitespace()),
 		"StateRepo":     rec.Slug,
 	})
 }

@@ -722,6 +722,18 @@ header.app-header.header-status-lgtm {
   gap: 8px;
   font-size: 12px;
   color: var(--muted);
+  flex-shrink: 0;
+}
+.commit-diff-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.commit-diff-files {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 /* Change details page */

@@ -18,6 +18,8 @@ const jjLogTemplate = `change_id ++ "\x1f" ++ commit_id ++ "\x1f" ++ parents.map
 
 const jjDiffTemplate = `status_char ++ "\x1f" ++ source.path() ++ "\x1f" ++ path ++ "\x1e"`
 
+const jjDiffStatTemplate = `commit_id ++ "\x1f" ++ diff.stat().files().len() ++ "\x1f" ++ diff.stat().total_added() ++ "\x1f" ++ diff.stat().total_removed() ++ "\x1e"`
+
 // JJRepo implements the Repo interface for Jujutsu repositories.
 type JJRepo struct {
 	root        string
@@ -577,4 +579,94 @@ func (r *JJRepo) ReadDirGoFiles(rev, dir string) ([]GoFileBlobContent, error) {
 		return nil, err
 	}
 	return cf.ReadDirGoFiles(rev, dir)
+}
+
+// ChangeDiffStats implements DiffStatRepo for JJRepo using cached batched Git queries
+// with a batched jj diff.stat() fallback for conflicted or non-Git commits.
+func (r *JJRepo) ChangeDiffStats(changes []*Change) map[string]DiffStat {
+	out := make(map[string]DiffStat, len(changes))
+	var gitChanges []*Change
+	var gitRevs []string
+	seenGit := make(map[string]bool)
+	var jjFallback []*Change
+
+	for _, c := range changes {
+		if c == nil || c.Rev == "" || c.Empty {
+			continue
+		}
+		if st, ok := r.cache.getDiffStat(c.Parent, c.Rev); ok {
+			out[c.Rev] = st
+			continue
+		}
+		parentOK := c.Parent == "" || strings.Trim(c.Parent, "0") == "" || (IsImmutableHexRev(c.Parent) && !r.conflicted(c.Parent))
+		if r.gitDir != "" && IsImmutableHexRev(c.Rev) && !r.conflicted(c.Rev) && parentOK {
+			gitChanges = append(gitChanges, c)
+			if !seenGit[c.Rev] {
+				seenGit[c.Rev] = true
+				gitRevs = append(gitRevs, c.Rev)
+			}
+		} else {
+			jjFallback = append(jjFallback, c)
+		}
+	}
+
+	if len(gitRevs) > 0 {
+		stats, err := gitBatchCommitDiffStats(r.gitDir, r.root, gitRevs)
+		if err == nil {
+			for _, c := range gitChanges {
+				if st, ok := stats[c.Rev]; ok {
+					out[c.Rev] = st
+					r.cache.putDiffStat(c.Parent, c.Rev, st)
+				} else {
+					jjFallback = append(jjFallback, c)
+				}
+			}
+		} else {
+			jjFallback = append(jjFallback, gitChanges...)
+		}
+	}
+
+	if len(jjFallback) > 0 {
+		var revExprs []string
+		seenJJ := make(map[string]bool)
+		for _, c := range jjFallback {
+			if c.Rev != "" && !seenJJ[c.Rev] {
+				seenJJ[c.Rev] = true
+				revExprs = append(revExprs, c.Rev)
+			}
+		}
+		parsed := make(map[string]DiffStat, len(revExprs))
+		const jjChunkSize = 64
+		for start := 0; start < len(revExprs); start += jjChunkSize {
+			end := min(start+jjChunkSize, len(revExprs))
+			if raw, err := r.runCmd("jj", "--ignore-working-copy", "--config", `ui.paginate="never"`, "log", "--no-graph", "-r", strings.Join(revExprs[start:end], "|"), "-T", jjDiffStatTemplate); err == nil {
+				for _, rec := range strings.Split(string(raw), "\x1e") {
+					fields := strings.Split(rec, "\x1f")
+					if len(fields) != 4 {
+						continue
+					}
+					rev := strings.TrimSpace(fields[0])
+					filesN, err1 := strconv.Atoi(strings.TrimSpace(fields[1]))
+					added, err2 := strconv.Atoi(strings.TrimSpace(fields[2]))
+					deleted, err3 := strconv.Atoi(strings.TrimSpace(fields[3]))
+					if rev != "" && err1 == nil && err2 == nil && err3 == nil {
+						parsed[rev] = DiffStat{Files: filesN, Added: added, Deleted: deleted}
+					}
+				}
+			}
+		}
+		for _, c := range jjFallback {
+			if st, ok := parsed[c.Rev]; ok {
+				out[c.Rev] = st
+				r.cache.putDiffStat(c.Parent, c.Rev, st)
+				continue
+			}
+			if files, err := r.Files(c.Parent, c.Rev); err == nil {
+				st := diffStatFromFiles(files)
+				out[c.Rev] = st
+				r.cache.putDiffStat(c.Parent, c.Rev, st)
+			}
+		}
+	}
+	return out
 }

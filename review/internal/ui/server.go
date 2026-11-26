@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -40,6 +41,8 @@ type Server struct {
 	broker             *SSEBroker
 	sym                *gosym.Analyzer
 	moveCache          *moveCache
+	wsStatMu           sync.Mutex
+	wsStats            map[wsDiffStatKey]vcs.DiffStat
 	templates          map[string]*template.Template
 	staticVersion      string
 	httpServer         *http.Server
