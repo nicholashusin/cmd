@@ -1,6 +1,102 @@
 (() => {
   var formDraftsMap = new Map();
   var draftSaveTimers = new Map();
+  var draftOpSeq = new Map();
+  var draftSaveAborts = new Map();
+  var legacyDraftsPruned = false;
+
+  function elemFromTarget(t) {
+    return t && t.nodeType === 3 ? t.parentElement : t;
+  }
+
+  function encodeRepoPath(p) {
+    return String(p || '').replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/');
+  }
+
+  let actionErrorTimer = null;
+  function showActionError(msg) {
+    if (!msg || typeof document === 'undefined' || !document.body || !document.body.appendChild) return;
+    let toast = document.getElementById('actionErrorToast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'actionErrorToast';
+      toast.className = 'action-error-toast';
+      if (toast.setAttribute) toast.setAttribute('role', 'alert');
+      if (toast.addEventListener) {
+        toast.addEventListener('click', () => {
+          toast.classList.remove('show');
+          if (actionErrorTimer) {
+            clearTimeout(actionErrorTimer);
+            actionErrorTimer = null;
+          }
+        });
+      }
+      document.body.appendChild(toast);
+    }
+    toast.textContent = String(msg);
+    if (toast.classList) toast.classList.add('show');
+    if (actionErrorTimer) clearTimeout(actionErrorTimer);
+    actionErrorTimer = setTimeout(() => {
+      actionErrorTimer = null;
+      if (toast.classList) toast.classList.remove('show');
+    }, 4500);
+  }
+
+  function invalidateTableRowCache(table) {
+    if (!table) return;
+    table._diffRows = null;
+    table._rowsByLineL = null;
+    table._rowsByLineR = null;
+  }
+
+  function ensureTableRowCache(table) {
+    if (!table) return [];
+    if (table._diffRows && table._diffRows.length > 0 && table._diffRows[0] && table._diffRows[0].isConnected === false) {
+      invalidateTableRowCache(table);
+    }
+    if (!table._diffRows) {
+      const list = table.querySelectorAll ? Array.from(table.querySelectorAll('tr.diff-row')) : [];
+      const mapL = new Map();
+      const mapR = new Map();
+      for (let i = 0; i < list.length; i++) {
+        const r = list[i];
+        if (!r || !r.getAttribute) continue;
+        const lAttr = r.getAttribute('data-line-l');
+        if (lAttr) {
+          const ln = parseInt(lAttr, 10);
+          if (ln > 0 && !mapL.has(ln)) mapL.set(ln, r);
+        }
+        const rAttr = r.getAttribute('data-line-r');
+        if (rAttr) {
+          const rn = parseInt(rAttr, 10);
+          if (rn > 0 && !mapR.has(rn)) mapR.set(rn, r);
+        }
+      }
+      table._diffRows = list;
+      table._rowsByLineL = mapL;
+      table._rowsByLineR = mapR;
+    }
+    return table._diffRows;
+  }
+
+  function findDiffRowByLine(table, side, line, allowQueryFallback) {
+    if (!table || !line || line <= 0) return null;
+    ensureTableRowCache(table);
+    const map = side === 'L' ? table._rowsByLineL : table._rowsByLineR;
+    let hit = map ? map.get(line) : null;
+    if (hit && hit.isConnected === false) {
+      invalidateTableRowCache(table);
+      ensureTableRowCache(table);
+      const freshMap = side === 'L' ? table._rowsByLineL : table._rowsByLineR;
+      hit = freshMap ? freshMap.get(line) : null;
+    }
+    if (hit) return hit;
+    if (allowQueryFallback && table.querySelector) {
+      const attr = side === 'L' ? 'data-line-l' : 'data-line-r';
+      return table.querySelector(`tr.diff-row[${attr}="${line}"]`);
+    }
+    return null;
+  }
 
   // Theme management
   function isDarkActive() {
@@ -201,7 +297,7 @@
       body._loadPromise = null;
 
       const table = body.querySelector ? body.querySelector('.diff-table') : null;
-      if (table) table._diffRows = null;
+      if (table) invalidateTableRowCache(table);
 
       if (secRect && secRect.bottom <= stickyBottom && typeof window !== 'undefined' && window.scrollY > 0) {
         const deltaHeight = (body.offsetHeight || 0) - beforeHeight;
@@ -221,6 +317,30 @@
     return body._loadPromise;
   }
   window.ensureFileBodyLoaded = ensureFileBodyLoaded;
+
+  async function expandFileSection(sec) {
+    if (!sec) return false;
+    const body = sec.querySelector ? sec.querySelector('.diff-file-body') : null;
+    const btn = sec.querySelector ? (sec.querySelector('.file-collapse-btn') || sec.querySelector('.diff-file-header button')) : null;
+    let expanded = false;
+    if ((sec.classList && sec.classList.contains('collapsed')) || (body && body.style && body.style.display === 'none')) {
+      if (sec.classList) sec.classList.remove('collapsed');
+      if (body && body.style) body.style.display = 'block';
+      if (btn) btn.textContent = '▾';
+      expanded = true;
+    }
+    if (body && window.ensureFileBodyLoaded && (body.getAttribute && body.getAttribute('data-lazy-url') || body._loadPromise)) {
+      await window.ensureFileBodyLoaded(body);
+    }
+    if (expanded) {
+      if (typeof handleNaturalPageHeightChange === 'function') handleNaturalPageHeightChange();
+      if (typeof window.updateToggleAllFilesBtn === 'function') window.updateToggleAllFilesBtn();
+      saveExpandedFiles();
+      if (typeof invalidateVisibleRowsCache === 'function') invalidateVisibleRowsCache();
+      scheduleStickyScopeUpdate();
+    }
+    return expanded;
+  }
 
   function restoreExpandedFiles() {
     const allFilesEl = document.querySelector('.diff-all-files');
@@ -434,12 +554,7 @@
       if (card) {
         const sec = card.closest ? card.closest('.diff-file-section') : null;
         if (sec && sec.classList.contains('collapsed')) {
-          const body = sec.querySelector ? sec.querySelector('.diff-file-body') : null;
-          const btn = sec.querySelector ? sec.querySelector('.file-collapse-btn') : null;
-          sec.classList.remove('collapsed');
-          if (body) body.style.display = 'block';
-          if (btn) btn.textContent = '▾';
-          expandedAny = true;
+          await expandFileSection(sec);
         }
         if (revealThreadForJump(card, messageId, { batch: true })) {
           expandedAny = true;
@@ -474,28 +589,28 @@
     const endParam = parseInt(sp.get('end') || '0', 10);
     const maxLine = Math.max(lineNum, endParam || lineNum);
 
-    let el = null;
-    if (jumpSide === 'L') {
-      el = document.querySelector(`tr[data-line-l="${lineNum}"]`) ||
-        document.getElementById(hash.slice(1)) ||
-        document.querySelector(`tr[data-line-r="${lineNum}"]`);
-    } else {
-      el = document.getElementById(hash.slice(1)) ||
+    const findHashLineEl = () => {
+      if (jumpSide === 'L') {
+        return document.querySelector(`tr[data-line-l="${lineNum}"]`) ||
+          document.getElementById(hash.slice(1)) ||
+          document.querySelector(`tr[data-line-r="${lineNum}"]`);
+      }
+      if (jumpSide === 'R') {
+        return document.querySelector(`tr[data-line-r="${lineNum}"]`) ||
+          document.getElementById(hash.slice(1)) ||
+          document.querySelector(`tr[data-line-l="${lineNum}"]`);
+      }
+      return document.getElementById(hash.slice(1)) ||
         document.querySelector(`tr[data-line-r="${lineNum}"]`) ||
         document.querySelector(`tr[data-line-l="${lineNum}"]`);
-    }
+    };
+
+    let el = findHashLineEl();
 
     if (el) {
       const sec = el.closest('.diff-file-section');
       if (sec && sec.classList.contains('collapsed')) {
-        const body = sec.querySelector('.diff-file-body');
-        const btn = sec.querySelector('.file-collapse-btn');
-        sec.classList.remove('collapsed');
-        if (body) body.style.display = 'block';
-        if (btn) btn.textContent = '▾';
-        if (window.ensureFileBodyLoaded && body) {
-          await window.ensureFileBodyLoaded(body);
-        }
+        await expandFileSection(sec);
       }
     }
 
@@ -522,29 +637,14 @@
       if (sStart > 0 && Math.max(lineNum, sStart) <= Math.min(maxLine, sEnd)) {
         const sec = skip.closest ? skip.closest('.diff-file-section') : null;
         if (sec && sec.classList.contains('collapsed')) {
-          const body = sec.querySelector('.diff-file-body');
-          const btn = sec.querySelector('.file-collapse-btn');
-          sec.classList.remove('collapsed');
-          if (body) body.style.display = 'block';
-          if (btn) btn.textContent = '▾';
-          if (window.ensureFileBodyLoaded && body) {
-            await window.ensureFileBodyLoaded(body);
-          }
+          await expandFileSection(sec);
         }
         const expandBtn = skip.querySelector('.skip-all') || skip.querySelector('button');
         if (expandBtn && window.expandContextAll) {
           await window.expandContextAll(expandBtn);
         }
         if (!el) {
-          if (jumpSide === 'L') {
-            el = document.querySelector(`tr[data-line-l="${lineNum}"]`) ||
-              document.getElementById(hash.slice(1)) ||
-              document.querySelector(`tr[data-line-r="${lineNum}"]`);
-          } else {
-            el = document.getElementById(hash.slice(1)) ||
-              document.querySelector(`tr[data-line-r="${lineNum}"]`) ||
-              document.querySelector(`tr[data-line-l="${lineNum}"]`);
-          }
+          el = findHashLineEl();
         }
       }
     }
@@ -614,7 +714,7 @@
       if (curMode) sp.set('mode', curMode);
     }
     sp.delete('diffs');
-    const cleanTarget = encodeURIComponent(peerPath).replace(/%2F/g, '/');
+    const cleanTarget = encodeRepoPath(peerPath);
     const peerUrl = `/r/${encodeURIComponent(repo)}/c/${encodeURIComponent(change)}/f/${cleanTarget}?${sp.toString()}#L${peerStart}`;
 
     if (e) {
@@ -635,20 +735,7 @@
     for (const sec of allSections) {
       const p = (sec.getAttribute('data-file-path') || '').replace(/^\/+/, '');
       if (p === peerPath) {
-        const body = sec.querySelector('.diff-file-body');
-        const chevron = sec.querySelector('.file-collapse-btn');
-        if (body && (body.style.display === 'none' || sec.classList.contains('collapsed'))) {
-          sec.classList.remove('collapsed');
-          body.style.display = 'block';
-          if (chevron) chevron.textContent = '▾';
-          saveExpandedFiles();
-          if (typeof window.updateToggleAllFilesBtn === 'function') {
-            window.updateToggleAllFilesBtn();
-          }
-        }
-        if (body && window.ensureFileBodyLoaded) {
-          await window.ensureFileBodyLoaded(body);
-        }
+        await expandFileSection(sec);
         targetContainer = sec.querySelector('.diff-container');
         break;
       }
@@ -897,7 +984,14 @@
     suppressSSEReloadUntil = 0;
   }
 
+  let sseReconnectTimer = null;
+  let sseHadDisconnect = false;
+
   function closeSSE() {
+    if (sseReconnectTimer) {
+      clearTimeout(sseReconnectTimer);
+      sseReconnectTimer = null;
+    }
     if (eventSource) {
       eventSource.close();
       eventSource = null;
@@ -906,7 +1000,18 @@
 
   function initSSE() {
     if (!window.EventSource || document.hidden || eventSource) return;
+    if (sseReconnectTimer) {
+      clearTimeout(sseReconnectTimer);
+      sseReconnectTimer = null;
+    }
     eventSource = new EventSource('/api/events' + buildStateQuery());
+
+    eventSource.addEventListener('open', () => {
+      if (sseHadDisconnect) {
+        sseHadDisconnect = false;
+        checkRemoteState(true);
+      }
+    });
 
     eventSource.addEventListener('reload', (e) => {
       if (Date.now() < suppressSSEReloadUntil) return;
@@ -961,22 +1066,26 @@
     });
 
     eventSource.onerror = () => {
+      sseHadDisconnect = true;
       closeSSE();
-      if (!document.hidden) {
-        setTimeout(initSSE, 5000);
+      if (!document.hidden && !sseReconnectTimer) {
+        sseReconnectTimer = setTimeout(() => {
+          sseReconnectTimer = null;
+          initSSE();
+        }, 5000);
       }
     };
   }
 
   let lastStateCheckAt = 0;
-  async function checkRemoteState() {
+  async function checkRemoteState(force) {
     if (document.hidden) return;
     if (Date.now() < suppressSSEReloadUntil) return;
-    if (Date.now() - lastStateCheckAt < 1500) return;
-    lastStateCheckAt = Date.now();
+    if (force !== true && Date.now() - lastStateCheckAt < 1500) return;
     try {
       const res = await fetch('/api/state' + buildStateQuery(), { cache: 'no-store' });
       if (res.ok) {
+        lastStateCheckAt = Date.now();
         const data = await res.json();
         showOrHideUpdateBanner(data, '');
       }
@@ -988,12 +1097,12 @@
       closeSSE();
     } else {
       refreshRelativeTimes();
-      await checkRemoteState();
+      await checkRemoteState(false);
       initSSE();
     }
   });
 
-  window.addEventListener('focus', checkRemoteState);
+  window.addEventListener('focus', () => { checkRemoteState(false); });
 
   window.addEventListener('pagehide', closeSSE);
   window.addEventListener('beforeunload', closeSSE);
@@ -1089,7 +1198,19 @@
         span.remove();
       }
     });
-    touchedParents.forEach(p => p.normalize());
+    const sel = (typeof window !== 'undefined' && window.getSelection) ? window.getSelection() : null;
+    const selRange = (sel && !sel.isCollapsed && sel.rangeCount > 0) ? sel.getRangeAt(0) : null;
+    touchedParents.forEach(p => {
+      if (p && p.normalize) {
+        if (selRange) {
+          try {
+            if (selRange.intersectsNode && selRange.intersectsNode(p)) return;
+            if (p.contains && (p.contains(selRange.startContainer) || p.contains(selRange.endContainer))) return;
+          } catch (_) {}
+        }
+        p.normalize();
+      }
+    });
   }
 
   function highlightThreadRange(card) {
@@ -1120,9 +1241,11 @@
       container = document.querySelector('.diff-container') || document;
     }
 
+    const table = container.querySelector ? container.querySelector('.diff-table') : null;
     const getCodeCell = (line) => {
-      const lineAttr = side === 'L' ? 'data-line-l' : 'data-line-r';
-      const row = container.querySelector(`tr.diff-row[${lineAttr}="${line}"]`);
+      const row = table
+        ? findDiffRowByLine(table, side, line, true)
+        : (container.querySelector ? container.querySelector(`tr.diff-row[${side === 'L' ? 'data-line-l' : 'data-line-r'}="${line}"]`) : null);
       if (!row) return null;
       return row.querySelector(`td[data-side="${side}"]`) || row.querySelector('td.line-code-unified') || row.querySelector('td.line-code');
     };
@@ -1159,7 +1282,8 @@
   let activeHighlightedCard = null;
 
   document.addEventListener('mouseover', (e) => {
-    const card = e.target.closest('.thread-card[data-has-range="true"]');
+    const targetEl = elemFromTarget(e.target);
+    const card = targetEl && targetEl.closest ? targetEl.closest('.thread-card[data-has-range="true"]') : null;
     if (!card) return;
     if (activeHighlightedCard === card) return;
     clearRangeHighlights();
@@ -1177,15 +1301,17 @@
   });
 
   window.addEventListener('pointerdown', (e) => {
-    const inComment = e.target.closest('.thread-card, .comment-form');
+    const targetEl = elemFromTarget(e.target);
+    if (!targetEl || !targetEl.closest) return;
+    const inComment = targetEl.closest('.thread-card, .comment-form');
     if (inComment) {
       const table = inComment.closest('.diff-table');
       if (table) table.classList.remove('selecting-L', 'selecting-R');
       return;
     }
 
-    const codeTd = e.target.closest('td[data-side]');
-    const gutterTd = e.target.closest('td[data-gutter-side]');
+    const codeTd = targetEl.closest('td[data-side]');
+    const gutterTd = targetEl.closest('td[data-gutter-side]');
     const side = codeTd ? codeTd.getAttribute('data-side') : (gutterTd ? gutterTd.getAttribute('data-gutter-side') : null);
     if (!side) return;
 
@@ -1672,7 +1798,8 @@
 
   document.addEventListener('pointerdown', (e) => {
     if (e.button !== 0) return;
-    const card = e.target.closest ? e.target.closest('.thread-card') : null;
+    const targetEl = elemFromTarget(e.target);
+    const card = targetEl && targetEl.closest ? targetEl.closest('.thread-card') : null;
     if (card) {
       bringCommentToFront(card);
       if (card.classList && !card.classList.contains('new-comment-card')) {
@@ -1683,7 +1810,8 @@
   });
 
   document.addEventListener('focusin', (e) => {
-    const card = e.target.closest ? e.target.closest('.thread-card') : null;
+    const targetEl = elemFromTarget(e.target);
+    const card = targetEl && targetEl.closest ? targetEl.closest('.thread-card') : null;
     if (card) {
       bringCommentToFront(card);
       if (card.classList && !card.classList.contains('new-comment-card')) {
@@ -1714,6 +1842,9 @@
     let startTr = findDiffRow(range.startContainer);
     let endTr = findDiffRow(range.endContainer);
     if (!startTr || !endTr) return null;
+    const startCont = startTr.closest ? startTr.closest('.diff-container') : null;
+    const endCont = endTr.closest ? endTr.closest('.diff-container') : null;
+    if (startCont && endCont && startCont !== endCont) return null;
 
     const table = startTr.closest('.diff-table');
     let side = 'R';
@@ -1797,12 +1928,14 @@
     if (e.button !== 0) return;
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed) {
-      if (!e.target.closest('td.line-num:not(.skip-gutter)')) {
+      const targetEl = elemFromTarget(e.target);
+      if (!targetEl || !targetEl.closest || !targetEl.closest('td.line-num:not(.skip-gutter)')) {
         selectedStart = 0;
         selectedEnd = 0;
         selectedStartCol = 0;
         selectedEndCol = 0;
         selectedContainer = null;
+        activeRow = null;
       }
       return;
     }
@@ -1870,6 +2003,8 @@
   }
 
   function saveFormDraftServer(draftKey, payload) {
+    const seq = (draftOpSeq.get(draftKey) || 0) + 1;
+    draftOpSeq.set(draftKey, seq);
     if (draftSaveTimers.has(draftKey)) {
       clearTimeout(draftSaveTimers.get(draftKey));
       draftSaveTimers.delete(draftKey);
@@ -1877,9 +2012,16 @@
     formDraftsMap.set(draftKey, payload);
     const timer = setTimeout(() => {
       draftSaveTimers.delete(draftKey);
+      if (draftOpSeq.get(draftKey) !== seq) return;
       const info = getCurrentRepoAndChange();
       if (!info.repo || !info.change) return;
-      fetch(`/api/form-drafts?repo=${encodeURIComponent(info.repo)}&change=${encodeURIComponent(info.change)}`, {
+      const prevAbort = draftSaveAborts.get(draftKey);
+      if (prevAbort) {
+        try { prevAbort.abort(); } catch (_) {}
+      }
+      const abort = (typeof AbortController === 'function') ? new AbortController() : null;
+      if (abort) draftSaveAborts.set(draftKey, abort);
+      const opts = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         keepalive: true,
@@ -1899,15 +2041,29 @@
           message_id: (payload.message_id != null && payload.message_id !== '') ? String(payload.message_id) : '',
           content: payload.content || '',
         })
-      }).catch(() => {});
+      };
+      if (abort) opts.signal = abort.signal;
+      fetch(`/api/form-drafts?repo=${encodeURIComponent(info.repo)}&change=${encodeURIComponent(info.change)}`, opts)
+        .catch(() => {})
+        .finally(() => {
+          if (abort && draftSaveAborts.get(draftKey) === abort) {
+            draftSaveAborts.delete(draftKey);
+          }
+        });
     }, 150);
     draftSaveTimers.set(draftKey, timer);
   }
 
   function deleteFormDraftServer(draftKey, meta) {
+    draftOpSeq.set(draftKey, (draftOpSeq.get(draftKey) || 0) + 1);
     if (draftSaveTimers.has(draftKey)) {
       clearTimeout(draftSaveTimers.get(draftKey));
       draftSaveTimers.delete(draftKey);
+    }
+    const prevAbort = draftSaveAborts.get(draftKey);
+    if (prevAbort) {
+      try { prevAbort.abort(); } catch (_) {}
+      draftSaveAborts.delete(draftKey);
     }
     formDraftsMap.delete(draftKey);
     const info = getCurrentRepoAndChange();
@@ -1937,7 +2093,7 @@
       if (data && Array.isArray(data.drafts)) {
         for (const d of data.drafts) {
           if (d && d.draft_key) {
-            if (draftSaveTimers.has(d.draft_key)) {
+            if (draftSaveTimers.has(d.draft_key) || draftOpSeq.has(d.draft_key)) {
               continue;
             }
             formDraftsMap.set(d.draft_key, {
@@ -2381,6 +2537,9 @@
       card.outerHTML = html;
       newCard = cardID ? document.getElementById(cardID) : null;
     }
+    if (newCard && threadNavState.el === card) {
+      threadNavState.el = newCard;
+    }
     const restoreRoot = newCard || parent;
     if (collapsedByMsgID && collapsedByMsgID.size > 0 && restoreRoot && restoreRoot.querySelectorAll) {
       restoreRoot.querySelectorAll('.message-body').forEach(newMb => {
@@ -2575,6 +2734,7 @@
     selectedStartCol = 0;
     selectedEndCol = 0;
     selectedContainer = null;
+    activeRow = null;
     cleanupCommentZIndicesIfNeeded();
     if (typeof handleNaturalPageHeightChange === 'function') {
       handleNaturalPageHeightChange();
@@ -2643,19 +2803,16 @@
       applyPageState(data);
       suppressSSEReloadUntil = Date.now() + 300;
       clearRangeHighlights();
-      const inlineRow = document.getElementById('inlineNewComment');
-      if (inlineRow) {
-        const key = inlineRow.getAttribute('data-draft-key');
-        if (key) {
-          deleteFormDraftServer(key);
-        }
+      const targetInlineRow = inlineRow || document.getElementById('inlineNewComment');
+      if (inlineKey) {
+        deleteFormDraftServer(inlineKey);
       }
-      const cleanP = (path || '').replace(/^\/+/, '') || path;
-      const fbKey = `review_draft:new:${repoSlug}:${changeKey}:${cleanP}:${side}:${start}`;
-      deleteFormDraftServer(fbKey);
-      if (inlineRow && data.html) {
-        inlineRow.removeAttribute('id');
-        const cell = inlineRow.querySelector('.thread-cell');
+      if (fbKey !== inlineKey) {
+        deleteFormDraftServer(fbKey);
+      }
+      if (targetInlineRow && data.html) {
+        targetInlineRow.removeAttribute('id');
+        const cell = targetInlineRow.querySelector('.thread-cell');
         if (cell) cell.innerHTML = data.html;
         refreshLayoutAfterCollapseChange();
       }
@@ -2663,10 +2820,13 @@
       selectedEnd = 0;
       selectedStartCol = 0;
       selectedEndCol = 0;
+      selectedContainer = null;
+      activeRow = null;
       cleanupCommentZIndicesIfNeeded();
       updateCommentCountBadges(data.file_path, data.file_counts, data.change_counts);
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to save comment.');
     }).finally(() => {
       form._submitting = false;
     });
@@ -2850,6 +3010,7 @@
       updateCommentCountBadges(data.file_path, data.file_counts, data.change_counts);
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to update comment.');
     }).finally(() => {
       form._submitting = false;
     });
@@ -3149,8 +3310,8 @@
     const s = findScopeAtLine(scopes, lineNum);
     if (!s) return null;
 
-    if (table && table.querySelector) {
-      const declRow = table.querySelector(`tr.diff-row[${lineAttr}="${s.s}"]`);
+    if (table) {
+      const declRow = findDiffRowByLine(table, side, s.s, false);
       if (declRow && declRow.getBoundingClientRect) {
         const declRect = declRow.getBoundingClientRect();
         const winH = (typeof window !== 'undefined' && window.innerHeight) ? window.innerHeight : 1000;
@@ -3168,13 +3329,20 @@
   window.findScopeAtLine = findScopeAtLine;
   window.resolveSideAnchorLine = resolveSideAnchorLine;
 
-  function syncAppHeaderHeight() {
-    const appHeader = document.querySelector('header.app-header');
-    if (!appHeader) return 0;
-    const rect = appHeader.getBoundingClientRect ? appHeader.getBoundingClientRect() : null;
-    const h = (rect && rect.height > 0) ? rect.height : (appHeader.offsetHeight || 0);
-    if (h > 0 && document.documentElement && document.documentElement.style && document.documentElement.style.setProperty) {
-      document.documentElement.style.setProperty('--app-header-h', `${h}px`);
+  var lastAppHeaderH = 0;
+  function syncAppHeaderHeight(measuredHeight) {
+    let h = measuredHeight || 0;
+    if (!h) {
+      const appHeader = document.querySelector('header.app-header');
+      if (!appHeader) return 0;
+      const rect = appHeader.getBoundingClientRect ? appHeader.getBoundingClientRect() : null;
+      h = (rect && rect.height > 0) ? rect.height : (appHeader.offsetHeight || 0);
+    }
+    if (h > 0 && h !== lastAppHeaderH) {
+      lastAppHeaderH = h;
+      if (document.documentElement && document.documentElement.style && document.documentElement.style.setProperty) {
+        document.documentElement.style.setProperty('--app-header-h', `${h}px`);
+      }
     }
     return h;
   }
@@ -3232,8 +3400,14 @@
   window.updateHangingFileHeaders = updateHangingFileHeaders;
 
   function resetHiddenScopeGroup(group, bar, btnL, btnR, headerEl) {
+    if (group && group._scopeHidden && group.style.display === 'none' &&
+        (!bar || bar.style.display === 'none') &&
+        (!headerEl || !headerEl.classList || !headerEl.classList.contains('has-scope'))) {
+      return;
+    }
     if (group) {
       group.style.display = 'none';
+      group._scopeHidden = true;
       if (group.classList) {
         group.classList.remove('is-split');
         group.classList.remove('is-empty-side');
@@ -3255,19 +3429,21 @@
   }
 
   function updateStickyScopes() {
-    syncAppHeaderHeight();
     const appHeader = document.querySelector('header.app-header');
-    const appBottom = appHeader ? Math.max(0, (appHeader.getBoundingClientRect ? appHeader.getBoundingClientRect().bottom : (appHeader.offsetHeight || 0))) : 0;
+    const appRect = (appHeader && appHeader.getBoundingClientRect) ? appHeader.getBoundingClientRect() : null;
+    const appH = (appRect && appRect.height > 0) ? appRect.height : (appHeader ? (appHeader.offsetHeight || 0) : 0);
+    if (appH > 0) syncAppHeaderHeight(appH);
+    const appBottom = appHeader ? Math.max(0, (appRect ? appRect.bottom : (appHeader.offsetHeight || 0))) : 0;
     updateHangingFileHeaders(appBottom);
 
     const singleGroup = document.getElementById('appHeaderScopeGroup');
     const singleBar = document.getElementById('appHeaderScope');
     const singleBtnL = document.getElementById('appHeaderScopeSideLeft') || (singleGroup ? singleGroup.querySelector('.diff-scope-side-left') : null);
     const singleBtnR = document.getElementById('appHeaderScopeSideRight') || (singleGroup ? singleGroup.querySelector('.diff-scope-side-right') : null);
-    resetHiddenScopeGroup(singleGroup, singleBar, singleBtnL, singleBtnR, appHeader);
 
     const containers = document.querySelectorAll('.diff-container[data-scopes]');
     const actions = [];
+    let singleGroupHandled = false;
 
     for (const container of containers) {
       const fileSection = container.closest ? container.closest('.diff-file-section') : null;
@@ -3277,6 +3453,7 @@
       const fileBar = fileSection ? (fileSection.querySelector ? fileSection.querySelector('.diff-header-scope') : null) : singleBar;
       const fileBtnL = fileGroup ? (fileGroup.querySelector ? fileGroup.querySelector('.diff-scope-side-left') : null) : singleBtnL;
       const fileBtnR = fileGroup ? (fileGroup.querySelector ? fileGroup.querySelector('.diff-scope-side-right') : null) : singleBtnR;
+      if (!fileSection && (fileGroup || fileBar)) singleGroupHandled = true;
 
       if (fileSection && fileSection.classList && fileSection.classList.contains('collapsed')) {
         actions.push({ hide: true, group: fileGroup, bar: fileBar, btnL: fileBtnL, btnR: fileBtnR, headerEl });
@@ -3288,7 +3465,10 @@
       }
 
       const table = container.querySelector ? container.querySelector('.diff-table') : null;
-      if (!table) continue;
+      if (!table) {
+        actions.push({ hide: true, group: fileGroup, bar: fileBar, btnL: fileBtnL, btnR: fileBtnR, headerEl });
+        continue;
+      }
 
       let barBottom = appBottom;
       if (fileSection && fileHeader && fileHeader.getBoundingClientRect) {
@@ -3302,10 +3482,7 @@
         continue;
       }
 
-      if (!table._diffRows) {
-        table._diffRows = Array.from(table.querySelectorAll('tr.diff-row'));
-      }
-      const diffRowsList = table._diffRows;
+      const diffRowsList = ensureTableRowCache(table);
       if (!diffRowsList || diffRowsList.length === 0) {
         actions.push({ hide: true, group: fileGroup, bar: fileBar, btnL: fileBtnL, btnR: fileBtnR, headerEl });
         continue;
@@ -3384,6 +3561,10 @@
       }
     }
 
+    if (!singleGroupHandled && (singleGroup || singleBar)) {
+      actions.push({ hide: true, group: singleGroup, bar: singleBar, btnL: singleBtnL, btnR: singleBtnR, headerEl: appHeader });
+    }
+
     const shownBars = [];
     for (const act of actions) {
       if (act.hide) {
@@ -3391,6 +3572,7 @@
       } else if (act.isSplit) {
         const { group, bar, btnL, btnR, headerEl, container, activeSide, sActive, sOther } = act;
         if (group) {
+          group._scopeHidden = false;
           group.style.display = 'inline-flex';
           if (group.classList) group.classList.add('is-split');
           if (group.setAttribute) group.setAttribute('data-active-side', activeSide);
@@ -3467,6 +3649,7 @@
           if (btnR.setAttribute) btnR.setAttribute('aria-hidden', 'true');
         }
         if (group) {
+          group._scopeHidden = false;
           group.style.display = 'inline-flex';
           if (group.classList) {
             group.classList.remove('is-split');
@@ -3555,7 +3738,7 @@
 
     if (!table) return;
 
-    let targetTr = table.querySelector(`tr.diff-row[${lineAttr}="${declLine}"]`);
+    let targetTr = findDiffRowByLine(table, side, declLine, true);
     if (!targetTr) {
       const skipRows = table.querySelectorAll('tr.row-skip');
       for (const sr of skipRows) {
@@ -3569,7 +3752,7 @@
           break;
         }
       }
-      targetTr = table.querySelector(`tr.diff-row[${lineAttr}="${declLine}"]`);
+      targetTr = findDiffRowByLine(table, side, declLine, true);
     }
 
     if (targetTr) {
@@ -3582,7 +3765,7 @@
   // Incremental context expansion: expandContextStep and expandContextAll
   window.expandContextAll = async function(btn) {
     const skipRow = btn.closest('tr.row-skip');
-    if (!skipRow) return;
+    if (!skipRow || skipRow._expanding) return;
     const container = skipRow.closest('.diff-container');
 
     const lStartAttr = skipRow.getAttribute('data-left-start');
@@ -3618,22 +3801,29 @@
       });
       if (leftPath) params.set('left_path', leftPath);
 
+      skipRow._expanding = true;
       btn.disabled = true;
       try {
         const res = await fetch('/api/diff/expand?' + params.toString());
-        if (!res.ok) return;
+        if (!res.ok) {
+          showActionError('Failed to expand context lines.');
+          return;
+        }
         const html = await res.text();
+        if (skipRow.isConnected === false) return;
         const tmp = document.createElement('tbody');
         tmp.innerHTML = html;
         const trs = Array.from(tmp.children);
         const table = container.querySelector('.diff-table');
-        if (table) table._diffRows = null;
-        if (typeof invalidateVisibleRowsCache === 'function') invalidateVisibleRowsCache();
+        if (table) invalidateTableRowCache(table);
         skipRow.replaceWith(...trs);
         if (typeof invalidateVisibleRowsCache === 'function') invalidateVisibleRowsCache();
         scheduleStickyScopeUpdate();
         if (typeof updateIdentOccurrences === 'function') updateIdentOccurrences();
+      } catch (_) {
+        showActionError('Failed to expand context lines.');
       } finally {
+        skipRow._expanding = false;
         btn.disabled = false;
       }
     }
@@ -3641,7 +3831,7 @@
 
   window.expandContextStep = async function(btn, dir, count) {
     const skipRow = btn.closest('tr.row-skip');
-    if (!skipRow) return;
+    if (!skipRow || skipRow._expanding) return;
     const container = skipRow.closest('.diff-container');
 
     const lStartAttr = skipRow.getAttribute('data-left-start');
@@ -3692,17 +3882,22 @@
       });
       if (leftPath) params.set('left_path', leftPath);
 
+      skipRow._expanding = true;
       btn.disabled = true;
       try {
         const res = await fetch('/api/diff/expand?' + params.toString());
-        if (!res.ok) return;
+        if (!res.ok) {
+          showActionError('Failed to expand context lines.');
+          return;
+        }
         const html = await res.text();
+        if (skipRow.isConnected === false) return;
         const tmp = document.createElement('tbody');
         tmp.innerHTML = html;
         const trs = Array.from(tmp.children);
 
         const table = container.querySelector('.diff-table');
-        if (table) table._diffRows = null;
+        if (table) invalidateTableRowCache(table);
         if (typeof invalidateVisibleRowsCache === 'function') invalidateVisibleRowsCache();
 
         if (dir === 'down') {
@@ -3737,7 +3932,10 @@
         }
         scheduleStickyScopeUpdate();
         if (typeof updateIdentOccurrences === 'function') updateIdentOccurrences();
+      } catch (_) {
+        showActionError('Failed to expand context lines.');
       } finally {
+        skipRow._expanding = false;
         btn.disabled = false;
       }
     }
@@ -3811,12 +4009,17 @@
       updateCommentCountBadges(data.file_path, data.file_counts, data.change_counts);
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to save reply.');
     }).finally(() => {
       form._submitting = false;
     });
   };
 
+  const inflightResolves = new Set();
   window.resolveThread = function(threadID, resolved) {
+    const key = String(threadID);
+    if (inflightResolves.has(key)) return;
+    inflightResolves.add(key);
     const card = document.getElementById('thread-' + threadID);
     const container = card ? card.closest('.diff-container') : null;
     const leftRev = container ? (container.getAttribute('data-left-rev') || '') : '';
@@ -3852,18 +4055,25 @@
       updateCommentCountBadges(data.file_path, data.file_counts, data.change_counts);
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to update thread status.');
+    }).finally(() => {
+      inflightResolves.delete(key);
     });
   };
 
+  const inflightDeletes = new Set();
   window.deleteMessage = function(msgID) {
+    const key = String(msgID);
+    if (inflightDeletes.has(key)) return;
+    inflightDeletes.add(key);
     const msgEl = document.getElementById('msg-' + msgID) || document.getElementById('msg-edit-' + msgID);
     const draftKey = getEditDraftKey(msgID, msgEl);
-    deleteFormDraftServer(draftKey, { message_id: msgID });
-    if (draftSaveTimers.has(`edit:${msgID}`)) {
-      clearTimeout(draftSaveTimers.get(`edit:${msgID}`));
-      draftSaveTimers.delete(`edit:${msgID}`);
+    for (const k of [draftKey, `edit:${msgID}`]) {
+      if (k && draftSaveTimers.has(k)) {
+        clearTimeout(draftSaveTimers.get(k));
+        draftSaveTimers.delete(k);
+      }
     }
-    formDraftsMap.delete(`edit:${msgID}`);
     const container = msgEl ? msgEl.closest('.diff-container') : null;
     const leftRev = container ? (container.getAttribute('data-left-rev') || '') : '';
     const rightRev = container ? (container.getAttribute('data-right-rev') || '') : '';
@@ -3886,6 +4096,8 @@
       applyPageState(data);
       suppressSSEReloadUntil = Date.now() + 300;
       clearRangeHighlights();
+      deleteFormDraftServer(draftKey, { message_id: msgID });
+      formDraftsMap.delete(`edit:${msgID}`);
       if (data.thread_deleted) {
         try {
           const root = container || document;
@@ -3919,10 +4131,16 @@
       updateCommentCountBadges(data.file_path, data.file_counts, data.change_counts);
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to delete message.');
+    }).finally(() => {
+      inflightDeletes.delete(key);
     });
   };
 
+  let toggleFileReviewedBusy = false;
   window.toggleFileReviewed = function(repo, change, rev, path, reviewed) {
+    if (toggleFileReviewedBusy) return;
+    toggleFileReviewedBusy = true;
     const btn = document.getElementById('toggleReviewedBtn');
     const nextVal = btn ? !btn.classList.contains('btn-active') : !!reviewed;
     beginSelfReload();
@@ -3956,13 +4174,20 @@
         }
       } else {
         cancelSelfReload();
+        showActionError('Failed to update reviewed status.');
       }
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to update reviewed status.');
+    }).finally(() => {
+      toggleFileReviewedBusy = false;
     });
   };
 
+  let toggleChangeRevBusy = false;
   window.toggleChangeRevMark = function(repo, change, rev, kind, val) {
+    if (toggleChangeRevBusy) return;
+    toggleChangeRevBusy = true;
     const lgtmBtn = document.getElementById('lgtmBtn');
     let nextVal = val;
     if (kind === 'lgtm' && lgtmBtn) {
@@ -4051,9 +4276,13 @@
         }
       } else {
         cancelSelfReload();
+        showActionError('Failed to update review status.');
       }
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to update review status.');
+    }).finally(() => {
+      toggleChangeRevBusy = false;
     });
   };
 
@@ -4092,7 +4321,10 @@
     }
   }
 
+  let publishDraftsBusy = false;
   window.publishDrafts = function(repo, change) {
+    if (publishDraftsBusy) return;
+    publishDraftsBusy = true;
     const el = document.querySelector('[data-left-rev][data-right-rev]');
     const leftRev = el ? el.getAttribute('data-left-rev') : '';
     const rightRev = el ? el.getAttribute('data-right-rev') : '';
@@ -4249,13 +4481,20 @@
         }
       } else {
         cancelSelfReload();
+        showActionError('Failed to publish drafts.');
       }
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to publish drafts.');
+    }).finally(() => {
+      publishDraftsBusy = false;
     });
   };
 
+  let takeSnapshotBusy = false;
   window.takeSnapshot = function(repo, change) {
+    if (takeSnapshotBusy) return;
+    takeSnapshotBusy = true;
     beginSelfReload();
     fetch('/api/snapshot', {
       method: 'POST',
@@ -4266,14 +4505,21 @@
         window.location.reload();
       } else {
         cancelSelfReload();
+        showActionError('Failed to create snapshot.');
       }
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to create snapshot.');
+    }).finally(() => {
+      takeSnapshotBusy = false;
     });
   };
 
+  let forgetRepoBusy = false;
   window.forgetRepo = function(slug) {
+    if (forgetRepoBusy) return;
     if (!confirm(`Forget repository "${slug}"? Any snapshots and review comments will be permanently removed.`)) return;
+    forgetRepoBusy = true;
     beginSelfReload();
     fetch('/api/repos/forget', {
       method: 'POST',
@@ -4284,9 +4530,13 @@
         window.location.reload();
       } else {
         cancelSelfReload();
+        showActionError('Failed to forget repository.');
       }
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to forget repository.');
+    }).finally(() => {
+      forgetRepoBusy = false;
     });
   };
 
@@ -4297,15 +4547,17 @@
     }
   };
 
+  let markReviewedBusy = false;
   function markReviewedAndNext() {
     const isAllFiles = document.querySelector('.diff-all-files') != null;
     if (isAllFiles) {
       const sections = Array.from(document.querySelectorAll('.diff-file-section'));
       if (sections.length === 0) return;
+      const threshold = (lastAppHeaderH || syncAppHeaderHeight() || 50) + 70;
       let curSec = sections[0];
       for (const s of sections) {
         const rect = s.getBoundingClientRect();
-        if (rect.top <= 120) {
+        if (rect.top <= threshold) {
           curSec = s;
         } else {
           break;
@@ -4332,6 +4584,7 @@
       return;
     }
 
+    if (markReviewedBusy) return;
     const container = document.querySelector('.diff-container');
     if (!container) return;
     let repoSlug = container.getAttribute('data-repo') || '';
@@ -4347,6 +4600,7 @@
     const rev = container.getAttribute('data-right-rev') || '';
     const nextUnreviewed = container.getAttribute('data-next-unreviewed') || '';
 
+    markReviewedBusy = true;
     beginSelfReload();
     fetch('/api/files/reviewed', {
       method: 'POST',
@@ -4361,16 +4615,20 @@
     }).then(res => {
       if (res.ok) {
         if (nextUnreviewed) {
-          const encoded = nextUnreviewed.replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/');
+          const encoded = encodeRepoPath(nextUnreviewed);
           window.location.href = `/r/${encodeURIComponent(repoSlug)}/c/${encodeURIComponent(changeKey)}/f/${encoded}${window.location.search}`;
         } else {
           window.location.href = `/r/${encodeURIComponent(repoSlug)}/c/${encodeURIComponent(changeKey)}${window.location.search}`;
         }
       } else {
+        markReviewedBusy = false;
         cancelSelfReload();
+        showActionError('Failed to mark file as reviewed.');
       }
     }).catch(() => {
+      markReviewedBusy = false;
       cancelSelfReload();
+      showActionError('Failed to mark file as reviewed.');
     });
   }
 
@@ -4542,6 +4800,8 @@
   };
 
   window.toggleFileReviewedInPlace = function(btn, repo, change, rev, path, i) {
+    if (!btn || btn._busy) return;
+    btn._busy = true;
     const isReviewed = btn.classList.contains('btn-active');
     const nextVal = !isReviewed;
     const cleanPath = (path || '').replace(/^\/+/, '');
@@ -4598,9 +4858,13 @@
         }
       } else {
         cancelSelfReload();
+        showActionError('Failed to update reviewed status.');
       }
     }).catch(() => {
       cancelSelfReload();
+      showActionError('Failed to update reviewed status.');
+    }).finally(() => {
+      btn._busy = false;
     });
   };
 
@@ -4643,16 +4907,32 @@
       } catch (_) {}
     }
 
-    btn.classList.add('copied');
-    btn.title = 'Copied!';
     if (btn._copyTimer) clearTimeout(btn._copyTimer);
-    btn._copyTimer = setTimeout(() => {
+    if (ok) {
+      btn.classList.add('copied');
+      btn.title = 'Copied!';
+      btn._copyTimer = setTimeout(() => {
+        btn.classList.remove('copied');
+        btn.title = 'Copy link to page';
+      }, 1500);
+    } else {
       btn.classList.remove('copied');
-      btn.title = 'Copy link to page';
-    }, 1500);
+      btn.title = 'Copy failed';
+      showActionError('Could not copy link to clipboard.');
+      btn._copyTimer = setTimeout(() => {
+        btn.title = 'Copy link to page';
+      }, 1500);
+    }
   };
 
   // --- Go Symbol Lookup & Definition Popup ---
+
+  function abortCallerFetches(state) {
+    if (state && state.callerState && state.callerState._abort) {
+      try { state.callerState._abort.abort(); } catch (_) {}
+      state.callerState._abort = null;
+    }
+  }
 
   function closeSpecificSymbolPopup(inst) {
     if (!inst) return false;
@@ -4672,6 +4952,11 @@
     if (inst.listAbort) {
       inst.listAbort.abort();
       inst.listAbort = null;
+      if (inst.currentState && inst.currentState.kind === 'search') inst.currentState.inflightQuery = '';
+    }
+    abortCallerFetches(inst.currentState);
+    if (inst.history) {
+      for (const h of inst.history) abortCallerFetches(h);
     }
     if (inst._searchTimer) {
       clearTimeout(inst._searchTimer);
@@ -4904,6 +5189,7 @@
       inst.listAbort.abort();
       inst.listAbort = null;
     }
+    abortCallerFetches(state);
 
     let endpoint = '';
     let params = null;
@@ -4996,29 +5282,28 @@
 
     const abort = new AbortController();
     inst.listAbort = abort;
-    inst._abortPendingNav = () => {
+    const abortNav = () => {
       if (inst.listAbort === abort) {
         abort.abort();
         inst.listAbort = null;
       }
       restoreHeader();
     };
+    inst._abortPendingNav = abortNav;
 
     try {
       const resp = await fetch(endpoint + '?' + params.toString(), {
         cache: 'no-store',
         signal: abort.signal,
       });
-      if (inst.listAbort === abort) inst.listAbort = null;
-      inst._abortPendingNav = null;
-      if (!openSymbolPopups.includes(inst) || inst.currentState !== state) return;
+      if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== state) return;
       if (!resp.ok) {
         restoreHeader();
         showPopupNotice(inst, notFoundMsg);
         return;
       }
       const newData = await resp.json();
-      if (!openSymbolPopups.includes(inst) || inst.currentState !== state) return;
+      if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== state) return;
       if (!newData || !newData.found) {
         restoreHeader();
         showPopupNotice(inst, notFoundMsg);
@@ -5057,13 +5342,14 @@
         }
       }
     } catch (err) {
-      if (inst.listAbort === abort) inst.listAbort = null;
-      inst._abortPendingNav = null;
-      if (err && err.name === 'AbortError') return;
+      if ((err && err.name === 'AbortError') || abort.signal.aborted) return;
       if (openSymbolPopups.includes(inst) && inst.currentState === state) {
         restoreHeader();
         showPopupNotice(inst, notFoundMsg);
       }
+    } finally {
+      if (inst.listAbort === abort) inst.listAbort = null;
+      if (inst._abortPendingNav === abortNav) inst._abortPendingNav = null;
     }
   }
 
@@ -5155,7 +5441,9 @@
     if (inst.listAbort) {
       inst.listAbort.abort();
       inst.listAbort = null;
+      if (inst.currentState && inst.currentState.kind === 'search') inst.currentState.inflightQuery = '';
     }
+    abortCallerFetches(inst.currentState);
     if (inst._searchTimer) {
       clearTimeout(inst._searchTimer);
       inst._searchTimer = null;
@@ -5263,10 +5551,10 @@
   }
   window.getPopupTopClearance = getPopupTopClearance;
 
-  function detectSnapZone(clientX, clientY) {
-    const vw = (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1024;
-    const vh = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight || 768;
-    const topClearance = getSnapTopClearance();
+  function detectSnapZone(clientX, clientY, metrics) {
+    const vw = (metrics && metrics.vw) || (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1024;
+    const vh = (metrics && metrics.vh) || (document.documentElement && document.documentElement.clientHeight) || window.innerHeight || 768;
+    const topClearance = (metrics && typeof metrics.topClearance === 'number') ? metrics.topClearance : getSnapTopClearance();
 
     const EDGE_THRESH = 28;
     const nearLeft = clientX <= EDGE_THRESH;
@@ -5778,6 +6066,10 @@
       const startTop = parseFloat(popup.style.top) || (isSnapped ? startRect.top : (startRect.top + startScrollY));
       const startWidth = popup.offsetWidth || startRect.width;
       const startHeight = popup.offsetHeight || startRect.height;
+      const cachedSnapTopClearance = getSnapTopClearance();
+      const cachedHeaderClearance = getHeaderClearanceOffset();
+      const cachedVW = (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1024;
+      const cachedVH = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight || 768;
 
       if (isSnapped) {
         inst.customSnapRect = true;
@@ -5822,7 +6114,7 @@
         if (updateTop) {
           popup.style.top = `${nextTop}px`;
           if (isSnapped) {
-            if (Math.abs(nextTop - getSnapTopClearance()) <= 1) {
+            if (Math.abs(nextTop - cachedSnapTopClearance) <= 1) {
               popup.classList.add('sym-snapped-top');
             } else {
               popup.classList.remove('sym-snapped-top');
@@ -5858,17 +6150,17 @@
         if (isSnapped) {
           dx = moveEvt.clientX - startX;
           dy = moveEvt.clientY - startY;
-          minHeaderTop = getSnapTopClearance();
+          minHeaderTop = cachedSnapTopClearance;
         } else {
           const curScrollX = window.scrollX || 0;
           const curScrollY = window.scrollY || 0;
           dx = (moveEvt.clientX + curScrollX) - (startX + startScrollX);
           dy = (moveEvt.clientY + curScrollY) - (startY + startScrollY);
-          minHeaderTop = curScrollY + getHeaderClearanceOffset();
+          minHeaderTop = curScrollY + cachedHeaderClearance;
         }
 
-        const vw = (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1024;
-        const vh = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight || 768;
+        const vw = cachedVW;
+        const vh = cachedVH;
 
         if (dir.includes('e')) {
           if (isSnapped) {
@@ -5950,6 +6242,9 @@
       let startLeft = parseFloat(popup.style.left) || (isSnapped ? startRect.left : (startRect.left + startScrollX));
       let startTop = parseFloat(popup.style.top) || (isSnapped ? startRect.top : (startRect.top + startScrollY));
       const viewportW = (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1024;
+      const viewportH = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight || 768;
+      const cachedHeaderClearance = getHeaderClearanceOffset();
+      const cachedSnapMetrics = { vw: viewportW, vh: viewportH, topClearance: getSnapTopClearance() };
       let hasDragged = false;
       let activeSnapZone = null;
       const threshold = isLocLink ? 4 : 2;
@@ -6063,18 +6358,21 @@
           }
         }
 
-        const minHeaderTop = curScrollY + getHeaderClearanceOffset();
+        const minHeaderTop = curScrollY + cachedHeaderClearance;
         const maxLeft = curScrollX + viewportW - 80;
         pendingLeft = Math.max(0, Math.min(startLeft + dx, maxLeft));
         pendingTop = Math.max(minHeaderTop, startTop + dy);
 
-        activeSnapZone = detectSnapZone(moveEvt.clientX, moveEvt.clientY);
-        if (activeSnapZone) {
-          const snapRect = computeSnapRect(activeSnapZone);
-          const zIdx = (parseInt(popup.style.zIndex, 10) || 200) - 1;
-          showSnapPreview(snapRect, zIdx);
-        } else {
-          hideSnapPreview();
+        const nextSnapZone = detectSnapZone(moveEvt.clientX, moveEvt.clientY, cachedSnapMetrics);
+        if (nextSnapZone !== activeSnapZone) {
+          activeSnapZone = nextSnapZone;
+          if (activeSnapZone) {
+            const snapRect = computeSnapRect(activeSnapZone);
+            const zIdx = (parseInt(popup.style.zIndex, 10) || 200) - 1;
+            showSnapPreview(snapRect, zIdx);
+          } else {
+            hideSnapPreview();
+          }
         }
 
         if (typeof requestAnimationFrame === 'function') {
@@ -6111,10 +6409,19 @@
   }
   window.setupDragAndResize = setupDragAndResize;
 
-  window.addEventListener('scroll', scheduleStickyScopeUpdate, { passive: true, capture: true });
+  window.addEventListener('scroll', scheduleStickyScopeUpdate, { passive: true });
   window.addEventListener('resize', scheduleStickyScopeUpdate, { passive: true });
-  window.addEventListener('resize', syncAppHeaderHeight, { passive: true });
+  window.addEventListener('resize', () => { syncAppHeaderHeight(); }, { passive: true });
   window.addEventListener('resize', updateSnappedPopupsLayout, { passive: true });
+  window.addEventListener('resize', () => {
+    const menu = document.querySelector ? document.querySelector('.unresolved-threads-menu') : null;
+    if (!menu || !menu.style || menu.style.display === 'none') return;
+    const status = menu.getAttribute ? menu.getAttribute('data-active-status') : '';
+    const trig = status && document.querySelector
+      ? document.querySelector(`#changeCommentCounts .threads-menu-trigger[data-status="${status}"]`)
+      : null;
+    if (trig) positionThreadsMenu(menu, trig);
+  }, { passive: true });
 
   var appHeaderResizeObserved = false;
   function observeAppHeaderResize() {
@@ -6158,16 +6465,7 @@
 
     if (fileSec || container) {
       if (fileSec) {
-        const body = fileSec.querySelector('.diff-file-body');
-        if (body && (body.style.display === 'none' || fileSec.classList.contains('collapsed'))) {
-          const btn = fileSec.querySelector('.diff-file-header button');
-          body.style.display = 'block';
-          fileSec.classList.remove('collapsed');
-          if (btn) btn.textContent = '▾';
-        }
-        if (body && window.ensureFileBodyLoaded && (body.hasAttribute('data-lazy-url') || body._loadPromise)) {
-          await window.ensureFileBodyLoaded(body);
-        }
+        await expandFileSection(fileSec);
       }
 
       const parentScope = fileSec || container;
@@ -6188,8 +6486,9 @@
         }
       }
 
+      const table = parentScope.querySelector ? parentScope.querySelector('.diff-table') : null;
       const lineAttr = lookupSide === 'L' ? `data-line-l="${defLine}"` : `data-line-r="${defLine}"`;
-      let targetRow = parentScope.querySelector(`tr.diff-row[${lineAttr}]`);
+      let targetRow = table ? findDiffRowByLine(table, lookupSide === 'L' ? 'L' : 'R', defLine, true) : parentScope.querySelector(`tr.diff-row[${lineAttr}]`);
       if (!targetRow) {
         targetRow = parentScope.querySelector(`tr[data-line-r="${defLine}"]`) || parentScope.querySelector(`tr[data-line-l="${defLine}"]`);
       }
@@ -6580,6 +6879,63 @@
     return !!(obj && Object.prototype.hasOwnProperty.call(obj, key));
   }
 
+  function ensureCallerAbortSignal(callerState) {
+    if (!callerState || typeof AbortController !== 'function') return undefined;
+    if (!callerState._abort) {
+      callerState._abort = new AbortController();
+    }
+    return callerState._abort.signal;
+  }
+
+  function insertCallerChildrenDom(contentEl, rowEl, node, callerState) {
+    const nodeId = node.nodeId;
+    const existing = contentEl.querySelector(`.sym-caller-children[data-parent-node-id="${nodeId}"]`);
+    if (existing) {
+      if (existing.remove) existing.remove();
+      else if (existing.parentElement) existing.parentElement.removeChild(existing);
+    }
+
+    const childrenEl = document.createElement('div');
+    childrenEl.className = 'sym-caller-children';
+    childrenEl.setAttribute('data-parent-node-id', nodeId);
+
+    let childHtml = '';
+    if (!node.childRefs || node.childRefs.length === 0) {
+      childHtml = `<div class="sym-caller-empty" style="padding-left: ${10 + (node.depth + 1) * 16}px;">No references found</div>`;
+    } else {
+      for (let i = 0; i < node.childRefs.length; i++) {
+        const cr = node.childRefs[i];
+        const childNodeId = `${nodeId}.${i}`;
+        if (!callerState.nodes[childNodeId]) {
+          callerState.nodes[childNodeId] = {
+            nodeId: childNodeId,
+            ref: cr,
+            depth: node.depth + 1,
+            groupKey: node.groupKey,
+            parentNodeId: nodeId,
+            expanded: false,
+            loaded: false,
+            childRefs: [],
+          };
+        }
+        childHtml += renderRefRowTreeHtml(cr, node.depth + 1, childNodeId, callerState);
+      }
+    }
+    childrenEl.innerHTML = childHtml;
+    if (rowEl.after) rowEl.after(childrenEl);
+    else if (rowEl.parentElement) {
+      const p = rowEl.parentElement;
+      const idx = p.children.indexOf ? p.children.indexOf(rowEl) : -1;
+      if (idx !== -1 && idx + 1 < p.children.length) {
+        p.insertBefore(childrenEl, p.children[idx + 1]);
+      } else {
+        p.appendChild(childrenEl);
+      }
+    } else if (rowEl.parentNode && rowEl.parentNode.insertBefore) {
+      rowEl.parentNode.insertBefore(childrenEl, rowEl.nextSibling);
+    }
+  }
+
   async function fetchCallerRefs(ref, stateCtx, callerState) {
     if (!ref || !stateCtx) return [];
     const declKey = getRefDeclKey(ref);
@@ -6612,8 +6968,11 @@
       if (stateCtx.originPath) params.set('path', stateCtx.originPath);
     }
 
+    const signal = ensureCallerAbortSignal(callerState);
     const fetchPromise = (async () => {
-      const resp = await fetch('/api/symbol/refs?' + params.toString(), { cache: 'no-store' });
+      const fetchOpts = { cache: 'no-store' };
+      if (signal) fetchOpts.signal = signal;
+      const resp = await fetch('/api/symbol/refs?' + params.toString(), fetchOpts);
       if (!resp.ok) {
         throw new Error(`fetch failed: ${resp.status}`);
       }
@@ -6635,7 +6994,7 @@
     return await fetchPromise;
   }
 
-  async function fetchCallerRefsBatch(refs, stateCtx, callerState) {
+  async function fetchCallerRefsBatch(refs, stateCtx, callerState, failedKeys) {
     if (!refs || refs.length === 0 || !stateCtx) return [];
     const uncached = [];
     const seenKeys = new Set();
@@ -6659,8 +7018,14 @@
 
     if (uncached.length === 0) return [];
 
+    const signal = ensureCallerAbortSignal(callerState);
     const CHUNK_SIZE = 64;
     for (let c = 0; c < uncached.length; c += CHUNK_SIZE) {
+      if (signal && signal.aborted) {
+        const abortErr = new Error('Aborted');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
       const chunkItems = uncached.slice(c, c + CHUNK_SIZE);
 
       const deferreds = chunkItems.map(item => {
@@ -6697,12 +7062,14 @@
       };
 
       try {
-        const resp = await fetch('/api/symbol/refs/batch', {
+        const fetchOpts = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
           cache: 'no-store',
-        });
+        };
+        if (signal) fetchOpts.signal = signal;
+        const resp = await fetch('/api/symbol/refs/batch', fetchOpts);
         if (!resp.ok) {
           throw new Error(`batch fetch failed: ${resp.status}`);
         }
@@ -6720,20 +7087,38 @@
           }
           def.resolve(childRefs);
         }
-      } catch (_) {
+      } catch (batchErr) {
         if (callerState && callerState.inflight) {
           for (const def of deferreds) {
             delete callerState.inflight[def.item.key];
           }
         }
+        if ((batchErr && batchErr.name === 'AbortError') || (signal && signal.aborted)) {
+          for (const def of deferreds) def.reject(batchErr);
+          throw batchErr;
+        }
         await mapConcurrent(deferreds, 4, async (def) => {
+          if (signal && signal.aborted) {
+            const abortErr = new Error('Aborted');
+            abortErr.name = 'AbortError';
+            def.reject(abortErr);
+            return;
+          }
           try {
             const res = await fetchCallerRefs(def.item.ref, stateCtx, callerState);
             def.resolve(res || []);
           } catch (e) {
+            if (!(e && e.name === 'AbortError') && !(signal && signal.aborted)) {
+              if (failedKeys) failedKeys.add(def.item.key);
+            }
             def.reject(e);
           }
         });
+        if (signal && signal.aborted) {
+          const abortErr = new Error('Aborted');
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        }
       } finally {
         if (callerState && callerState.inflight) {
           for (const def of deferreds) {
@@ -6803,51 +7188,7 @@
       callerToggle.setAttribute('aria-expanded', 'true');
       callerToggle.title = `Collapse references to ${node.ref.container || ''}`;
 
-      const existing = contentEl.querySelector(`.sym-caller-children[data-parent-node-id="${nodeId}"]`);
-      if (existing) {
-        if (existing.remove) existing.remove();
-        else if (existing.parentElement) existing.parentElement.removeChild(existing);
-      }
-
-      const childrenEl = document.createElement('div');
-      childrenEl.className = 'sym-caller-children';
-      childrenEl.setAttribute('data-parent-node-id', nodeId);
-
-      let childHtml = '';
-      if (!node.childRefs || node.childRefs.length === 0) {
-        childHtml = `<div class="sym-caller-empty" style="padding-left: ${10 + (node.depth + 1) * 16}px;">No references found</div>`;
-      } else {
-        for (let i = 0; i < node.childRefs.length; i++) {
-          const cr = node.childRefs[i];
-          const childNodeId = `${nodeId}.${i}`;
-          if (!callerState.nodes[childNodeId]) {
-            callerState.nodes[childNodeId] = {
-              nodeId: childNodeId,
-              ref: cr,
-              depth: node.depth + 1,
-              groupKey: node.groupKey,
-              parentNodeId: nodeId,
-              expanded: false,
-              loaded: false,
-              childRefs: [],
-            };
-          }
-          childHtml += renderRefRowTreeHtml(cr, node.depth + 1, childNodeId, callerState);
-        }
-      }
-      childrenEl.innerHTML = childHtml;
-      if (rowEl.after) rowEl.after(childrenEl);
-      else if (rowEl.parentElement) {
-        const p = rowEl.parentElement;
-        const idx = p.children.indexOf ? p.children.indexOf(rowEl) : -1;
-        if (idx !== -1 && idx + 1 < p.children.length) {
-          p.insertBefore(childrenEl, p.children[idx + 1]);
-        } else {
-          p.appendChild(childrenEl);
-        }
-      } else if (rowEl.parentNode && rowEl.parentNode.insertBefore) {
-        rowEl.parentNode.insertBefore(childrenEl, rowEl.nextSibling);
-      }
+      insertCallerChildrenDom(contentEl, rowEl, node, callerState);
       syncGroupButtons(contentEl, callerState, node.groupKey);
       if (typeof updateIdentOccurrences === 'function') updateIdentOccurrences();
       return;
@@ -6861,7 +7202,10 @@
     try {
       const stateCtx = activeState.ctx;
       const childRefs = await fetchCallerRefs(node.ref, stateCtx, callerState);
-      if (inst.currentState !== activeState) return;
+      if (!openSymbolPopups.includes(inst) || inst.currentState !== activeState) {
+        node.loading = false;
+        return;
+      }
       node.childRefs = childRefs || [];
       node.loaded = true;
       node.expanded = true;
@@ -6871,50 +7215,12 @@
       callerToggle.setAttribute('aria-expanded', 'true');
       callerToggle.title = `Collapse references to ${node.ref.container || ''}`;
 
-      const childrenEl = document.createElement('div');
-      childrenEl.className = 'sym-caller-children';
-      childrenEl.setAttribute('data-parent-node-id', nodeId);
-
-      let childHtml = '';
-      if (!node.childRefs || node.childRefs.length === 0) {
-        childHtml = `<div class="sym-caller-empty" style="padding-left: ${10 + (node.depth + 1) * 16}px;">No references found</div>`;
-      } else {
-        for (let i = 0; i < node.childRefs.length; i++) {
-          const cr = node.childRefs[i];
-          const childNodeId = `${nodeId}.${i}`;
-          if (!callerState.nodes[childNodeId]) {
-            callerState.nodes[childNodeId] = {
-              nodeId: childNodeId,
-              ref: cr,
-              depth: node.depth + 1,
-              groupKey: node.groupKey,
-              parentNodeId: nodeId,
-              expanded: false,
-              loaded: false,
-              childRefs: [],
-            };
-          }
-          childHtml += renderRefRowTreeHtml(cr, node.depth + 1, childNodeId, callerState);
-        }
-      }
-      childrenEl.innerHTML = childHtml;
-      if (rowEl.after) rowEl.after(childrenEl);
-      else if (rowEl.parentElement) {
-        const p = rowEl.parentElement;
-        const idx = p.children.indexOf ? p.children.indexOf(rowEl) : -1;
-        if (idx !== -1 && idx + 1 < p.children.length) {
-          p.insertBefore(childrenEl, p.children[idx + 1]);
-        } else {
-          p.appendChild(childrenEl);
-        }
-      } else if (rowEl.parentNode && rowEl.parentNode.insertBefore) {
-        rowEl.parentNode.insertBefore(childrenEl, rowEl.nextSibling);
-      }
+      insertCallerChildrenDom(contentEl, rowEl, node, callerState);
       syncGroupButtons(contentEl, callerState, node.groupKey);
       if (typeof updateIdentOccurrences === 'function') updateIdentOccurrences();
     } catch (err) {
       node.loading = false;
-      if (inst && inst.currentState === activeState) {
+      if (openSymbolPopups.includes(inst) && inst.currentState === activeState) {
         callerToggle.disabled = false;
         callerToggle.innerHTML = CALLER_CHEVRON_RIGHT_SVG;
       }
@@ -6948,95 +7254,68 @@
     }
 
     const activeState = inst.currentState;
+    const failedKeys = new Set();
     try {
       const stateCtx = activeState.ctx;
       const refsToFetch = nodesToExpand.filter(n => !n.loaded).map(n => n.ref);
       if (refsToFetch.length > 0) {
-        await fetchCallerRefsBatch(refsToFetch, stateCtx, callerState);
+        await fetchCallerRefsBatch(refsToFetch, stateCtx, callerState, failedKeys);
       }
+      if (!openSymbolPopups.includes(inst) || inst.currentState !== activeState) return;
       await mapConcurrent(nodesToExpand, 6, async (node) => {
-        if (!node.loaded) {
-          const k = getRefDeclKey(node.ref);
-          const childRefs = (callerState && hasProp(callerState.cache, k))
-            ? callerState.cache[k]
-            : await fetchCallerRefs(node.ref, stateCtx, callerState);
-          node.childRefs = childRefs || [];
-          node.loaded = true;
+        if (!openSymbolPopups.includes(inst) || inst.currentState !== activeState) {
+          node.loading = false;
+          return;
         }
-        node.expanded = true;
-        node.loading = false;
-        if (node.childRefs) {
-          for (let i = 0; i < node.childRefs.length; i++) {
-            const cr = node.childRefs[i];
-            const childNodeId = `${node.nodeId}.${i}`;
-            if (!callerState.nodes[childNodeId]) {
-              callerState.nodes[childNodeId] = {
-                nodeId: childNodeId,
-                ref: cr,
-                depth: node.depth + 1,
-                groupKey: node.groupKey,
-                parentNodeId: node.nodeId,
-                expanded: false,
-                loaded: false,
-                childRefs: [],
-              };
+        try {
+          if (!node.loaded) {
+            const k = getRefDeclKey(node.ref);
+            if (failedKeys.has(k)) {
+              node.loading = false;
+              return;
             }
+            const childRefs = (callerState && hasProp(callerState.cache, k))
+              ? callerState.cache[k]
+              : await fetchCallerRefs(node.ref, stateCtx, callerState);
+            if (!openSymbolPopups.includes(inst) || inst.currentState !== activeState) {
+              node.loading = false;
+              return;
+            }
+            node.childRefs = childRefs || [];
+            node.loaded = true;
           }
+          node.expanded = true;
+          node.loading = false;
+        } catch (_) {
+          node.loading = false;
         }
       });
 
-      if (inst.currentState !== activeState) return;
+      if (!openSymbolPopups.includes(inst) || inst.currentState !== activeState) return;
 
       for (const node of nodesToExpand) {
         const rowEl = contentEl.querySelector(`.sym-ref-row[data-node-id="${node.nodeId}"]`);
         if (!rowEl) continue;
         const toggle = rowEl.querySelector('.sym-caller-toggle');
+        if (!node.expanded) {
+          if (toggle) {
+            toggle.disabled = false;
+            toggle.innerHTML = CALLER_CHEVRON_RIGHT_SVG;
+          }
+          continue;
+        }
         if (toggle) {
           toggle.disabled = false;
           toggle.innerHTML = CALLER_CHEVRON_DOWN_SVG;
           toggle.setAttribute('aria-expanded', 'true');
           toggle.title = `Collapse references to ${node.ref.container || ''}`;
         }
-
-        const existing = contentEl.querySelector(`.sym-caller-children[data-parent-node-id="${node.nodeId}"]`);
-        if (existing) {
-          if (existing.remove) existing.remove();
-          else if (existing.parentElement) existing.parentElement.removeChild(existing);
-        }
-
-        const childrenEl = document.createElement('div');
-        childrenEl.className = 'sym-caller-children';
-        childrenEl.setAttribute('data-parent-node-id', node.nodeId);
-
-        let childHtml = '';
-        if (!node.childRefs || node.childRefs.length === 0) {
-          childHtml = `<div class="sym-caller-empty" style="padding-left: ${10 + (node.depth + 1) * 16}px;">No references found</div>`;
-        } else {
-          for (let i = 0; i < node.childRefs.length; i++) {
-            const cr = node.childRefs[i];
-            const childNodeId = `${node.nodeId}.${i}`;
-            childHtml += renderRefRowTreeHtml(cr, node.depth + 1, childNodeId, callerState);
-          }
-        }
-        childrenEl.innerHTML = childHtml;
-        if (rowEl.after) rowEl.after(childrenEl);
-        else if (rowEl.parentElement) {
-          const p = rowEl.parentElement;
-          const idx = p.children.indexOf ? p.children.indexOf(rowEl) : -1;
-          if (idx !== -1 && idx + 1 < p.children.length) {
-            p.insertBefore(childrenEl, p.children[idx + 1]);
-          } else {
-            p.appendChild(childrenEl);
-          }
-        } else if (rowEl.parentNode && rowEl.parentNode.insertBefore) {
-          rowEl.parentNode.insertBefore(childrenEl, rowEl.nextSibling);
-        }
+        insertCallerChildrenDom(contentEl, rowEl, node, callerState);
       }
     } catch (err) {
-      if (inst && inst.currentState === activeState) {
+      if (openSymbolPopups.includes(inst) && inst.currentState === activeState) {
         for (const node of nodesToExpand) {
           if (!node.expanded) {
-            node.loading = false;
             const rowEl = contentEl.querySelector(`.sym-ref-row[data-node-id="${node.nodeId}"]`);
             if (rowEl) {
               const toggle = rowEl.querySelector('.sym-caller-toggle');
@@ -7049,8 +7328,11 @@
         }
       }
     } finally {
+      for (const node of nodesToExpand) {
+        node.loading = false;
+      }
       callerState.groupLoading[groupKey] = false;
-      if (inst && inst.currentState === activeState) {
+      if (openSymbolPopups.includes(inst) && inst.currentState === activeState) {
         syncGroupButtons(contentEl, callerState, groupKey);
         if (typeof updateIdentOccurrences === 'function') updateIdentOccurrences();
       }
@@ -7626,8 +7908,10 @@
       html += `<div class="sym-group-header">Files (${files.length})</div>`;
       for (const f of files) {
         const chBadge = f.in_change ? '<span class="sym-count-badge">changed</span>' : '';
-        html += `<div class="cs-item" role="button" tabindex="0" data-cs-kind="file" data-path="${escapeHtml(f.path)}" data-line="1">` +
-          `<div class="cs-item-main"><span class="cs-item-loc">${escapeHtml(f.path)}</span></div>` +
+        const targetLine = (f.line && f.line > 0) ? f.line : 1;
+        const locLabel = (f.line && f.line > 0) ? `${f.path}:${f.line}` : f.path;
+        html += `<div class="cs-item" role="button" tabindex="0" data-cs-kind="file" data-path="${escapeHtml(f.path)}" data-line="${targetLine}">` +
+          `<div class="cs-item-main"><span class="cs-item-loc">${escapeHtml(locLabel)}</span></div>` +
           (chBadge ? `<div class="cs-item-meta">${chBadge}</div>` : '') +
         `</div>`;
       }
@@ -7703,7 +7987,7 @@
     return `<div class="sym-list-inner">${html}</div>`;
   }
 
-  function setSearchActiveIndex(contentEl, idx) {
+  function setSearchActiveIndex(contentEl, idx, opts) {
     if (!contentEl || !contentEl.querySelectorAll) return -1;
     const items = Array.from(contentEl.querySelectorAll('.cs-item'));
     items.forEach(el => el.classList && el.classList.remove('cs-item-active'));
@@ -7712,15 +7996,17 @@
     const target = items[clamped];
     if (target) {
       if (target.classList) target.classList.add('cs-item-active');
-      const resultsEl = contentEl.querySelector ? contentEl.querySelector('.cs-results') : null;
-      if (resultsEl && target.getBoundingClientRect && resultsEl.getBoundingClientRect) {
-        const tRect = target.getBoundingClientRect();
-        const rRect = resultsEl.getBoundingClientRect();
-        if (tRect.height > 0 && rRect.height > 0) {
-          if (tRect.top < rRect.top) {
-            resultsEl.scrollTop -= (rRect.top - tRect.top);
-          } else if (tRect.bottom > rRect.bottom) {
-            resultsEl.scrollTop += (tRect.bottom - rRect.bottom);
+      if (!(opts && opts.noScroll)) {
+        const resultsEl = contentEl.querySelector ? contentEl.querySelector('.cs-results') : null;
+        if (resultsEl && target.getBoundingClientRect && resultsEl.getBoundingClientRect) {
+          const tRect = target.getBoundingClientRect();
+          const rRect = resultsEl.getBoundingClientRect();
+          if (tRect.height > 0 && rRect.height > 0) {
+            if (tRect.top < rRect.top) {
+              resultsEl.scrollTop -= (rRect.top - tRect.top);
+            } else if (tRect.bottom > rRect.bottom) {
+              resultsEl.scrollTop += (tRect.bottom - rRect.bottom);
+            }
           }
         }
       }
@@ -7748,6 +8034,7 @@
     if (inst.listAbort) {
       inst.listAbort.abort();
       inst.listAbort = null;
+      state.inflightQuery = '';
     }
 
     const trimmed = (query || '').trim();
@@ -7779,20 +8066,27 @@
 
       const abort = new AbortController();
       inst.listAbort = abort;
+      state.inflightQuery = trimmed;
+      const isStale = () => abort.signal.aborted || inst.listAbort !== abort || !inst.currentState || inst.currentState !== state || !openSymbolPopups.includes(inst);
       try {
         const res = await fetch('/api/search?' + params.toString(), {
           cache: 'no-store',
           signal: abort.signal,
         });
-        if (inst.listAbort === abort) inst.listAbort = null;
-        if (!inst.currentState || inst.currentState !== state || !openSymbolPopups.includes(inst)) return;
+        if (isStale()) return;
         if (!res.ok) {
-          if (resultsEl) resultsEl.innerHTML = '<div class="sym-list-empty">Search failed.</div>';
+          let errMsg = '';
+          try { errMsg = (await res.text() || '').trim(); } catch (_) {}
+          if (isStale()) return;
+          if (errMsg.length > 160) errMsg = errMsg.slice(0, 160) + '…';
+          if (resultsEl) {
+            resultsEl.innerHTML = `<div class="sym-list-empty">${errMsg ? escapeHtml(errMsg) : 'Search failed.'}</div>`;
+          }
           if (truncEl && truncEl.style) truncEl.style.display = 'none';
           return;
         }
         const data = await res.json();
-        if (!inst.currentState || inst.currentState !== state || !openSymbolPopups.includes(inst)) return;
+        if (isStale()) return;
         state.data = data;
         if (resultsEl) {
           resultsEl.innerHTML = renderSearchResultsHtml(ctx, data);
@@ -7804,12 +8098,17 @@
         }
         state.activeIdx = setSearchActiveIndex(contentEl, 0);
       } catch (err) {
-        if (err && err.name === 'AbortError') return;
+        if ((err && err.name === 'AbortError') || isStale()) return;
         if (resultsEl && inst.currentState === state) {
           resultsEl.innerHTML = '<div class="sym-list-empty">Search failed.</div>';
         }
         if (truncEl && truncEl.style && inst.currentState === state) {
           truncEl.style.display = 'none';
+        }
+      } finally {
+        if (inst.listAbort === abort) {
+          inst.listAbort = null;
+          state.inflightQuery = '';
         }
       }
     };
@@ -7864,7 +8163,7 @@
       }
     }
     if (state.data && typeof state.activeIdx === 'number' && state.activeIdx >= 0) {
-      state.activeIdx = setSearchActiveIndex(contentEl, state.activeIdx);
+      state.activeIdx = setSearchActiveIndex(contentEl, state.activeIdx, { noScroll: typeof restoredScrollTop === 'number' });
     }
 
     const inputEl = contentEl.querySelector ? contentEl.querySelector('.cs-search-input') : null;
@@ -7888,6 +8187,9 @@
         if (e.key === 'Enter') {
           if (e.preventDefault) e.preventDefault();
           const curTrimmed = (inputEl.value || '').trim();
+          if (inst.listAbort && state.inflightQuery === curTrimmed) {
+            return;
+          }
           if (inst._searchTimer || (curTrimmed && (!state.data || (state.data.query || '').trim() !== curTrimmed))) {
             if (curTrimmed) {
               runCodeSearchQuery(inst, inputEl.value, true);
@@ -7940,7 +8242,18 @@
       }
       if (stateCtx.repo && cmChange) {
         const hash = msgId ? `#thread-${threadId}-msg-${msgId}` : `#thread-${threadId}`;
-        window.location.href = `/r/${encodeURIComponent(stateCtx.repo)}/c/${encodeURIComponent(cmChange)}${hash}`;
+        const cleanCmPath = String(cmPath || '').replace(/^\/+/, '');
+        if (cleanCmPath) {
+          const sp = new URLSearchParams();
+          if (snapNum > 0 && !inView) {
+            sp.set('base', 'parent');
+            sp.set('target', 'snap:' + snapNum);
+          }
+          const qs = sp.toString();
+          window.location.href = `/r/${encodeURIComponent(stateCtx.repo)}/c/${encodeURIComponent(cmChange)}/f/${encodeRepoPath(cleanCmPath)}${qs ? '?' + qs : ''}${hash}`;
+        } else {
+          window.location.href = `/r/${encodeURIComponent(stateCtx.repo)}/c/${encodeURIComponent(cmChange)}?diffs=all${hash}`;
+        }
       }
       return;
     }
@@ -7961,6 +8274,7 @@
     } else if (inst.listAbort) {
       inst.listAbort.abort();
       inst.listAbort = null;
+      if (baseState.kind === 'search') baseState.inflightQuery = '';
     }
 
     const headerEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.sym-popup-header') : null;
@@ -7987,13 +8301,14 @@
 
     const abort = new AbortController();
     inst.listAbort = abort;
-    inst._abortPendingNav = () => {
+    const abortNav = () => {
       if (inst.listAbort === abort) {
         abort.abort();
         inst.listAbort = null;
       }
       restoreHeader();
     };
+    inst._abortPendingNav = abortNav;
 
     try {
       let data = null;
@@ -8017,8 +8332,10 @@
           cache: 'no-store',
           signal: abort.signal,
         });
+        if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
         if (symRes.ok) {
           const symJson = await symRes.json();
+          if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
           if (symJson && symJson.found) {
             data = symJson;
             lookupParams = symParams;
@@ -8041,17 +8358,17 @@
           cache: 'no-store',
           signal: abort.signal,
         });
+        if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
         if (prevRes.ok) {
           const prevJson = await prevRes.json();
+          if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
           if (prevJson && prevJson.found) {
             data = prevJson;
           }
         }
       }
 
-      if (inst.listAbort === abort) inst.listAbort = null;
-      inst._abortPendingNav = null;
-      if (!openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
+      if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
       if (!data) {
         restoreHeader();
         return;
@@ -8067,10 +8384,13 @@
       };
       renderSymbolPopup(inst, data, stateCtx, undefined, true);
     } catch (err) {
+      if ((err && err.name === 'AbortError') || abort.signal.aborted) return;
+      if (openSymbolPopups.includes(inst) && inst.currentState === baseState) {
+        restoreHeader();
+      }
+    } finally {
       if (inst.listAbort === abort) inst.listAbort = null;
-      inst._abortPendingNav = null;
-      if (err && err.name === 'AbortError') return;
-      restoreHeader();
+      if (inst._abortPendingNav === abortNav) inst._abortPendingNav = null;
     }
   }
 
@@ -8089,6 +8409,7 @@
       inst.listAbort.abort();
       inst.listAbort = null;
     }
+    abortCallerFetches(inst.currentState);
 
     const contentEl = getPopupContentEl(inst);
     if (inst.currentState && inst.currentState.kind !== 'search') {
@@ -8156,6 +8477,13 @@
         if (existing.shaded) setPopupShaded(existing, false, false);
         if (!isPopupPersistent(existing)) {
           centerPopupInViewport(existing);
+        } else if (!existing.snapped && existing.el && existing.el.getBoundingClientRect) {
+          const r = existing.el.getBoundingClientRect();
+          const vw = (document.documentElement && document.documentElement.clientWidth) || window.innerWidth || 1024;
+          const vh = (document.documentElement && document.documentElement.clientHeight) || window.innerHeight || 768;
+          if ((r.width > 0 || r.height > 0) && (r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw)) {
+            centerPopupInViewport(existing);
+          }
         }
         bringPopupToFront(existing);
         const inputEl = existing.contentEl && existing.contentEl.querySelector
@@ -8300,6 +8628,29 @@
         if (sel && !sel.isCollapsed) return;
         if (evt.preventDefault) evt.preventDefault();
         if (evt.stopPropagation) evt.stopPropagation();
+        if ((evt.metaKey || evt.ctrlKey) && inst.currentState) {
+          const kind = csItem.getAttribute('data-cs-kind') || '';
+          const stateCtx = inst.currentState.ctx || getCodeSearchContext(inst);
+          if (kind !== 'comment' && stateCtx && stateCtx.repo && stateCtx.change) {
+            const p = csItem.getAttribute('data-path') || '';
+            const ln = parseInt(csItem.getAttribute('data-line') || '1', 10) || 1;
+            if (p) {
+              const href = buildInRepoJumpHref(stateCtx, p, ln);
+              if (href && window.open) {
+                window.open(href, '_blank', 'noopener');
+                return;
+              }
+            }
+          }
+        }
+        const contentEl = getPopupContentEl(inst);
+        if (inst.currentState && inst.currentState.kind === 'search' && contentEl && contentEl.querySelectorAll) {
+          const items = Array.from(contentEl.querySelectorAll('.cs-item'));
+          const idx = items.indexOf(csItem);
+          if (idx >= 0) {
+            inst.currentState.activeIdx = setSearchActiveIndex(contentEl, idx, { noScroll: true });
+          }
+        }
         openSearchResultInPopup(inst, csItem);
         return;
       }
@@ -8359,27 +8710,29 @@
           syncPopupShadeUI(inst);
         }
 
-        inst.listAbort = new AbortController();
-        inst._abortPendingNav = () => {
-          if (inst.listAbort) {
-            inst.listAbort.abort();
+        const abort = new AbortController();
+        inst.listAbort = abort;
+        const abortNav = () => {
+          if (inst.listAbort === abort) {
+            abort.abort();
             inst.listAbort = null;
           }
           restoreHeader();
         };
+        inst._abortPendingNav = abortNav;
 
         try {
           const resp = await fetch('/api/symbol/refs?' + params.toString(), {
             cache: 'no-store',
-            signal: inst.listAbort.signal,
+            signal: abort.signal,
           });
-          inst.listAbort = null;
-          inst._abortPendingNav = null;
+          if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
           if (!resp.ok) {
             restoreHeader();
             return;
           }
           const refsData = await resp.json();
+          if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
           if (!refsData || !refsData.found) {
             restoreHeader();
             return;
@@ -8394,9 +8747,13 @@
           };
           renderRefsView(inst, refsData, stateCtx);
         } catch (err) {
-          inst._abortPendingNav = null;
-          if (err && err.name === 'AbortError') return;
-          restoreHeader();
+          if ((err && err.name === 'AbortError') || abort.signal.aborted) return;
+          if (openSymbolPopups.includes(inst) && inst.currentState === baseState) {
+            restoreHeader();
+          }
+        } finally {
+          if (inst.listAbort === abort) inst.listAbort = null;
+          if (inst._abortPendingNav === abortNav) inst._abortPendingNav = null;
         }
         return;
       }
@@ -8457,27 +8814,29 @@
           syncPopupShadeUI(inst);
         }
 
-        inst.listAbort = new AbortController();
-        inst._abortPendingNav = () => {
-          if (inst.listAbort) {
-            inst.listAbort.abort();
+        const abort = new AbortController();
+        inst.listAbort = abort;
+        const abortNav = () => {
+          if (inst.listAbort === abort) {
+            abort.abort();
             inst.listAbort = null;
           }
           restoreHeader();
         };
+        inst._abortPendingNav = abortNav;
 
         try {
           const resp = await fetch('/api/symbol/impls?' + params.toString(), {
             cache: 'no-store',
-            signal: inst.listAbort.signal,
+            signal: abort.signal,
           });
-          inst.listAbort = null;
-          inst._abortPendingNav = null;
+          if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
           if (!resp.ok) {
             restoreHeader();
             return;
           }
           const implsData = await resp.json();
+          if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
           if (!implsData || !implsData.found) {
             restoreHeader();
             return;
@@ -8492,9 +8851,13 @@
           };
           renderImplsView(inst, implsData, stateCtx);
         } catch (err) {
-          inst._abortPendingNav = null;
-          if (err && err.name === 'AbortError') return;
-          restoreHeader();
+          if ((err && err.name === 'AbortError') || abort.signal.aborted) return;
+          if (openSymbolPopups.includes(inst) && inst.currentState === baseState) {
+            restoreHeader();
+          }
+        } finally {
+          if (inst.listAbort === abort) inst.listAbort = null;
+          if (inst._abortPendingNav === abortNav) inst._abortPendingNav = null;
         }
         return;
       }
@@ -8578,10 +8941,6 @@
           chParams.set('path', pPath);
         }
 
-        const locEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.sym-popup-loc') : null;
-        const oldLocHtml = locEl ? locEl.innerHTML : '';
-        if (locEl) locEl.innerHTML = `<span style="color: var(--muted);">Resolving …</span>`;
-
         if (inst._abortPendingNav) {
           inst._abortPendingNav();
           inst._abortPendingNav = null;
@@ -8589,35 +8948,58 @@
           inst.listAbort.abort();
           inst.listAbort = null;
         }
-        inst.listAbort = new AbortController();
-        inst._abortPendingNav = () => {
-          if (inst.listAbort) {
-            inst.listAbort.abort();
+        if (baseState._notFoundTimer) {
+          clearTimeout(baseState._notFoundTimer);
+          baseState._notFoundTimer = null;
+        }
+        const locEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.sym-popup-loc') : null;
+        if (baseState.baseLocHtml === undefined && locEl) {
+          baseState.baseLocHtml = locEl.innerHTML;
+        }
+        const oldLocHtml = baseState.baseLocHtml || (locEl ? locEl.innerHTML : '');
+        if (locEl) locEl.innerHTML = `<span style="color: var(--muted);">Resolving …</span>`;
+
+        const abort = new AbortController();
+        inst.listAbort = abort;
+        const abortNav = () => {
+          if (inst.listAbort === abort) {
+            abort.abort();
             inst.listAbort = null;
+          }
+          if (baseState._notFoundTimer) {
+            clearTimeout(baseState._notFoundTimer);
+            baseState._notFoundTimer = null;
           }
           if (locEl) locEl.innerHTML = oldLocHtml;
         };
+        inst._abortPendingNav = abortNav;
 
         try {
           const resp = await fetch('/api/symbol?' + chParams.toString(), {
             cache: 'no-store',
-            signal: inst.listAbort.signal,
+            signal: abort.signal,
           });
-          inst.listAbort = null;
-          inst._abortPendingNav = null;
+          if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
           if (!resp.ok) {
             if (locEl) locEl.innerHTML = oldLocHtml;
             return;
           }
           const chainedData = await resp.json();
+          if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
           if (!chainedData || !chainedData.found) {
             if (locEl) {
               locEl.innerHTML = `<span style="color: var(--muted);">(not found)</span>`;
-              setTimeout(() => { if (locEl && inst.currentState === baseState) locEl.innerHTML = oldLocHtml; }, 1500);
+              baseState._notFoundTimer = setTimeout(() => {
+                baseState._notFoundTimer = null;
+                if (locEl && locEl.isConnected !== false && !inst._abortPendingNav && openSymbolPopups.includes(inst) && inst.currentState === baseState) {
+                  locEl.innerHTML = oldLocHtml;
+                }
+              }, 1500);
             }
             return;
           }
 
+          abortCallerFetches(baseState);
           inst.history.push(baseState);
 
           const nextParams = new URLSearchParams(chParams);
@@ -8638,9 +9020,13 @@
           };
           renderSymbolPopup(inst, chainedData, stateCtx, undefined, true);
         } catch (err) {
-          inst._abortPendingNav = null;
-          if (err && err.name === 'AbortError') return;
-          if (locEl) locEl.innerHTML = oldLocHtml;
+          if ((err && err.name === 'AbortError') || abort.signal.aborted) return;
+          if (locEl && openSymbolPopups.includes(inst) && inst.currentState === baseState) {
+            locEl.innerHTML = oldLocHtml;
+          }
+        } finally {
+          if (inst.listAbort === abort) inst.listAbort = null;
+          if (inst._abortPendingNav === abortNav) inst._abortPendingNav = null;
         }
         return;
       }
@@ -8750,13 +9136,6 @@
         chParams.set('path', prevData.def_path || '');
       }
 
-      const locEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.sym-popup-loc') : null;
-      if (baseState.baseLocHtml === undefined && locEl) {
-        baseState.baseLocHtml = locEl.innerHTML;
-      }
-      const oldLocHtml = baseState.baseLocHtml || (locEl ? locEl.innerHTML : '');
-      if (locEl) locEl.innerHTML = `<span style="color: var(--muted);">Resolving ${escapeHtml(chTok.textContent || '')}…</span>`;
-
       if (inst._abortPendingNav) {
         inst._abortPendingNav();
         inst._abortPendingNav = null;
@@ -8764,31 +9143,53 @@
         inst.listAbort.abort();
         inst.listAbort = null;
       }
-      inst.listAbort = new AbortController();
-      inst._abortPendingNav = () => {
-        if (inst.listAbort) {
-          inst.listAbort.abort();
+      if (baseState._notFoundTimer) {
+        clearTimeout(baseState._notFoundTimer);
+        baseState._notFoundTimer = null;
+      }
+      const locEl = contentEl && contentEl.querySelector ? contentEl.querySelector('.sym-popup-loc') : null;
+      if (baseState.baseLocHtml === undefined && locEl) {
+        baseState.baseLocHtml = locEl.innerHTML;
+      }
+      const oldLocHtml = baseState.baseLocHtml || (locEl ? locEl.innerHTML : '');
+      if (locEl) locEl.innerHTML = `<span style="color: var(--muted);">Resolving ${escapeHtml(chTok.textContent || '')}…</span>`;
+
+      const abort = new AbortController();
+      inst.listAbort = abort;
+      const abortNav = () => {
+        if (inst.listAbort === abort) {
+          abort.abort();
           inst.listAbort = null;
+        }
+        if (baseState._notFoundTimer) {
+          clearTimeout(baseState._notFoundTimer);
+          baseState._notFoundTimer = null;
         }
         if (locEl) locEl.innerHTML = oldLocHtml;
       };
+      inst._abortPendingNav = abortNav;
 
       try {
         const resp = await fetch('/api/symbol?' + chParams.toString(), {
           cache: 'no-store',
-          signal: inst.listAbort.signal,
+          signal: abort.signal,
         });
-        inst.listAbort = null;
-        inst._abortPendingNav = null;
+        if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
         if (!resp.ok) {
           if (locEl) locEl.innerHTML = oldLocHtml;
           return;
         }
         const chainedData = await resp.json();
+        if (abort.signal.aborted || !openSymbolPopups.includes(inst) || inst.currentState !== baseState) return;
         if (!chainedData || !chainedData.found) {
           if (locEl) {
             locEl.innerHTML = `<span style="color: var(--muted);">${escapeHtml(chTok.textContent || '')} (not found)</span>`;
-            setTimeout(() => { if (locEl && inst.currentState && inst.currentState.data === prevData) locEl.innerHTML = oldLocHtml; }, 1500);
+            baseState._notFoundTimer = setTimeout(() => {
+              baseState._notFoundTimer = null;
+              if (locEl && locEl.isConnected !== false && !inst._abortPendingNav && openSymbolPopups.includes(inst) && inst.currentState === baseState) {
+                locEl.innerHTML = oldLocHtml;
+              }
+            }, 1500);
           }
           return;
         }
@@ -8803,9 +9204,13 @@
         };
         renderSymbolPopup(inst, chainedData, stateCtx, undefined, true);
       } catch (err) {
-        inst._abortPendingNav = null;
-        if (err && err.name === 'AbortError') return;
-        if (locEl) locEl.innerHTML = oldLocHtml;
+        if ((err && err.name === 'AbortError') || abort.signal.aborted) return;
+        if (locEl && openSymbolPopups.includes(inst) && inst.currentState === baseState) {
+          locEl.innerHTML = oldLocHtml;
+        }
+      } finally {
+        if (inst.listAbort === abort) inst.listAbort = null;
+        if (inst._abortPendingNav === abortNav) inst._abortPendingNav = null;
       }
     });
 
@@ -9258,20 +9663,24 @@
   window.threadNavState = threadNavState;
 
   // Keyboard navigation
-  let cursorRowIndex = 0;
+  let cursorRowIndex = -1;
   let cachedVisibleRows = null;
   let activeCursorRow = null;
   let pendingCursorRow = null;
 
   function invalidateVisibleRowsCache() {
     cachedVisibleRows = null;
-    if (activeCursorRow && activeCursorRow.offsetParent === null) {
+    if (activeCursorRow && (activeCursorRow.offsetParent === null || activeCursorRow.isConnected === false)) {
       activeCursorRow.style.outline = '';
       activeCursorRow = null;
     }
   }
+  window.invalidateVisibleRowsCache = invalidateVisibleRowsCache;
 
   function rows() {
+    if (cachedVisibleRows && activeCursorRow && (activeCursorRow.offsetParent === null || activeCursorRow.isConnected === false)) {
+      invalidateVisibleRowsCache();
+    }
     if (!cachedVisibleRows) {
       cachedVisibleRows = Array.from(document.querySelectorAll('.diff-table tr[data-line-r], .diff-table tr[data-line-l]')).filter(r => r.offsetParent !== null);
     }
@@ -9355,11 +9764,13 @@
   function navigateFiles(direction) {
     const sections = Array.from(document.querySelectorAll('.diff-file-section'));
     if (sections.length > 0) {
-      const viewportTop = window.scrollY + 60;
+      const threshold = (lastAppHeaderH || syncAppHeaderHeight() || 50) + 24;
       let curIdx = 0;
       for (let i = 0; i < sections.length; i++) {
-        const top = sections[i].offsetTop;
-        if (top <= viewportTop) {
+        const top = sections[i].getBoundingClientRect
+          ? sections[i].getBoundingClientRect().top
+          : (sections[i].offsetTop - (window.scrollY || 0));
+        if (top <= threshold) {
           curIdx = i;
         } else {
           break;
@@ -9482,6 +9893,12 @@
       toggleShortcutsModal();
       return;
     }
+
+    const shortcutsModal = document.getElementById('shortcutsModal');
+    if (shortcutsModal && shortcutsModal.style && (shortcutsModal.style.display === 'flex' || shortcutsModal.style.display === 'block')) {
+      return;
+    }
+
     if (e.key === '/') {
       const ctx = getCodeSearchContext(null);
       if (ctx.repo) {
@@ -9494,7 +9911,7 @@
     if (e.key === 'j') {
       const diffRows = rows();
       if (diffRows.length > 0) {
-        cursorRowIndex = Math.min(cursorRowIndex + 1, diffRows.length - 1);
+        cursorRowIndex = Math.max(0, Math.min(cursorRowIndex + 1, diffRows.length - 1));
         const nextRow = diffRows[cursorRowIndex];
         if (activeCursorRow && activeCursorRow !== nextRow) {
           activeCursorRow.style.outline = '';
@@ -9508,7 +9925,7 @@
     if (e.key === 'k') {
       const diffRows = rows();
       if (diffRows.length > 0) {
-        cursorRowIndex = Math.max(cursorRowIndex - 1, 0);
+        cursorRowIndex = cursorRowIndex <= 0 ? 0 : Math.min(cursorRowIndex - 1, diffRows.length - 1);
         const nextRow = diffRows[cursorRowIndex];
         if (activeCursorRow && activeCursorRow !== nextRow) {
           activeCursorRow.style.outline = '';
@@ -9570,11 +9987,12 @@
       if (sel && !sel.isCollapsed) {
         captureDiffSelection();
       }
-      let targetTr = activeRow;
+      let targetTr = (activeRow && activeRow.isConnected !== false && activeRow.offsetParent !== null) ? activeRow : null;
       if (!targetTr) {
         const diffRows = rows();
         if (diffRows.length > 0) {
-          targetTr = diffRows[cursorRowIndex];
+          const idx = Math.max(0, Math.min(cursorRowIndex < 0 ? 0 : cursorRowIndex, diffRows.length - 1));
+          targetTr = diffRows[idx];
         }
       }
       if (targetTr) {
@@ -9651,9 +10069,12 @@
 
   // Keyup fallback for brackets in case an extension intercepted keydown
   window.addEventListener('keyup', (e) => {
-    const tag = e.target.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    const target = elemFromTarget(e.target);
+    const tag = target ? target.tagName : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (target && target.isContentEditable)) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const modal = document.getElementById('shortcutsModal');
+    if (modal && modal.style && (modal.style.display === 'flex' || modal.style.display === 'block')) return;
 
     if (e.key === ']' || e.key === '[') {
       if (!bracketHandledOnKeydown) {
@@ -9734,7 +10155,7 @@
     if (sel && !sel.isCollapsed && sel.toString().length > 0) return;
 
     // Interactive or form elements
-    const target = e.target;
+    const target = elemFromTarget(e.target);
     if (!target) return;
     if (target.closest && target.closest('input, textarea, select, [contenteditable="true"], a[href], button, summary, label, img, video, audio')) {
       return;
@@ -9831,17 +10252,18 @@
 
   function getCharBeforeElement(container, el) {
     if (!container || !el) return '';
-    try {
-      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-      walker.currentNode = el;
-      let prev = walker.previousNode();
-      while (prev) {
-        if (prev.textContent.length > 0) {
-          return prev.textContent.charAt(prev.textContent.length - 1);
+    let cur = el;
+    while (cur && cur !== container) {
+      if (cur.previousSibling) {
+        cur = cur.previousSibling;
+        if (cur.nodeType === 3 || cur.nodeType === 1) {
+          const t = cur.textContent || '';
+          if (t.length > 0) return t.charAt(t.length - 1);
         }
-        prev = walker.previousNode();
+      } else {
+        cur = cur.parentElement;
       }
-    } catch (_) {}
+    }
     return '';
   }
 
@@ -10485,7 +10907,10 @@
   }
 
   function restoreSavedDrafts(targetContainer) {
-    pruneOldDrafts();
+    if (!legacyDraftsPruned) {
+      legacyDraftsPruned = true;
+      pruneOldDrafts();
+    }
     const root = targetContainer || document;
     const info = getCurrentRepoAndChange(root);
     if (!info.repo || !info.change) return;
@@ -10631,7 +11056,7 @@
         return;
       }
       if (normalizedPath) {
-        const encodedPath = normalizedPath.split('/').map(encodeURIComponent).join('/');
+        const encodedPath = encodeRepoPath(normalizedPath);
         let dest = `/r/${encodeURIComponent(info.repo)}/c/${encodeURIComponent(info.change)}/f/${encodedPath}?base=${encodeURIComponent(destBase)}&target=${encodeURIComponent(destTarget)}`;
         if (mode) dest += `&mode=${encodeURIComponent(mode)}`;
         if (ctxParam) dest += `&ctx=${encodeURIComponent(ctxParam)}`;
@@ -10642,7 +11067,7 @@
 
     const buildFileDest = () => {
       if (!info.repo || !info.change || !normalizedPath) return '';
-      const encodedPath = normalizedPath.split('/').map(encodeURIComponent).join('/');
+      const encodedPath = encodeRepoPath(normalizedPath);
       let dest = `/r/${encodeURIComponent(info.repo)}/c/${encodeURIComponent(info.change)}/f/${encodedPath}?base=${encodeURIComponent(base)}&target=${encodeURIComponent(target)}`;
       if (mode) dest += `&mode=${encodeURIComponent(mode)}`;
       if (ctxParam) dest += `&ctx=${encodeURIComponent(ctxParam)}`;
@@ -10650,48 +11075,28 @@
     };
 
     if (!hasDiffsAll) {
-      const dest = buildFileDest();
-      if (dest) window.location.href = dest;
-      return;
+      const existingCard = document.getElementById('thread-' + threadId);
+      if (!existingCard) {
+        const dest = buildFileDest();
+        if (dest) window.location.href = dest;
+        return;
+      }
     }
 
     let sec = null;
-    const allSecs = document.querySelectorAll('.diff-file-section');
-    for (const s of allSecs) {
-      const p = (s.getAttribute('data-file-path') || '').replace(/^\/+/, '');
-      if (p === normalizedPath) {
-        sec = s;
-        break;
+    if (hasDiffsAll) {
+      const allSecs = document.querySelectorAll('.diff-file-section');
+      for (const s of allSecs) {
+        const p = (s.getAttribute('data-file-path') || '').replace(/^\/+/, '');
+        if (p === normalizedPath) {
+          sec = s;
+          break;
+        }
       }
     }
 
-    let expandedSec = false;
     if (sec) {
-      if (sec.classList.contains('collapsed')) {
-        const body = sec.querySelector('.diff-file-body');
-        const btn = sec.querySelector('.file-collapse-btn');
-        sec.classList.remove('collapsed');
-        if (body) body.style.display = 'block';
-        if (btn) btn.textContent = '▾';
-        expandedSec = true;
-        if (window.ensureFileBodyLoaded && body) {
-          await window.ensureFileBodyLoaded(body);
-        }
-      } else {
-        const body = sec.querySelector('.diff-file-body');
-        if (body && body.getAttribute('data-lazy-url') && !body.hasAttribute('data-loaded')) {
-          if (window.ensureFileBodyLoaded) {
-            await window.ensureFileBodyLoaded(body);
-          }
-        }
-      }
-    }
-    if (expandedSec) {
-      if (typeof handleNaturalPageHeightChange === 'function') handleNaturalPageHeightChange();
-      if (typeof window.updateToggleAllFilesBtn === 'function') window.updateToggleAllFilesBtn();
-      saveExpandedFiles();
-      if (typeof invalidateVisibleRowsCache === 'function') invalidateVisibleRowsCache();
-      scheduleStickyScopeUpdate();
+      await expandFileSection(sec);
     }
 
     const card = document.getElementById('thread-' + threadId);
@@ -10806,8 +11211,24 @@
       });
 
       menu.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          const rowsList = Array.from(menu.querySelectorAll('.unres-item-row'));
+          if (rowsList.length === 0) return;
+          e.preventDefault();
+          const curTarget = elemFromTarget(e.target);
+          const curRow = curTarget && curTarget.closest ? curTarget.closest('.unres-item-row') : null;
+          let idx = curRow ? rowsList.indexOf(curRow) : -1;
+          idx = e.key === 'ArrowDown'
+            ? (idx < 0 ? 0 : (idx + 1) % rowsList.length)
+            : (idx <= 0 ? rowsList.length - 1 : idx - 1);
+          if (rowsList[idx] && rowsList[idx].focus) {
+            rowsList[idx].focus();
+          }
+          return;
+        }
         if (e.key === 'Enter' || e.key === ' ') {
-          const row = e.target.closest ? e.target.closest('.unres-item-row') : null;
+          const curTarget = elemFromTarget(e.target);
+          const row = curTarget && curTarget.closest ? curTarget.closest('.unres-item-row') : null;
           if (row) {
             e.preventDefault();
             const threadId = row.getAttribute('data-thread-id');
@@ -10948,7 +11369,8 @@
   }
 
   document.addEventListener('click', (e) => {
-    const trigger = e.target.closest ? e.target.closest(THREADS_MENU_TRIGGER_SELECTOR) : null;
+    const targetEl = elemFromTarget(e.target);
+    const trigger = targetEl && targetEl.closest ? targetEl.closest(THREADS_MENU_TRIGGER_SELECTOR) : null;
     if (trigger) {
       e.preventDefault();
       e.stopPropagation();
@@ -10956,17 +11378,28 @@
       return;
     }
     const menu = document.querySelector('.unresolved-threads-menu');
-    if (menu && menu.style.display !== 'none' && !menu.contains(e.target)) {
+    if (menu && menu.style.display !== 'none' && !menu.contains(targetEl)) {
       closeUnresolvedMenu();
     }
   });
 
   document.addEventListener('keydown', (e) => {
-    const trigger = e.target.closest ? e.target.closest(THREADS_MENU_TRIGGER_SELECTOR) : null;
+    const targetEl = elemFromTarget(e.target);
+    const trigger = targetEl && targetEl.closest ? targetEl.closest(THREADS_MENU_TRIGGER_SELECTOR) : null;
     if (trigger) {
       if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault();
         toggleUnresolvedMenu(trigger);
+      } else if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && trigger.getAttribute('aria-expanded') === 'true') {
+        const menu = document.querySelector('.unresolved-threads-menu');
+        if (menu && menu.style.display !== 'none') {
+          const rowsList = Array.from(menu.querySelectorAll('.unres-item-row'));
+          if (rowsList.length > 0) {
+            e.preventDefault();
+            const targetRow = e.key === 'ArrowDown' ? rowsList[0] : rowsList[rowsList.length - 1];
+            if (targetRow && targetRow.focus) targetRow.focus();
+          }
+        }
       }
     }
   });

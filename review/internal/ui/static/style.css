@@ -622,7 +622,7 @@ header.app-header.header-status-lgtm {
 
 /* Banner */
 .update-banner {
-  background: #0969da;
+  background: var(--btn-blue-bg);
   color: #ffffff;
   padding: 8px 16px;
   text-align: center;
@@ -631,6 +631,28 @@ header.app-header.header-status-lgtm {
   display: none;
 }
 .update-banner.show {
+  display: block;
+}
+
+.action-error-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 1200;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--danger);
+  background: var(--card-bg);
+  color: var(--danger);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  line-height: 1.4;
+  box-shadow: var(--card-shadow);
+  cursor: pointer;
+  display: none;
+}
+.action-error-toast.show {
   display: block;
 }
 
@@ -1032,6 +1054,11 @@ td.cell-moved-modified {
 td.cell-moved-modified mark.intra,
 td.line-code-unified.cell-moved-modified mark.intra {
   background-color: var(--diff-add-intra);
+}
+tr.row-del td.cell-moved-modified mark.intra,
+td.cell-del.cell-moved-modified mark.intra,
+tr.row-del td.line-code-unified.cell-moved-modified mark.intra {
+  background-color: var(--diff-del-intra);
 }
 tr.row-del td.line-code-unified.cell-moved,
 tr.row-add td.line-code-unified.cell-moved,
@@ -1736,6 +1763,11 @@ mark.cs-match {
 [data-theme="dark"] mark.cs-match {
   background: rgba(255, 208, 0, 0.24);
 }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) mark.cs-match {
+    background: rgba(255, 208, 0, 0.24);
+  }
+}
 
 .cs-guide {
   padding: 10px 12px;
@@ -2238,7 +2270,9 @@ mark.cs-match {
 }
 
 .symbol-popup.sym-shaded > .sym-popup-content > :not(.sym-popup-header),
-#symbolPopup.sym-shaded > .sym-popup-content > :not(.sym-popup-header) {
+#symbolPopup.sym-shaded > .sym-popup-content > :not(.sym-popup-header),
+.symbol-popup.sym-shaded > .sym-ver-notice,
+#symbolPopup.sym-shaded > .sym-ver-notice {
   display: none !important;
 }
 
@@ -2555,14 +2589,14 @@ td.comment-range-line mark.intra {
   color: var(--text);
 }
 .thread-btn-primary {
-  background: #1f883d;
-  border-color: #1f883d;
+  background: var(--btn-green-bg);
+  border-color: var(--btn-green-bg);
   color: #ffffff;
   font-weight: 500;
 }
 .thread-btn-primary:hover {
-  background: #1a7f37;
-  border-color: #1a7f37;
+  background: var(--btn-green-hover);
+  border-color: var(--btn-green-hover);
   color: #ffffff;
 }
 .thread-btn-danger {
@@ -2574,7 +2608,7 @@ td.comment-range-line mark.intra {
   background: var(--surface-alt);
   padding: 2px 6px;
   margin: 3px 6px 0;
-  border-left: 2px solid #e06c75;
+  border-left: 2px solid var(--danger);
   color: var(--muted);
   white-space: pre-wrap;
 }
@@ -3145,6 +3179,17 @@ td.comment-range-line mark.intra {
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--card-bg);
+  scroll-margin-top: calc(var(--app-header-h, 50px) + 12px);
+}
+.diff-table tr.diff-row {
+  scroll-margin-top: calc(var(--app-header-h, 50px) + 44px);
+}
+.btn:focus-visible,
+.thread-btn:focus-visible,
+.cs-item:focus-visible,
+.unres-item-row:focus-visible {
+  outline: 2px solid var(--link);
+  outline-offset: -1px;
 }
 .diff-file-section .diff-container {
   border: none;

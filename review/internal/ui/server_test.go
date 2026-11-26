@@ -23788,3 +23788,410 @@ func TestServerPolishRegressions(t *testing.T) {
 		t.Fatal("SSEBroker.ServeHTTP hung after Close()")
 	}
 }
+
+func TestUI_FrontendPolishRegressions(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+
+	appJSPath, err := filepath.Abs(filepath.Join("static", "app.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	script := `
+const fs = require("fs");
+const vm = require("vm");
+
+function makeClassList(el) {
+  const set = new Set();
+  const sync = () => { el._className = Array.from(set).join(" "); };
+  return {
+    add(...cs) { cs.forEach(c => { if (c) set.add(c); }); sync(); },
+    remove(...cs) { cs.forEach(c => set.delete(c)); sync(); },
+    contains(c) { return set.has(c); },
+    toggle(c) { if (set.has(c)) set.delete(c); else set.add(c); sync(); },
+    _setFromString(s) { set.clear(); String(s || "").split(/\s+/).filter(Boolean).forEach(c => set.add(c)); sync(); },
+  };
+}
+
+function makeEl(tag, attrs = {}) {
+  const el = {
+    tagName: tag.toUpperCase(),
+    nodeType: 1,
+    id: attrs.id || "",
+    _className: "",
+    attrs: Object.assign({}, attrs),
+    style: {},
+    children: [],
+    childNodes: [],
+    parentElement: null,
+    parentNode: null,
+    textContent: "",
+    _innerHTML: "",
+    offsetParent: {},
+    isConnected: true,
+    listeners: {},
+    scrolled: 0,
+    disabled: false,
+    title: "",
+    get className() { return this._className; },
+    set className(v) { this.classList._setFromString(v); },
+    get innerHTML() { return this._innerHTML; },
+    set innerHTML(v) {
+      this._innerHTML = String(v);
+      if (this._innerHTML.includes('class="cs-results"')) {
+        let r = this.children.find(c => c.classList && c.classList.contains("cs-results"));
+        if (!r) {
+          r = makeEl("div", { class: "cs-results" });
+          this.appendChild(r);
+        }
+      }
+    },
+    setAttribute(k, v) { this.attrs[k] = String(v); if (k === "id") this.id = String(v); if (k === "class") this.className = String(v); },
+    getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; },
+    hasAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k); },
+    removeAttribute(k) { delete this.attrs[k]; if (k === "id") this.id = ""; },
+    appendChild(child) {
+      child.parentElement = this;
+      child.parentNode = this;
+      this.children.push(child);
+      this.childNodes.push(child);
+      return child;
+    },
+    removeChild(child) {
+      this.children = this.children.filter(c => c !== child);
+      this.childNodes = this.childNodes.filter(c => c !== child);
+      child.parentElement = null;
+      child.parentNode = null;
+      child.isConnected = false;
+    },
+    remove() { if (this.parentElement) this.parentElement.removeChild(this); else this.isConnected = false; },
+    replaceWith(...nodes) {
+      if (!this.parentElement) return;
+      const p = this.parentElement;
+      const idx = p.children.indexOf(this);
+      if (idx >= 0) {
+        nodes.forEach(n => { n.parentElement = p; n.parentNode = p; });
+        p.children.splice(idx, 1, ...nodes);
+        p.childNodes = p.children.slice();
+      }
+      this.parentElement = null;
+      this.parentNode = null;
+      this.isConnected = false;
+    },
+    scrollIntoView() { this.scrolled++; },
+    focus() {},
+    blur() {},
+    addEventListener(ev, fn) { (this.listeners[ev] = this.listeners[ev] || []).push(fn); },
+    dispatch(ev, evt) { (this.listeners[ev] || []).forEach(fn => fn(evt)); },
+    closest(sel) {
+      const parts = sel.split(",").map(s => s.trim());
+      let cur = this;
+      while (cur) {
+        if (parts.some(p => matches(cur, p))) return cur;
+        cur = cur.parentElement;
+      }
+      return null;
+    },
+    querySelectorAll(sel) {
+      const out = [];
+      const parts = sel.split(",").map(s => s.trim());
+      (function walk(n) {
+        for (const c of n.children) {
+          if (parts.some(p => matches(c, p))) out.push(c);
+          walk(c);
+        }
+      })(this);
+      return out;
+    },
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    getBoundingClientRect() { return { top: 20, bottom: 40, left: 20, right: 200, width: 180, height: 20 }; },
+  };
+  el.classList = makeClassList(el);
+  if (attrs.class) el.className = attrs.class;
+  return el;
+}
+
+function matches(el, sel) {
+  if (!el || el.nodeType !== 1) return false;
+  // Support compound selectors with tag, #id, .class, [attr] or [attr="val"]
+  const tokens = sel.split(/\s+/).filter(Boolean);
+  const simple = tokens[tokens.length - 1];
+  const tagM = simple.match(/^([a-zA-Z0-9_-]+)/);
+  if (tagM && el.tagName !== tagM[1].toUpperCase()) return false;
+  const idM = simple.match(/#([a-zA-Z0-9_-]+)/);
+  if (idM && el.id !== idM[1]) return false;
+  for (const cm of simple.matchAll(/\.([a-zA-Z0-9_-]+)/g)) {
+    if (!el.classList.contains(cm[1])) return false;
+  }
+  for (const am of simple.matchAll(/\[([a-zA-Z0-9_-]+)(?:="([^"]*)")?\]/g)) {
+    const val = el.getAttribute(am[1]);
+    if (val === null) return false;
+    if (am[2] !== undefined && val !== am[2]) return false;
+  }
+  if (tokens.length > 1) {
+    const ancSel = tokens.slice(0, -1).join(" ");
+    let cur = el.parentElement;
+    while (cur) {
+      if (matches(cur, ancSel)) return true;
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+  return true;
+}
+
+const body = makeEl("body");
+const docEl = makeEl("html");
+docEl.appendChild(body);
+const docListeners = {};
+const winListeners = {};
+const openedUrls = [];
+const fetchCalls = [];
+let fetchHandler = async () => ({ ok: true, json: async () => ({}), text: async () => "" });
+
+const doc = {
+  readyState: "complete",
+  hidden: false,
+  documentElement: docEl,
+  body,
+  activeElement: body,
+  createElement(tag) { return makeEl(tag); },
+  createTextNode(t) { return { nodeType: 3, textContent: t, nodeValue: t }; },
+  getElementById(id) {
+    let found = null;
+    (function walk(n) {
+      if (found) return;
+      if (n.id === id) { found = n; return; }
+      for (const c of n.children) walk(c);
+    })(docEl);
+    return found;
+  },
+  querySelector(sel) { return docEl.querySelector(sel); },
+  querySelectorAll(sel) { return docEl.querySelectorAll(sel); },
+  addEventListener(ev, fn) { (docListeners[ev] = docListeners[ev] || []).push(fn); },
+  execCommand() { return false; },
+};
+
+const win = {
+  document: doc,
+  location: { href: "http://127.0.0.1/r/myrepo/c/chg1/f/a.go", pathname: "/r/myrepo/c/chg1/f/a.go", search: "", hash: "" },
+  history: { replaceState() {} },
+  scrollX: 0,
+  scrollY: 0,
+  innerWidth: 1280,
+  innerHeight: 800,
+  isSecureContext: false,
+  navigator: {},
+  getSelection() { return { isCollapsed: true, rangeCount: 0, removeAllRanges() {} }; },
+  open(url) { openedUrls.push(url); },
+  addEventListener(ev, fn) { (winListeners[ev] = winListeners[ev] || []).push(fn); },
+  removeEventListener() {},
+  dispatchKey(key, extra = {}) {
+    const evt = Object.assign({ key, target: body, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {} }, extra);
+    (winListeners.keydown || []).forEach(fn => fn(evt));
+    return evt;
+  },
+  URLSearchParams,
+  URL,
+  AbortController,
+  Set, Map, Array, Object, Promise, Error, Number, String, Math, Date, JSON,
+  parseInt, parseFloat, encodeURIComponent, decodeURIComponent,
+  setTimeout, clearTimeout, setInterval, clearInterval,
+  fetch: (url, opts) => { fetchCalls.push({ url, opts }); return fetchHandler(url, opts); },
+};
+win.window = win;
+win.self = win;
+win.localStorage = { length: 0, getItem() { return null; }, setItem() {}, removeItem() {}, key() { return null; } };
+win.sessionStorage = { getItem() { return null; }, setItem() {} };
+win.Node = { ELEMENT_NODE: 1, TEXT_NODE: 3 };
+
+vm.createContext(win);
+vm.runInContext(fs.readFileSync(` + strconv.Quote(appJSPath) + `, "utf8"), win);
+
+(async () => {
+  // 1. cursorRowIndex starts at -1 so first 'j' lands on row 0; 'k' safely clamps when rows shrink.
+  const cont = makeEl("div", { class: "diff-container", "data-repo": "myrepo", "data-change": "chg1", "data-file-path": "a.go", "data-left-rev": "l1", "data-right-rev": "r1" });
+  const table = makeEl("table", { class: "diff-table" });
+  const r0 = makeEl("tr", { class: "diff-row", "data-line-r": "1" });
+  const r1 = makeEl("tr", { class: "diff-row", "data-line-r": "2" });
+  const r2 = makeEl("tr", { class: "diff-row", "data-line-r": "3" });
+  table.appendChild(r0); table.appendChild(r1); table.appendChild(r2);
+  cont.appendChild(table);
+  body.appendChild(cont);
+
+  win.dispatchKey("j");
+  if (!r0.style.outline) throw new Error("first 'j' should land on row 0, not row 1");
+  win.dispatchKey("j");
+  win.dispatchKey("j");
+  if (!r2.style.outline) throw new Error("third 'j' should land on row 2");
+  // Simulate collapsing rows so only r0 remains visible and cache is refreshed
+  r1.offsetParent = null; r2.offsetParent = null;
+  r1.remove(); r2.remove();
+  if (typeof win.invalidateVisibleRowsCache === "function") win.invalidateVisibleRowsCache();
+  win.dispatchKey("k"); // Must clamp to r0 without throwing
+  if (!r0.style.outline) throw new Error("'k' after row shrinkage should clamp outline onto r0");
+
+  // 2. Single-key shortcuts blocked while #shortcutsModal is open.
+  const modal = makeEl("div", { id: "shortcutsModal" });
+  modal.style.display = "flex";
+  body.appendChild(modal);
+  r0.scrolled = 0;
+  win.dispatchKey("j");
+  if (r0.scrolled !== 0) throw new Error("'j' should be ignored while shortcutsModal is open");
+  modal.style.display = "none";
+
+  // 3. copyPageLink does NOT add 'copied' class when copy fails.
+  const copyBtn = makeEl("button");
+  await win.copyPageLink(copyBtn);
+  if (copyBtn.classList.contains("copied")) throw new Error("copyPageLink must not mark 'copied' when clipboard fails");
+  if (copyBtn.title !== "Copy failed") throw new Error("copyPageLink failed title = " + copyBtn.title);
+
+  // 4. deleteMessage preserves edit draft if server returns error, deletes it on success.
+  const editKey = "review_draft:edit:myrepo:chg1:77";
+  win.formDraftsMap.set(editKey, { content: "keep me" });
+  fetchHandler = async () => ({ ok: false, status: 500, json: async () => ({}) });
+  win.deleteMessage(77);
+  await new Promise(r => setTimeout(r, 20));
+  if (!win.formDraftsMap.has(editKey)) throw new Error("failed deleteMessage must NOT wipe edit draft");
+
+  fetchHandler = async () => ({ ok: true, json: async () => ({ thread_id: 9, thread_deleted: false }) });
+  win.deleteMessage(77);
+  await new Promise(r => setTimeout(r, 20));
+  if (win.formDraftsMap.has(editKey)) throw new Error("successful deleteMessage must clear edit draft");
+
+  // 5. jumpToUnresolvedThread on single-file page stays on page when #thread-55 is already in DOM.
+  const card55 = makeEl("div", { id: "thread-55", class: "thread-card" });
+  body.appendChild(card55);
+  const hrefBefore = win.location.href;
+  await win.jumpToUnresolvedThread("55", "a.go");
+  if (win.location.href !== hrefBefore) throw new Error("single-file jumpToUnresolvedThread unexpectedly navigated away");
+  if (card55.scrolled < 1) throw new Error("expected #thread-55 to be scrolled into view");
+
+  // 6. expandContextAll ignores concurrent duplicate clicks while in-flight.
+  const skipRow = makeEl("tr", { class: "row-skip", "data-left-start": "10", "data-left-end": "12", "data-right-start": "10", "data-right-end": "12" });
+  const skipBtn = makeEl("button", { class: "skip-all" });
+  skipRow.appendChild(skipBtn);
+  table.appendChild(skipRow);
+  let expandFetches = 0;
+  let releaseExpand;
+  fetchHandler = async (u) => {
+    if (u.startsWith("/api/diff/expand")) {
+      expandFetches++;
+      await new Promise(r => { releaseExpand = r; });
+      return { ok: true, text: async () => "<tr></tr>" };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+  const p1 = win.expandContextAll(skipBtn);
+  const p2 = win.expandContextAll(skipBtn);
+  await new Promise(r => setTimeout(r, 10));
+  if (expandFetches !== 1) throw new Error("expected 1 expand fetch, got " + expandFetches);
+  releaseExpand();
+  await Promise.all([p1, p2]);
+
+  // 7. Code Search quick-open line number rendering + Cmd+Click opens new tab.
+  fetchHandler = async (u) => {
+    if (u.startsWith("/api/search")) {
+      return {
+        ok: true,
+        json: async () => ({
+          query: "a.go:42",
+          files: [{ path: "a.go", line: 42, in_change: true }],
+          symbols: [], comments: [], code: [], total_code: 0,
+        }),
+      };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+  const csInst = win.openCodeSearchPopup("a.go:42");
+  await new Promise(r => setTimeout(r, 30));
+  const resEl = csInst.contentEl.querySelector(".cs-results");
+  if (!resEl || !resEl.innerHTML.includes('data-line="42"') || !resEl.innerHTML.includes("a.go:42")) {
+    throw new Error("expected SearchFileMatch line=42 in Code Search results HTML: " + (resEl ? resEl.innerHTML : "missing"));
+  }
+  const fakeItem = makeEl("div", { class: "cs-item", "data-cs-kind": "file", "data-path": "a.go", "data-line": "42" });
+  csInst.el.dispatch("click", { target: fakeItem, metaKey: true, preventDefault() {}, stopPropagation() {} });
+  if (openedUrls.length !== 1 || !openedUrls[0].includes("/f/a.go") || !openedUrls[0].endsWith("#L42")) {
+    throw new Error("expected Cmd+Click on Code Search item to open new tab at #L42, got: " + JSON.stringify(openedUrls));
+  }
+  win.closeSpecificSymbolPopup(csInst);
+
+  // 8. navigateFiles(']') must advance from File 1 to File 2 even when File 1 sits at top=62px (scroll-margin-top).
+  const sec1 = makeEl("div", { class: "diff-file-section", "data-file-path": "a.go" });
+  const sec2 = makeEl("div", { class: "diff-file-section", "data-file-path": "b.go" });
+  sec1.getBoundingClientRect = () => ({ top: 62, bottom: 300, left: 0, right: 800, width: 800, height: 238 });
+  sec2.getBoundingClientRect = () => ({ top: 320, bottom: 600, left: 0, right: 800, width: 800, height: 280 });
+  body.appendChild(sec1);
+  body.appendChild(sec2);
+  win.dispatchKey("]");
+  if (sec2.scrolled < 1) {
+    throw new Error("expected ']' to advance to sec2 when sec1.top=62, got sec1.scrolled=" + sec1.scrolled + " sec2.scrolled=" + sec2.scrolled);
+  }
+  sec1.remove();
+  sec2.remove();
+
+  // 9. Aborting caller batch expansion must NOT fall back to individual /api/symbol/refs fetches.
+  let individualCallerFetches = 0;
+  let rejectBatch;
+  fetchHandler = async (u, opts) => {
+    if (u.startsWith("/api/symbol/refs/batch")) {
+      return await new Promise((_, rej) => {
+        rejectBatch = rej;
+        if (opts && opts.signal) {
+          opts.signal.addEventListener("abort", () => {
+            const e = new Error("Aborted"); e.name = "AbortError";
+            rej(e);
+          });
+        }
+      });
+    }
+    if (u.startsWith("/api/symbol/refs?")) {
+      individualCallerFetches++;
+      return { ok: true, json: async () => ({ found: true, refs: [] }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+  const popupInst = win.openCodeSearchPopup("");
+  const refsData = {
+    found: true,
+    symbol_name: "Foo",
+    signature: "func Foo()",
+    refs: [
+      { in_repo: true, path: "a.go", display: "a.go", line: 10, col: 2, group: "repo", container: "CallerA", container_line: 9, container_utf16_col: 6, line_html: "Foo()" },
+      { in_repo: true, path: "b.go", display: "b.go", line: 20, col: 2, group: "repo", container: "CallerB", container_line: 19, container_utf16_col: 6, line_html: "Foo()" },
+    ],
+  };
+  const refsCtx = { repo: "myrepo", change: "chg1", side: "R", leftRev: "l1", rightRev: "r1", base: "", target: "" };
+  popupInst.currentState = { kind: "refs", data: refsData, ctx: refsCtx, scrollTop: 0 };
+  // Render refs view and trigger expand-all, then immediately close popup to abort.
+  const expandAllBtn = makeEl("button", { "data-caller-group-action": "expand", "data-ref-group": "repo" });
+  popupInst.currentState.callerState = {
+    cache: {}, inflight: {}, nodes: {
+      "n1": { nodeId: "n1", groupKey: "repo", parentId: null, ref: refsData.refs[0], depth: 0, loaded: false, expanded: false, loading: false },
+      "n2": { nodeId: "n2", groupKey: "repo", parentId: null, ref: refsData.refs[1], depth: 0, loaded: false, expanded: false, loading: false },
+    }, groupLoading: {},
+  };
+  popupInst.contentEl.appendChild(expandAllBtn);
+  popupInst.el.dispatch("click", { target: expandAllBtn, preventDefault() {}, stopPropagation() {} });
+  await new Promise(r => setTimeout(r, 10));
+  win.closeSpecificSymbolPopup(popupInst);
+  await new Promise(r => setTimeout(r, 20));
+  if (individualCallerFetches !== 0) {
+    throw new Error("aborted caller batch fell back to " + individualCallerFetches + " individual fetches");
+  }
+  if (popupInst.currentState.callerState.nodes.n1.loading || popupInst.currentState.callerState.nodes.n2.loading) {
+    throw new Error("expected aborted caller nodes to reset loading=false");
+  }
+})().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+`
+	cmd := exec.Command(nodeBin, "-e", script)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("TestUI_FrontendPolishRegressions failed: %v\n%s", err, string(out))
+	}
+}
