@@ -20674,6 +20674,9 @@ func TestCommentCollapseExpand(t *testing.T) {
 	if !strings.Contains(pageHTML, `<tr><td><kbd>e</kbd> / <kbd>E</kbd></td><td>Expand / collapse all comments</td></tr>`) {
 		t.Errorf("expected #shortcutsModal to document e / E comment expand/collapse shortcuts")
 	}
+	if !strings.Contains(pageHTML, `<kbd class="kbd-icon" title="Right-click"`) || !strings.Contains(pageHTML, `kbd-mouse-icon`) {
+		t.Errorf("expected #shortcutsModal to render mouse right-click icon in <kbd class=\"kbd-icon\">")
+	}
 
 	extractDivBlock := func(htmlStr, marker string) string {
 		idx := strings.Index(htmlStr, marker)
