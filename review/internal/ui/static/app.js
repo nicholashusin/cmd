@@ -119,7 +119,11 @@
   }
 
   function escapeAttrVal(s) {
-    return String(s || '').replace(/["\\]/g, '\\$&');
+    return String(s || '').replace(/["\\]/g, '\\$&').replace(/\n/g, '\\a ').replace(/\r/g, '\\d ');
+  }
+
+  function isSafeExternalUrl(u) {
+    return typeof u === 'string' && /^https?:\/\//i.test(u.trim());
   }
 
   function updateCommentCountBadges(filePath, fileCounts, changeCounts) {
@@ -1107,8 +1111,9 @@
     if (!container) {
       const filePath = card.getAttribute('data-file-path');
       if (filePath) {
-        container = document.querySelector(`.diff-container[data-file-path="${filePath}"]`) ||
-                    document.querySelector(`.diff-container[data-file-path="/${filePath}"]`);
+        const escPath = escapeAttrVal(filePath);
+        container = document.querySelector(`.diff-container[data-file-path="${escPath}"]`) ||
+                    document.querySelector(`.diff-container[data-file-path="/${escPath}"]`);
       }
     }
     if (!container) {
@@ -4530,7 +4535,7 @@
     const href = row.getAttribute('data-href');
     if (!href) return;
     if (e.metaKey || e.ctrlKey) {
-      window.open(href, '_blank');
+      window.open(href, '_blank', 'noopener');
     } else {
       window.location.href = href;
     }
@@ -6257,14 +6262,14 @@
     const cleanDef = (defPath || '').replace(/^\/+/, '');
     const mode = (ctx && ctx.mode) || getCurrentPageDiffMode();
     const modeParam = mode ? `&mode=${encodeURIComponent(mode)}` : '';
-    return `/r/${encodeURIComponent(ctx.repo)}/c/${encodeURIComponent(ctx.change)}/f/${encodeURIComponent(cleanDef).replace(/%2F/g, '/')}?base=${encodeURIComponent(ctx.base)}&target=${encodeURIComponent(ctx.target)}${modeParam}&ctx=all&side=${encodeURIComponent(ctx.side || 'R')}#L${defLine}`;
+    return `/r/${encodeURIComponent(ctx.repo || '')}/c/${encodeURIComponent(ctx.change || '')}/f/${encodeURIComponent(cleanDef).replace(/%2F/g, '/')}?base=${encodeURIComponent(ctx.base || '')}&target=${encodeURIComponent(ctx.target || '')}${modeParam}&ctx=all&side=${encodeURIComponent(ctx.side || 'R')}#L${defLine}`;
   }
 
   function buildExtJumpHref(ctx, pkg, file, defLine, originPath) {
     const origin = originPath || ctx.originPath || '';
     const mode = (ctx && ctx.mode) || getCurrentPageDiffMode();
     const modeParam = mode ? `&mode=${encodeURIComponent(mode)}` : '';
-    return `/r/${encodeURIComponent(ctx.repo)}/c/${encodeURIComponent(ctx.change)}/ext?pkg=${encodeURIComponent(pkg)}&file=${encodeURIComponent(file)}${origin ? '&origin=' + encodeURIComponent(origin) : ''}&base=${encodeURIComponent(ctx.base)}&target=${encodeURIComponent(ctx.target)}${modeParam}&side=${encodeURIComponent(ctx.side || 'R')}#L${defLine}`;
+    return `/r/${encodeURIComponent(ctx.repo || '')}/c/${encodeURIComponent(ctx.change || '')}/ext?pkg=${encodeURIComponent(pkg || '')}&file=${encodeURIComponent(file || '')}${origin ? '&origin=' + encodeURIComponent(origin) : ''}&base=${encodeURIComponent(ctx.base || '')}&target=${encodeURIComponent(ctx.target || '')}${modeParam}&side=${encodeURIComponent(ctx.side || 'R')}#L${defLine}`;
   }
 
   async function handleJumpToExternalDefinition(repo, change, pkg, file, defLine, lookupSide, e, originPath) {
@@ -6442,7 +6447,7 @@
               ${codeHtml}
             </div>
           `;
-        } else if (impl.external_url) {
+        } else if (isSafeExternalUrl(impl.external_url)) {
           const extLocHtml = locLabel
             ? `<span class="sym-ref-loc"><span class="sym-loc-text">${locLabel}</span> <span class="sym-nav-arrow" aria-hidden="true">↗</span></span>`
             : '';
@@ -7335,10 +7340,10 @@
       const locTitle = defWillNav ? 'Open definition in single-file view' : 'Jump to definition';
       if (data.in_repo && data.def_line > 0 && stateCtx && stateCtx.change) {
         const href = buildInRepoJumpHref(stateCtx, data.def_path, data.def_line);
-        headerLocHtml = `<a href="${href}" class="${locClass}" data-jump-def data-def-path="${escapeHtml(data.def_path)}" data-def-line="${data.def_line}" data-lookup-side="${stateCtx.side}" title="${locTitle}">${locInner}</a>`;
+        headerLocHtml = `<a href="${escapeHtml(href)}" class="${locClass}" data-jump-def data-def-path="${escapeHtml(data.def_path)}" data-def-line="${data.def_line}" data-lookup-side="${stateCtx.side}" title="${locTitle}">${locInner}</a>`;
       } else if (!data.in_repo && data.def_pkg && data.def_file && data.def_line > 0 && stateCtx && stateCtx.change) {
         const extUrl = buildExtJumpHref(stateCtx, data.def_pkg, data.def_file, data.def_line, stateCtx.originPath);
-        headerLocHtml = `<a href="${extUrl}" class="${locClass}" data-jump-def data-ext="true" data-pkg="${escapeHtml(data.def_pkg)}" data-file="${escapeHtml(data.def_file)}" data-def-line="${data.def_line}" data-lookup-side="${stateCtx.side}" title="${locTitle}">${locInner}</a>`;
+        headerLocHtml = `<a href="${escapeHtml(extUrl)}" class="${locClass}" data-jump-def data-ext="true" data-pkg="${escapeHtml(data.def_pkg)}" data-file="${escapeHtml(data.def_file)}" data-def-line="${data.def_line}" data-lookup-side="${stateCtx.side}" title="${locTitle}">${locInner}</a>`;
       } else {
         headerLocHtml = `<span>${locLabel}</span>`;
       }
@@ -7354,7 +7359,7 @@
       const implsTitle = data.impls_direction === 'interfaces' ? 'Find implemented interfaces' : 'Find implementations';
       actionsHtml += `<button type="button" class="sym-btn-action sym-btn-impls" data-action="impls" title="${implsTitle}">Impls</button>`;
     }
-    if (data.pkg_go_dev_url) {
+    if (isSafeExternalUrl(data.pkg_go_dev_url)) {
       actionsHtml += `<a href="${escapeHtml(data.pkg_go_dev_url)}" target="_blank" rel="noopener noreferrer" class="sym-btn-pkg">pkg.go.dev ↗</a>`;
     }
     actionsHtml += renderPopupWindowControlsHtml(popupOrInst);
@@ -7482,7 +7487,7 @@
 
     const headerLocHtml = `
       <span class="sym-move-prefix">${prefix}</span>
-      <a href="${jumpHref}" class="${locClass}" data-jump-move-peer="true" data-peer-path="${escapeHtml(peerPath)}" data-peer-start="${data.start_line}" data-peer-end="${data.end_line || data.start_line}" data-peer-side="${peerSide}" title="${locTitle}">${locInner}</a>
+      <a href="${escapeHtml(jumpHref)}" class="${locClass}" data-jump-move-peer="true" data-peer-path="${escapeHtml(peerPath)}" data-peer-start="${data.start_line}" data-peer-end="${data.end_line || data.start_line}" data-peer-side="${peerSide}" title="${locTitle}">${locInner}</a>
       ${modLabelHtml}
     `;
 
@@ -10490,12 +10495,14 @@
       const hasText = !!(text && String(text).trim());
       if (!d || (!hasText && !(d.message_id && d.unresolved !== undefined))) continue;
       if (d.thread_id) {
-        const form = root.querySelector('#reply-form-' + d.thread_id);
+        const tid = String(d.thread_id);
+        const form = /^[A-Za-z0-9_-]+$/.test(tid) ? root.querySelector('#reply-form-' + tid) : null;
         if (form && (form.style.display === 'none' || form.style.display === '')) {
           window.toggleReplyForm(d.thread_id, false, { noFocus: true });
         }
       } else if (d.message_id) {
-        const form = root.querySelector('#msg-edit-' + d.message_id);
+        const mid = String(d.message_id);
+        const form = /^[A-Za-z0-9_-]+$/.test(mid) ? root.querySelector('#msg-edit-' + mid) : null;
         if (form && (form.style.display === 'none' || form.style.display === '')) {
           window.openEditMessageForm(d.message_id, { noFocus: true });
         }

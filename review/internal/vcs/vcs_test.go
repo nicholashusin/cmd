@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -1890,5 +1891,77 @@ func TestChangeDiffStats(t *testing.T) {
 		if !foundBase || !foundEdit || !foundConflict {
 			t.Fatalf("expected all JJ commits in Changes(), foundBase=%v foundEdit=%v foundConflict=%v", foundBase, foundEdit, foundConflict)
 		}
+	}
+}
+
+func TestSecurityRevAndPathContainment(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %s (%v)", args, string(out), err)
+		}
+	}
+	run("init", "-b", "main")
+	run("config", "user.name", "Test User")
+	run("config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "a.txt")
+	run("commit", "-m", "initial")
+
+	cache := NewCache()
+	defer cache.Close()
+	repo, err := Open(dir, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Flag injection via --output= must be rejected and never write files.
+	sentinel := filepath.Join(t.TempDir(), "pwned")
+	if _, err := repo.Commit("--output=" + sentinel); err == nil {
+		t.Fatalf("expected Commit with --output= to fail")
+	}
+	if _, err := repo.Files("--output="+sentinel, "HEAD"); err == nil {
+		t.Fatalf("expected Files with --output= to fail")
+	}
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("git flag injection created sentinel file %s", sentinel)
+	}
+
+	// 2. Working-tree symlink escape and ListDir traversal must be rejected.
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("top-secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "leak.txt")); err != nil {
+		if runtime.GOOS != "windows" {
+			t.Fatal(err)
+		}
+		t.Logf("skipping symlink escape subtest on windows: %v", err)
+	} else if data, err := repo.Content("working", "leak.txt"); err == nil {
+		t.Fatalf("expected symlink escape to be blocked, got %q", string(data))
+	}
+	if _, err := repo.ListDir("working", ".."); err == nil {
+		t.Fatalf("expected ListDir traversal to be blocked")
+	}
+
+	// 3. DeletePin must refuse non-review refs.
+	if err := repo.DeletePin("refs/heads/main"); err == nil {
+		t.Fatalf("expected DeletePin to refuse non-review ref")
+	}
+
+	// 4. extractGitKey must only accept safe tokens from the trailer paragraph.
+	sha := "1234567890abcdef1234567890abcdef12345678"
+	if got := extractGitKey(sha, "subject\n\nChange-Id: prose/slash\n\nReal body"); got != sha {
+		t.Errorf("extractGitKey matched non-trailer prose: %q", got)
+	}
+	if got := extractGitKey(sha, "subject\n\nChange-Id: ../../heads/main\n"); got != sha {
+		t.Errorf("extractGitKey accepted unsafe path token: %q", got)
+	}
+	if got := extractGitKey(sha, "subject\n\nchange-id: Ideadbeef1234\n"); got != "Ideadbeef1234" {
+		t.Errorf("extractGitKey failed valid trailer: got %q", got)
 	}
 }

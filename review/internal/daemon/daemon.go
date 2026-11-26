@@ -44,15 +44,35 @@ func GetServerInfo(configDir string) (*ServerInfo, error) {
 	return &info, nil
 }
 
-// WriteServerInfo writes server.json to configDir.
+// WriteServerInfo writes server.json atomically to configDir.
 func WriteServerInfo(configDir, addr string, pid int) error {
-	_ = os.MkdirAll(configDir, 0755)
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return err
+	}
 	info := ServerInfo{Addr: addr, PID: pid}
 	data, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(configDir, "server.json"), data, 0644)
+	tmp, err := os.CreateTemp(configDir, ".server.json.*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, filepath.Join(configDir, "server.json")); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 // RemoveServerInfo deletes server.json from configDir.
@@ -169,8 +189,8 @@ func StartBackground(binPath, dbPath, addr string) (*ServerInfo, error) {
 		return info, nil
 	}
 
-	_ = os.MkdirAll(configDir, 0755)
-	logFile, err := os.OpenFile(filepath.Join(configDir, "server.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	_ = os.MkdirAll(configDir, 0700)
+	logFile, err := os.OpenFile(filepath.Join(configDir, "server.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("creating server.log: %w", err)
 	}
@@ -182,6 +202,7 @@ func StartBackground(binPath, dbPath, addr string) (*ServerInfo, error) {
 	cmd := exec.Command(binPath, args...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
+	detachProcess(cmd)
 
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
@@ -190,6 +211,11 @@ func StartBackground(binPath, dbPath, addr string) (*ServerInfo, error) {
 
 	pid := cmd.Process.Pid
 	_ = logFile.Close()
+
+	exitCh := make(chan error, 1)
+	go func() {
+		exitCh <- cmd.Wait()
+	}()
 
 	effectiveAddr := addr
 	if effectiveAddr == "" {
@@ -200,6 +226,7 @@ func StartBackground(binPath, dbPath, addr string) (*ServerInfo, error) {
 	// Wait up to 3 seconds for server to be healthy
 	deadline := time.Now().Add(3 * time.Second)
 	healthy := false
+	exited := false
 	for time.Now().Before(deadline) {
 		if curInfo, err := GetServerInfo(configDir); err == nil && curInfo != nil && curInfo.Addr != "" {
 			checkAddr = DialAddr(curInfo.Addr)
@@ -208,12 +235,21 @@ func StartBackground(binPath, dbPath, addr string) (*ServerInfo, error) {
 			healthy = true
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-exitCh:
+			exited = true
+		case <-time.After(100 * time.Millisecond):
+		}
+		if exited {
+			break
+		}
 	}
 
 	if !healthy {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		if !exited {
+			_ = cmd.Process.Kill()
+			<-exitCh
+		}
 		return nil, fmt.Errorf("daemon failed to start or pass /healthz within 3 seconds; check %s", filepath.Join(configDir, "server.log"))
 	}
 

@@ -374,7 +374,7 @@ func (a *Analyzer) resolveTargetBySymbol(ctx context.Context, req LookupRequest,
 	}
 
 	// 3. External / stdlib package or symbol
-	if st.Pkg == "" {
+	if !isSafeImportPath(st.Pkg) {
 		return nil, nil
 	}
 	if st.Pkg == "unsafe" && st.Kind != "pkg" {

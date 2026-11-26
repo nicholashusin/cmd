@@ -222,6 +222,9 @@ func (r *JJRepo) parseChangeRecord(rec []byte) (*Change, bool) {
 }
 
 func (r *JJRepo) Commit(rev string) (*Change, error) {
+	if err := ValidateRev(rev); err != nil {
+		return nil, err
+	}
 	changes, err := r.Changes()
 	if err == nil {
 		for _, c := range changes {
@@ -236,7 +239,7 @@ func (r *JJRepo) Commit(rev string) (*Change, error) {
 	if ignoreWC {
 		args = append(args, "--ignore-working-copy")
 	}
-	args = append(args, "log", "--no-graph", "-r", rev, "-T", jjLogTemplate)
+	args = append(args, "log", "--no-graph", "-r="+rev, "-T", jjLogTemplate)
 	out, err := r.runCmd("jj", args...)
 	if !ignoreWC && isStaleWorkingCopyErr(err) {
 		out, err = r.runCmd("jj", append([]string{"--ignore-working-copy"}, args...)...)
@@ -253,6 +256,16 @@ func (r *JJRepo) Commit(rev string) (*Change, error) {
 }
 
 func (r *JJRepo) Files(baseRev, targetRev string) ([]*File, error) {
+	if baseRev != "" && strings.Trim(baseRev, "0") != "" {
+		if err := ValidateRev(baseRev); err != nil {
+			return nil, err
+		}
+	}
+	if targetRev != "" && targetRev != "working" {
+		if err := ValidateRev(targetRev); err != nil {
+			return nil, err
+		}
+	}
 	if r.gitDir != "" && !r.conflicted(baseRev) && !r.conflicted(targetRev) {
 		files, err := gitDiffFiles(r.gitDir, r.root, baseRev, targetRev)
 		if err == nil {
@@ -263,7 +276,7 @@ func (r *JJRepo) Files(baseRev, targetRev string) ([]*File, error) {
 	if baseRev == "" {
 		baseRev = "root()"
 	}
-	out, err := r.runCmd("jj", "--ignore-working-copy", "--config", `ui.paginate="never"`, "diff", "--from", baseRev, "--to", targetRev, "-T", jjDiffTemplate)
+	out, err := r.runCmd("jj", "--ignore-working-copy", "--config", `ui.paginate="never"`, "diff", "--from="+baseRev, "--to="+targetRev, "-T", jjDiffTemplate)
 	if err != nil {
 		return nil, fmt.Errorf("listing jj changed files: %w", err)
 	}
@@ -301,6 +314,16 @@ func (r *JJRepo) conflicted(rev string) bool {
 }
 
 func (r *JJRepo) ListDir(rev, dirPath string) ([]string, error) {
+	cleanDir := strings.Trim(filepath.ToSlash(dirPath), "/")
+	if cleanDir == "." {
+		cleanDir = ""
+	}
+	if (rev == "" || rev == "working") && r.root != "" {
+		return listWorkingDir(r.root, cleanDir)
+	}
+	if err := ValidateRev(rev); err != nil {
+		return nil, err
+	}
 	if r.gitDir != "" {
 		names, err := gitListDir(r.cache, r.gitDir, r.root, rev, dirPath)
 		if err == nil && names != nil {
@@ -308,17 +331,12 @@ func (r *JJRepo) ListDir(rev, dirPath string) ([]string, error) {
 		}
 	}
 
-	cleanDir := strings.Trim(filepath.ToSlash(dirPath), "/")
-	if cleanDir == "." {
-		cleanDir = ""
-	}
-
-	args := []string{"--ignore-working-copy", "--config", `ui.paginate="never"`, "file", "list"}
-	if rev != "" && rev != "working" {
-		args = append(args, "-r", rev)
-	}
+	args := []string{"--ignore-working-copy", "--config", `ui.paginate="never"`, "file", "list", "-r=" + rev}
 	if cleanDir != "" {
-		args = append(args, cleanDir)
+		if cleanDir == ".." || strings.HasPrefix(cleanDir, "../") || strings.Contains(cleanDir, "/../") || strings.HasSuffix(cleanDir, "/..") {
+			return nil, fmt.Errorf("path escapes repository root: %s", dirPath)
+		}
+		args = append(args, "--", "root:"+strconv.Quote(cleanDir))
 	}
 
 	outBytes, err := r.runCmd("jj", args...)
@@ -389,7 +407,10 @@ func (r *JJRepo) ListGoFiles(rev string) ([]string, error) {
 
 	args := []string{"--ignore-working-copy", "--config", `ui.paginate="never"`, "file", "list"}
 	if rev != "" && rev != "working" {
-		args = append(args, "-r", rev)
+		if err := ValidateRev(rev); err != nil {
+			return nil, err
+		}
+		args = append(args, "-r="+rev)
 	}
 
 	outBytes, err := r.runCmd("jj", args...)
@@ -440,13 +461,10 @@ func (r *JJRepo) Content(rev, path string) ([]byte, error) {
 	cleanPath := strings.TrimPrefix(path, "/")
 
 	if rev == "working" {
-		cleanRoot := filepath.Clean(r.root)
-		fullPath := filepath.Clean(filepath.Join(cleanRoot, cleanPath))
-		rel, err := filepath.Rel(cleanRoot, fullPath)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("path escapes repository root: %s", path)
-		}
-		return os.ReadFile(fullPath)
+		return readWorkingFile(r.root, path)
+	}
+	if err := ValidateRev(rev); err != nil {
+		return nil, err
 	}
 
 	if r.gitDir != "" && !r.conflicted(rev) {
@@ -463,7 +481,7 @@ func (r *JJRepo) Content(rev, path string) ([]byte, error) {
 	}
 
 	// Fall back to jj, which also renders conflicts with conflict markers.
-	out, err := r.runCmd("jj", "--ignore-working-copy", "--config", `ui.paginate="never"`, "file", "show", "-r", rev, "root-file:"+strconv.Quote(cleanPath))
+	out, err := r.runCmd("jj", "--ignore-working-copy", "--config", `ui.paginate="never"`, "file", "show", "-r="+rev, "--", "root-file:"+strconv.Quote(cleanPath))
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && bytes.Contains(exitErr.Stderr, []byte("No such path")) {

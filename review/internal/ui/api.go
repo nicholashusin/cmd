@@ -20,6 +20,13 @@ import (
 	"nicholas.sh/cmd/review/internal/vcs"
 )
 
+const maxJSONBodyBytes = 4 << 20 // 4 MiB
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	return json.NewDecoder(r.Body).Decode(dst)
+}
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -56,7 +63,7 @@ func (s *Server) handleAPINotify(w http.ResponseWriter, r *http.Request) {
 		Change string `json:"change"`
 	}
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = decodeJSON(w, r, &req)
 	}
 	if req.Reason == "" {
 		req.Reason = "notify"
@@ -77,7 +84,7 @@ func (s *Server) handleAPISnapshot(w http.ResponseWriter, r *http.Request) {
 		Repo   string `json:"repo"`
 		Change string `json:"change"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -117,7 +124,7 @@ func (s *Server) handleAPIPublish(w http.ResponseWriter, r *http.Request) {
 		LeftRev  string `json:"left_rev"`
 		RightRev string `json:"right_rev"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -279,7 +286,7 @@ func (s *Server) handleAPIThreadsAdd(w http.ResponseWriter, r *http.Request) {
 		Body      string `json:"body"`
 		Resolved  bool   `json:"resolved"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -349,7 +356,7 @@ func (s *Server) handleAPIThreadsReply(w http.ResponseWriter, r *http.Request) {
 		LeftRev  string `json:"left_rev"`
 		RightRev string `json:"right_rev"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -423,7 +430,7 @@ func (s *Server) handleAPIThreadsEdit(w http.ResponseWriter, r *http.Request) {
 		LeftRev   string `json:"left_rev"`
 		RightRev  string `json:"right_rev"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -481,7 +488,7 @@ func (s *Server) handleAPIThreadsDelete(w http.ResponseWriter, r *http.Request) 
 		LeftRev   string `json:"left_rev"`
 		RightRev  string `json:"right_rev"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -552,7 +559,7 @@ func (s *Server) handleAPIThreadsResolve(w http.ResponseWriter, r *http.Request)
 		LeftRev  string `json:"left_rev"`
 		RightRev string `json:"right_rev"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -917,7 +924,7 @@ func (s *Server) handleAPIFilesReviewed(w http.ResponseWriter, r *http.Request) 
 		Path     string `json:"path"`
 		Reviewed bool   `json:"reviewed"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -957,7 +964,7 @@ func (s *Server) handleAPIChangesReviewed(w http.ResponseWriter, r *http.Request
 		Reviewed *bool  `json:"reviewed"`
 		LGTM     *bool  `json:"lgtm"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1008,7 +1015,7 @@ func (s *Server) handleAPIReposForget(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Repo string `json:"repo"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1033,19 +1040,24 @@ func (s *Server) handleAPIPrefs(w http.ResponseWriter, r *http.Request) {
 		Key string `json:"key"`
 		Val string `json:"val"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(w, r, &req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if req.Key == "scope_side" {
+	switch req.Key {
+	case "diff_mode", "change_diffs", "syntax", "theme":
+	case "scope_side":
 		if req.Val != "L" {
 			req.Val = "R"
 		}
-	} else if req.Key == "ignore_ws" {
+	case "ignore_ws":
 		if req.Val != "off" {
 			req.Val = "on"
 		}
+	default:
+		http.Error(w, "unknown preference key", http.StatusBadRequest)
+		return
 	}
 
 	if err := s.d.SetPref(req.Key, req.Val); err != nil {
@@ -1576,7 +1588,7 @@ func (s *Server) buildSymbolLookupRequest(r *http.Request, needBothRevs bool) (r
 			return req, false, 0, ""
 		}
 	}
-	if strings.HasPrefix(leftRev, "-") || strings.HasPrefix(rightRev, "-") {
+	if (leftRev != "" && vcs.ValidateRev(leftRev) != nil) || (rightRev != "" && vcs.ValidateRev(rightRev) != nil) {
 		return req, false, 0, ""
 	}
 
@@ -1762,7 +1774,7 @@ type symbolRefsBatchResponse struct {
 
 func (s *Server) handleAPISymbolRefsBatch(w http.ResponseWriter, r *http.Request) {
 	var payload symbolRefsBatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	if err := decodeJSON(w, r, &payload); err != nil {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -1810,6 +1822,10 @@ func (s *Server) handleAPISymbolRefsBatch(w http.ResponseWriter, r *http.Request
 
 	baseRev := payload.LeftRev
 	targetRev := payload.RightRev
+	if (baseRev != "" && vcs.ValidateRev(baseRev) != nil) || (targetRev != "" && vcs.ValidateRev(targetRev) != nil) {
+		http.Error(w, "invalid revision", http.StatusBadRequest)
+		return
+	}
 	side := payload.Side
 	if side != "L" {
 		side = "R"
@@ -1841,8 +1857,12 @@ func (s *Server) handleAPISymbolRefsBatch(w http.ResponseWriter, r *http.Request
 	reqs := make([]gosym.LookupRequest, len(payload.Requests))
 	for i, item := range payload.Requests {
 		cleanPath := ""
+		pkgImport := ""
+		pkgFile := ""
 		if item.Pkg != "" && item.PkgFile != "" {
-			if strings.HasSuffix(item.PkgFile, ".go") && filepath.Base(item.PkgFile) == item.PkgFile && !strings.Contains(item.PkgFile, "..") {
+			if strings.HasSuffix(item.PkgFile, ".go") && filepath.Base(item.PkgFile) == item.PkgFile && !strings.Contains(item.PkgFile, "..") && !strings.ContainsAny(item.PkgFile, `/\`) {
+				pkgImport = item.Pkg
+				pkgFile = item.PkgFile
 				if item.File != "" {
 					cp := filepath.Clean(item.File)
 					if strings.HasSuffix(cp, ".go") && !strings.HasPrefix(cp, "..") && !filepath.IsAbs(cp) {
@@ -1866,8 +1886,8 @@ func (s *Server) handleAPISymbolRefsBatch(w http.ResponseWriter, r *http.Request
 			FilePath:      filepath.ToSlash(cleanPath),
 			Line:          item.Line,
 			UTF16Col:      item.Col,
-			PkgImportPath: item.Pkg,
-			PkgFile:       item.PkgFile,
+			PkgImportPath: pkgImport,
+			PkgFile:       pkgFile,
 			Site:          parseBatchSite(item.Site),
 		}
 	}
@@ -1967,7 +1987,7 @@ func (s *Server) handleAPIFormDrafts(w http.ResponseWriter, r *http.Request) {
 			MessageID  string `json:"message_id"`
 			Content    string `json:"content"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSON(w, r, &req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

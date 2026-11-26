@@ -593,13 +593,85 @@ func Open(dir string, cache *Cache) (Repo, error) {
 	return nil, fmt.Errorf("no .jj or .git repository found in %s or any parent directory", dir)
 }
 
+// ValidateRev checks that rev is safe to pass as a git/jj revision argument.
+func ValidateRev(rev string) error {
+	if rev == "" {
+		return fmt.Errorf("empty revision")
+	}
+	if strings.HasPrefix(rev, "-") || strings.ContainsAny(rev, "\x00\r\n \t") {
+		return fmt.Errorf("invalid revision %q", rev)
+	}
+	return nil
+}
+
+func isSafePinRef(ref string) bool {
+	return strings.HasPrefix(ref, "refs/reviewed/") &&
+		len(ref) > len("refs/reviewed/") &&
+		!strings.ContainsAny(ref, "\x00\r\n \t") &&
+		!strings.Contains(ref, "..")
+}
+
+func readWorkingFile(root, relPath string) ([]byte, error) {
+	clean := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(relPath, "/")))
+	if clean == "" || clean == "." || clean == ".." || filepath.IsAbs(clean) || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("path escapes repository root: %s", relPath)
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return r.ReadFile(clean)
+}
+
+func listWorkingDir(root, cleanDir string) ([]string, error) {
+	target := "."
+	if cleanDir != "" {
+		clean := filepath.Clean(filepath.FromSlash(cleanDir))
+		if clean == ".." || filepath.IsAbs(clean) || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("path escapes repository root: %s", cleanDir)
+		}
+		target = clean
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	f, err := r.Open(target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	entries, err := f.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	names := []string{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	return names, nil
+}
+
 // Pin helpers shared across VCS implementations.
 func pinRef(gitDir, refSuffix, rev string) error {
 	if gitDir == "" {
 		return nil
 	}
+	if err := ValidateRev(rev); err != nil {
+		return err
+	}
 	ref := "refs/reviewed/" + refSuffix
-	cmd := exec.Command("git", "--git-dir="+gitDir, "--no-optional-locks", "update-ref", ref, rev)
+	if !isSafePinRef(ref) {
+		return fmt.Errorf("invalid pin ref %q", ref)
+	}
+	cmd := exec.Command("git", "--git-dir="+gitDir, "--no-optional-locks", "update-ref", "--", ref, rev)
 	return cmd.Run()
 }
 
@@ -626,7 +698,10 @@ func deletePinRef(gitDir, ref string) error {
 	if gitDir == "" {
 		return nil
 	}
-	cmd := exec.Command("git", "--git-dir="+gitDir, "--no-optional-locks", "update-ref", "-d", ref)
+	if !isSafePinRef(ref) {
+		return fmt.Errorf("refusing to delete non-review ref %q", ref)
+	}
+	cmd := exec.Command("git", "--git-dir="+gitDir, "--no-optional-locks", "update-ref", "-d", "--", ref)
 	return cmd.Run()
 }
 
@@ -641,6 +716,13 @@ func gitDiffFiles(gitDir, workDir, baseRev, targetRev string) ([]*File, error) {
 	bRev := baseRev
 	if bRev == "" || strings.Trim(bRev, "0") == "" {
 		bRev = emptyTreeSHA
+	} else if err := ValidateRev(bRev); err != nil {
+		return files, err
+	}
+	if targetRev != "" && targetRev != "working" {
+		if err := ValidateRev(targetRev); err != nil {
+			return files, err
+		}
 	}
 
 	var args []string
@@ -652,6 +734,7 @@ func gitDiffFiles(gitDir, workDir, baseRev, targetRev string) ([]*File, error) {
 	if targetRev != "" && targetRev != "working" {
 		args = append(args, targetRev)
 	}
+	args = append(args, "--")
 
 	cmd := exec.Command("git", args...)
 	if targetRev == "working" && workDir != "" {
@@ -878,27 +961,13 @@ func gitListDir(cache *Cache, gitDir, workDir, rev, dirPath string) ([]string, e
 	}
 
 	if (rev == "" || rev == "working") && workDir != "" {
-		targetDir := workDir
-		if cleanDir != "" {
-			targetDir = filepath.Join(workDir, filepath.FromSlash(cleanDir))
-		}
-		entries, err := os.ReadDir(targetDir)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return []string{}, nil
-			}
-			return nil, err
-		}
-		names := []string{}
-		for _, e := range entries {
-			if !e.IsDir() {
-				names = append(names, e.Name())
-			}
-		}
-		return names, nil
+		return listWorkingDir(workDir, cleanDir)
 	}
 
 	if gitDir != "" && rev != "" && rev != "working" {
+		if err := ValidateRev(rev); err != nil {
+			return nil, err
+		}
 		if cf, err := cache.catFile(gitDir); err == nil {
 			if names, err := cf.ListTree(rev, cleanDir); err == nil {
 				return names, nil
@@ -909,7 +978,7 @@ func gitListDir(cache *Cache, gitDir, workDir, rev, dirPath string) ([]string, e
 		if cleanDir != "" {
 			treeSpec = rev + ":" + cleanDir
 		}
-		cmd := exec.Command("git", "--git-dir="+gitDir, "--no-optional-locks", "ls-tree", "-z", treeSpec)
+		cmd := exec.Command("git", "--git-dir="+gitDir, "--no-optional-locks", "ls-tree", "-z", treeSpec, "--")
 		out, err := cmd.Output()
 		if err != nil {
 			return nil, nil
@@ -972,6 +1041,9 @@ func gitListGoFiles(cache *Cache, gitDir, workDir, rev string) ([]string, error)
 	}
 
 	if gitDir != "" && rev != "" && rev != "working" {
+		if err := ValidateRev(rev); err != nil {
+			return nil, err
+		}
 		if cache != nil {
 			if cf, err := cache.catFile(gitDir); err == nil {
 				if files, err := cf.ListGoFiles(rev); err == nil {
@@ -980,7 +1052,7 @@ func gitListGoFiles(cache *Cache, gitDir, workDir, rev string) ([]string, error)
 			}
 		}
 
-		cmd := exec.Command("git", "--git-dir="+gitDir, "--no-optional-locks", "ls-tree", "-r", "-z", rev)
+		cmd := exec.Command("git", "--git-dir="+gitDir, "--no-optional-locks", "ls-tree", "-r", "-z", rev, "--")
 		out, err := cmd.Output()
 		if err != nil {
 			return nil, err

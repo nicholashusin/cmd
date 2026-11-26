@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -55,13 +56,23 @@ func DefaultPath() string {
 	return filepath.Join(configDir, "review", "review.db")
 }
 
+func escapeSQLiteURIPath(p string) string {
+	r := strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
+	return r.Replace(filepath.ToSlash(p))
+}
+
 // Open initializes or migrates the review database at path.
 func Open(path string) (*DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, fmt.Errorf("creating db directory: %w", err)
 	}
+	if path != "" && path != ":memory:" {
+		if f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600); err == nil {
+			_ = f.Close()
+		}
+	}
 
-	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)", path)
+	dsn := fmt.Sprintf("file:%s?_txlock=immediate&_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)", escapeSQLiteURIPath(path))
 	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite db: %w", err)
@@ -72,6 +83,11 @@ func Open(path string) (*DB, error) {
 	if err := d.initSchema(); err != nil {
 		_ = sqlDB.Close()
 		return nil, fmt.Errorf("initializing db schema: %w", err)
+	}
+	if path != "" && path != ":memory:" {
+		_ = os.Chmod(path, 0600)
+		_ = os.Chmod(path+"-wal", 0600)
+		_ = os.Chmod(path+"-shm", 0600)
 	}
 
 	return d, nil

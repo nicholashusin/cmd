@@ -426,6 +426,9 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 			}
 		}
 	} else {
+		if err := vcs.ValidateRev(targetSel); err != nil {
+			return nil, fmt.Errorf("invalid target revision: %w", err)
+		}
 		targetRev = targetSel
 		isLiveTarget = (targetRev == c.Rev)
 		snapshotPending = isLiveTarget
@@ -458,6 +461,9 @@ func buildChangeView(d *db.DB, repo vcs.Repo, rec *db.RepoRecord, c *vcs.Change,
 			}
 		}
 	} else if baseSel != "" && baseSel != "parent" {
+		if err := vcs.ValidateRev(baseSel); err != nil {
+			return nil, fmt.Errorf("invalid base revision: %w", err)
+		}
 		baseRev = baseSel
 		if baseRev != c.Parent {
 			baseDesc = shortHash(baseRev)
@@ -1241,6 +1247,16 @@ func AddCommentRangeWithTarget(d *db.DB, repo vcs.Repo, repoID int64, c *vcs.Cha
 			rev = c.Parent
 		} else {
 			rev = c.Rev
+		}
+	}
+	if rev != "" {
+		if err := vcs.ValidateRev(rev); err != nil {
+			return nil, nil, err
+		}
+	}
+	if targetRev != "" {
+		if err := vcs.ValidateRev(targetRev); err != nil {
+			return nil, nil, err
 		}
 	}
 

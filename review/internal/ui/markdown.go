@@ -1226,8 +1226,8 @@ func isSafeURL(raw string) bool {
 		return false
 	}
 
-	// Disallow protocol-relative URLs (e.g. "//evil.com")
-	if strings.HasPrefix(lower, "//") {
+	// Disallow protocol-relative URLs (e.g. "//evil.com" or "/\evil.com" per WHATWG URL)
+	if strings.HasPrefix(lower, "//") || strings.HasPrefix(lower, `/\`) || strings.HasPrefix(lower, `\`) {
 		return false
 	}
 

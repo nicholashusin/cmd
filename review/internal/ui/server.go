@@ -14,6 +14,8 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -48,8 +50,61 @@ type Server struct {
 	httpServer         *http.Server
 	listenAddr         string
 	copyHost           string
+	allowedHosts       map[string]bool
 	activeForeground   atomic.Int32
 	lastForegroundNano atomic.Int64
+}
+
+func escapePathSegments(p string) string {
+	p = strings.TrimPrefix(p, "/")
+	if p == "" {
+		return ""
+	}
+	segs := strings.Split(p, "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
+	}
+	return strings.Join(segs, "/")
+}
+
+func buildAllowedHosts(listenAddr string) map[string]bool {
+	allowed := map[string]bool{
+		"localhost": true,
+	}
+	if host, _, err := net.SplitHostPort(strings.TrimSpace(listenAddr)); err == nil && host != "" && host != "0.0.0.0" && host != "::" {
+		allowed[strings.ToLower(strings.TrimSuffix(host, "."))] = true
+	}
+	if hn, err := os.Hostname(); err == nil && hn != "" {
+		low := strings.ToLower(strings.TrimSuffix(hn, "."))
+		allowed[low] = true
+		if short, _, ok := strings.Cut(low, "."); ok && short != "" {
+			allowed[short] = true
+		}
+	}
+	return allowed
+}
+
+func (s *Server) isAllowedHost(hostHeader string) bool {
+	if hostHeader == "" {
+		return true
+	}
+	host := hostHeader
+	if h, _, err := net.SplitHostPort(hostHeader); err == nil {
+		host = h
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	low := strings.ToLower(strings.TrimSuffix(host, "."))
+	if low == "localhost" || strings.HasSuffix(low, ".localhost") {
+		return true
+	}
+	return s.allowedHosts[low]
 }
 
 // NewServer initializes the UI HTTP server.
@@ -69,6 +124,7 @@ func NewServer(d *db.DB, cache *vcs.Cache, listenAddr string) (*Server, error) {
 		"TrimSlash": func(p string) string {
 			return strings.TrimPrefix(p, "/")
 		},
+		"PathEscape": escapePathSegments,
 		"ShortRev": func(rev string) string {
 			if len(rev) > 12 {
 				return rev[:12]
@@ -131,6 +187,7 @@ func NewServer(d *db.DB, cache *vcs.Cache, listenAddr string) (*Server, error) {
 		staticVersion: staticVer,
 		listenAddr:    listenAddr,
 		copyHost:      extractCopyHost(listenAddr),
+		allowedHosts:  buildAllowedHosts(listenAddr),
 	}
 	s.lastForegroundNano.Store(time.Now().UnixNano())
 	if s.sym != nil {
@@ -194,8 +251,9 @@ func NewServer(d *db.DB, cache *vcs.Cache, listenAddr string) (*Server, error) {
 	mux.HandleFunc("GET /{path...}", s.handleFallback)
 
 	s.httpServer = &http.Server{
-		Addr:    listenAddr,
-		Handler: s.trackForeground(s.protectCrossOrigin(compressResponse(mux))),
+		Addr:              listenAddr,
+		Handler:           s.trackForeground(s.protectCrossOrigin(compressResponse(mux))),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	return s, nil
@@ -298,12 +356,27 @@ func FormatCommitMessage(msg string) template.HTML {
 
 func (s *Server) protectCrossOrigin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify cross-origin on mutating POST requests
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		// Block DNS rebinding attacks that resolve a foreign domain to a local IP.
+		if !s.isAllowedHost(r.Host) {
+			http.Error(w, "Invalid Host header", http.StatusForbidden)
+			return
+		}
+
+		// Verify cross-origin on mutating POST requests.
 		if r.Method == http.MethodPost {
-			secFetchSite := r.Header.Get("Sec-Fetch-Site")
-			if secFetchSite != "" && secFetchSite != "same-origin" && secFetchSite != "same-site" && secFetchSite != "none" {
-				http.Error(w, "Cross-origin request blocked", http.StatusForbidden)
-				return
+			if secFetchSite := r.Header.Get("Sec-Fetch-Site"); secFetchSite != "" {
+				if secFetchSite != "same-origin" && secFetchSite != "none" {
+					http.Error(w, "Cross-origin request blocked", http.StatusForbidden)
+					return
+				}
+			} else if origin := r.Header.Get("Origin"); origin != "" {
+				u, err := url.Parse(origin)
+				if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+					http.Error(w, "Cross-origin request blocked", http.StatusForbidden)
+					return
+				}
 			}
 		}
 		next.ServeHTTP(w, r)

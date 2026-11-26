@@ -14219,7 +14219,7 @@ vm.runInContext(code, ctx);
   if (jumpLink.getAttribute("data-peer-end") !== "21") {
     throw new Error("expected jump link data-peer-end=21, got: " + jumpLink.getAttribute("data-peer-end"));
   }
-  const jumpHref = jumpLink.getAttribute("href") || "";
+  const jumpHref = (jumpLink.getAttribute("href") || "").replace(/&amp;/g, "&");
   if (!jumpHref.includes("&end=21#L11")) {
     throw new Error("expected jump link href to contain &end=21#L11, got: " + jumpHref);
   }
@@ -17402,6 +17402,7 @@ func FuzzDiffExpandAndMovePreview(f *testing.F) {
 			url.QueryEscape(mode),
 		)
 		reqExpand := httptest.NewRequest("GET", expandURL, nil)
+		reqExpand.Host = "127.0.0.1"
 		recExpand := httptest.NewRecorder()
 		handler.ServeHTTP(recExpand, reqExpand)
 		if recExpand.Code >= 500 {
@@ -17418,6 +17419,7 @@ func FuzzDiffExpandAndMovePreview(f *testing.F) {
 			start, end,
 		)
 		reqMove := httptest.NewRequest("GET", moveURL, nil)
+		reqMove.Host = "127.0.0.1"
 		recMove := httptest.NewRecorder()
 		handler.ServeHTTP(recMove, reqMove)
 		if recMove.Code >= 500 {
@@ -23572,5 +23574,74 @@ function runScenario(opts) {
 	cmd := exec.Command(nodeBin, "-e", script)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("TestUI_PopupVersionChip failed: %v\n%s", err, string(out))
+	}
+}
+
+func TestSecurityHostOriginPrefsAndBodyLimit(t *testing.T) {
+	srv, ts, d, _ := setupTestServer(t)
+	defer srv.broker.Close()
+	defer ts.Close()
+	defer d.Close()
+
+	// 1. Foreign Host header (DNS rebinding) blocked with 403.
+	req, _ := http.NewRequest("GET", ts.URL+"/", nil)
+	req.Host = "evil.example.com:8080"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("foreign Host: got %d, want 403", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("missing X-Content-Type-Options: nosniff")
+	}
+
+	// 2. Cross-origin POST via Origin fallback and Sec-Fetch-Site: same-site blocked with 403.
+	postOrigin, _ := http.NewRequest("POST", ts.URL+"/api/prefs", strings.NewReader(`{"key":"theme","val":"dark"}`))
+	postOrigin.Header.Set("Origin", "http://evil.example.com")
+	resp, err = http.DefaultClient.Do(postOrigin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("cross-origin Origin POST: got %d, want 403", resp.StatusCode)
+	}
+
+	postSameSite, _ := http.NewRequest("POST", ts.URL+"/api/prefs", strings.NewReader(`{"key":"theme","val":"dark"}`))
+	postSameSite.Header.Set("Sec-Fetch-Site", "same-site")
+	resp, err = http.DefaultClient.Do(postSameSite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("Sec-Fetch-Site: same-site POST: got %d, want 403", resp.StatusCode)
+	}
+
+	// 3. Unknown preference key (such as listen_addr) rejected with 400.
+	resp, err = http.Post(ts.URL+"/api/prefs", "application/json", strings.NewReader(`{"key":"listen_addr","val":"0.0.0.0:1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("unknown pref key: got %d, want 400", resp.StatusCode)
+	}
+	if got := d.Pref("listen_addr", ""); got != "" {
+		t.Errorf("listen_addr pref was mutated to %q", got)
+	}
+
+	// 4. Oversized JSON body (>4 MiB) rejected with 400.
+	huge := `{"key":"theme","val":"` + strings.Repeat("a", maxJSONBodyBytes+1024) + `"}`
+	resp, err = http.Post(ts.URL+"/api/prefs", "application/json", strings.NewReader(huge))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("oversized JSON body: got %d, want 400", resp.StatusCode)
 	}
 }

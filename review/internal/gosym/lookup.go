@@ -487,7 +487,7 @@ func (a *Analyzer) resolveTarget(ctx context.Context, req LookupRequest) (*resol
 	}
 
 	cleanPath := path.Clean(filepath.ToSlash(req.FilePath))
-	if !strings.HasSuffix(cleanPath, ".go") || strings.HasPrefix(cleanPath, "..") {
+	if !strings.HasSuffix(cleanPath, ".go") || strings.HasPrefix(cleanPath, "..") || strings.HasPrefix(cleanPath, "/") {
 		return nil, nil
 	}
 
@@ -662,7 +662,7 @@ func (a *Analyzer) ResolveExternalFile(ctx context.Context, req ExternalFileRequ
 	if !strings.HasSuffix(pkgFile, ".go") || pkgFile != req.PkgFile || strings.Contains(pkgFile, "..") || strings.ContainsAny(pkgFile, `/\`) {
 		return "", nil, false
 	}
-	if req.PkgImportPath == "" {
+	if !isSafeImportPath(req.PkgImportPath) {
 		return "", nil, false
 	}
 
@@ -754,7 +754,10 @@ func getParsedBuiltin(goroot string) *builtinFileCache {
 
 func (a *Analyzer) resolveTargetChained(ctx context.Context, req LookupRequest, rev string) (*resolvedTarget, error) {
 	pkgFile := filepath.Base(req.PkgFile)
-	if !strings.HasSuffix(pkgFile, ".go") || pkgFile != req.PkgFile || strings.Contains(pkgFile, "..") {
+	if !strings.HasSuffix(pkgFile, ".go") || pkgFile != req.PkgFile || strings.Contains(pkgFile, "..") || strings.ContainsAny(pkgFile, `/\`) {
+		return nil, nil
+	}
+	if !isSafeImportPath(req.PkgImportPath) {
 		return nil, nil
 	}
 

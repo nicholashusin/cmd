@@ -3032,16 +3032,17 @@ func (si *stdlibImporter) Import(importPath string) (*types.Package, error) {
 	}
 
 	goroot := si.loader.env.goroot
-	if goroot != "" {
-		stdDir := filepath.Join(goroot, "src", filepath.FromSlash(importPath))
-		if dirExists(stdDir) {
+	if goroot != "" && isSafeImportPath(importPath) {
+		stdRoot := filepath.Join(goroot, "src")
+		stdDir := filepath.Join(stdRoot, filepath.FromSlash(importPath))
+		if isWithinDir(stdRoot, stdDir) && dirExists(stdDir) {
 			if pkg, err := si.loader.loadDiskPackage(importPath, stdDir); err == nil {
 				si.pkgs[importPath] = pkg
 				return pkg, nil
 			}
 		}
-		stdVendorDir := filepath.Join(goroot, "src", "vendor", filepath.FromSlash(importPath))
-		if dirExists(stdVendorDir) {
+		stdVendorDir := filepath.Join(stdRoot, "vendor", filepath.FromSlash(importPath))
+		if isWithinDir(stdRoot, stdVendorDir) && dirExists(stdVendorDir) {
 			if pkg, err := si.loader.loadDiskPackage(importPath, stdVendorDir); err == nil {
 				si.pkgs[importPath] = pkg
 				return pkg, nil
@@ -3089,6 +3090,12 @@ func (mci *modCacheImporter) Import(importPath string) (*types.Package, error) {
 	if p, ok := mci.pkgs[importPath]; ok {
 		return p, nil
 	}
+	if !isSafeImportPath(importPath) {
+		stub := types.NewPackage(importPath, guessPkgName(importPath))
+		stub.MarkComplete()
+		mci.pkgs[importPath] = stub
+		return stub, nil
+	}
 
 	// 1. Same module's own subpackages
 	if mci.mod != nil && mci.mod.modPath != "" && mci.modRoot != "" {
@@ -3102,7 +3109,7 @@ func (mci *modCacheImporter) Import(importPath string) (*types.Package, error) {
 		} else if strings.HasPrefix(importPath, mci.mod.modPath+"/") {
 			sub := strings.TrimPrefix(importPath, mci.mod.modPath+"/")
 			targetDir := filepath.Join(mci.modRoot, filepath.FromSlash(sub))
-			if dirHasGoFiles(targetDir) {
+			if isWithinDir(mci.modRoot, targetDir) && dirHasGoFiles(targetDir) {
 				if pkg, err := mci.loader.loadDiskPackage(importPath, targetDir); err == nil {
 					mci.pkgs[importPath] = pkg
 					return pkg, nil
@@ -3122,7 +3129,7 @@ func (mci *modCacheImporter) Import(importPath string) (*types.Package, error) {
 				target = filepath.Join(target, filepath.FromSlash(sub))
 			}
 			target = filepath.Clean(target)
-			if dirHasGoFiles(target) {
+			if isWithinDir(mci.modRoot, target) && dirHasGoFiles(target) {
 				if pkg, err := mci.loader.loadDiskPackage(importPath, target); err == nil {
 					mci.pkgs[importPath] = pkg
 					return pkg, nil
@@ -3169,6 +3176,9 @@ func (l *lookupLoader) hasInRepoGoFiles(dirInRepo string) bool {
 }
 
 func (l *lookupLoader) resolvePackageDir(importPath string) (dir string, isDisk bool, err error) {
+	if !isSafeImportPath(importPath) {
+		return "", false, fmt.Errorf("invalid import path %q", importPath)
+	}
 	if importPath == "builtin" {
 		if l.env.goroot != "" {
 			bDir := filepath.Join(l.env.goroot, "src", "builtin")
@@ -3335,20 +3345,22 @@ func (l *lookupLoader) resolvePackageDir(importPath string) (dir string, isDisk 
 
 	// 8. $GOPATH/src fallback
 	if l.env.gopath != "" {
-		gpDir := filepath.Join(l.env.gopath, "src", filepath.FromSlash(importPath))
-		if dirHasGoFiles(gpDir) {
+		gpSrc := filepath.Join(l.env.gopath, "src")
+		gpDir := filepath.Join(gpSrc, filepath.FromSlash(importPath))
+		if isWithinDir(gpSrc, gpDir) && dirHasGoFiles(gpDir) {
 			return gpDir, true, nil
 		}
 	}
 
 	// 9. Stdlib on disk
 	if l.env.goroot != "" {
-		stdDir := filepath.Join(l.env.goroot, "src", filepath.FromSlash(importPath))
-		if dirHasGoFiles(stdDir) {
+		stdSrc := filepath.Join(l.env.goroot, "src")
+		stdDir := filepath.Join(stdSrc, filepath.FromSlash(importPath))
+		if isWithinDir(stdSrc, stdDir) && dirHasGoFiles(stdDir) {
 			return stdDir, true, nil
 		}
-		stdVendorDir := filepath.Join(l.env.goroot, "src", "vendor", filepath.FromSlash(importPath))
-		if dirHasGoFiles(stdVendorDir) {
+		stdVendorDir := filepath.Join(stdSrc, "vendor", filepath.FromSlash(importPath))
+		if isWithinDir(stdSrc, stdVendorDir) && dirHasGoFiles(stdVendorDir) {
 			return stdVendorDir, true, nil
 		}
 	}

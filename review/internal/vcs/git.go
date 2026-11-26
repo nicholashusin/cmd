@@ -287,13 +287,38 @@ func (r *GitRepo) Changes() ([]*Change, error) {
 	return changes, nil
 }
 
+func isSafeChangeKey(s string) bool {
+	if s == "" || strings.HasPrefix(s, "-") || strings.HasPrefix(s, ".") || strings.HasSuffix(s, ".") || strings.HasSuffix(s, ".lock") || strings.Contains(s, "..") {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func extractGitKey(sha, body string) string {
-	// Check Change-Id trailer so amended commits preserve the same change key.
-	for _, line := range strings.Split(body, "\n") {
+	// Check Change-Id trailer in the final non-empty paragraph so amended commits
+	// preserve the same change key without matching prose mentions or unsafe tokens.
+	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	end := len(lines)
+	for end > 0 && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	start := end
+	for start > 0 && strings.TrimSpace(lines[start-1]) != "" {
+		start--
+	}
+	const prefix = "change-id:"
+	for _, line := range lines[start:end] {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Change-Id:") {
-			cid := strings.TrimSpace(strings.TrimPrefix(line, "Change-Id:"))
-			if cid != "" {
+		if len(line) > len(prefix) && strings.EqualFold(line[:len(prefix)], prefix) {
+			cid := strings.TrimSpace(line[len(prefix):])
+			if isSafeChangeKey(cid) {
 				return cid
 			}
 		}
@@ -307,16 +332,23 @@ func (r *GitRepo) Commit(rev string) (*Change, error) {
 		for _, c := range changes {
 			if c.Working {
 				if c.Parent != "" && c.ParentSubject == "" {
-					if pOut, err := r.runCmd("--no-optional-locks", "log", "-1", "--format=%s", c.Parent); err == nil {
-						cp := *c
-						cp.ParentSubject = strings.TrimSpace(string(pOut))
-						return &cp, nil
+					if ValidateRev(c.Parent) == nil {
+						if pOut, err := r.runCmd("--no-optional-locks", "log", "-1", "--format=%s", c.Parent, "--"); err == nil {
+							cp := *c
+							cp.ParentSubject = strings.TrimSpace(string(pOut))
+							return &cp, nil
+						}
 					}
 				}
 				return c, nil
 			}
 		}
-	} else if r.changes != nil {
+		return nil, fmt.Errorf("commit working not found")
+	}
+	if err := ValidateRev(rev); err != nil {
+		return nil, err
+	}
+	if r.changes != nil {
 		for _, c := range r.changes {
 			if c != nil && !c.Working && c.Rev == rev {
 				return c, nil
@@ -339,7 +371,7 @@ func (r *GitRepo) Commit(rev string) (*Change, error) {
 	}
 
 	format := "%H%x1f%P%x1f%an <%ae>%x1f%aI%x1f%cn <%ce>%x1f%cI%x1f%B"
-	out, err := r.runCmd("--no-optional-locks", "log", "-1", "--format="+format, rev)
+	out, err := r.runCmd("--no-optional-locks", "log", "-1", "--format="+format, rev, "--")
 	if err != nil {
 		return nil, fmt.Errorf("git commit %s: %w", rev, err)
 	}
@@ -387,8 +419,8 @@ func (r *GitRepo) Commit(rev string) (*Change, error) {
 				break
 			}
 		}
-		if parentSubject == "" {
-			if pOut, err := r.runCmd("--no-optional-locks", "log", "-1", "--format=%s", parent); err == nil {
+		if parentSubject == "" && ValidateRev(parent) == nil {
+			if pOut, err := r.runCmd("--no-optional-locks", "log", "-1", "--format=%s", parent, "--"); err == nil {
 				parentSubject = strings.TrimSpace(string(pOut))
 			}
 		}
@@ -435,13 +467,10 @@ func (r *GitRepo) Content(rev, path string) ([]byte, error) {
 	cleanPath := strings.TrimPrefix(path, "/")
 
 	if rev == "working" {
-		cleanRoot := filepath.Clean(r.root)
-		fullPath := filepath.Clean(filepath.Join(cleanRoot, cleanPath))
-		rel, err := filepath.Rel(cleanRoot, fullPath)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("path escapes repository root: %s", path)
-		}
-		return os.ReadFile(fullPath)
+		return readWorkingFile(r.root, path)
+	}
+	if err := ValidateRev(rev); err != nil {
+		return nil, err
 	}
 
 	cf, err := r.cache.catFile(r.gitDir)

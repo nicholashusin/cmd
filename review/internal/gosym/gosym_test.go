@@ -9577,3 +9577,40 @@ func UseBase() int {
 		t.Fatalf("expected fmt.Println to resolve in Base via SymTarget, got %+v err=%v", fmtBase, err)
 	}
 }
+
+func TestSecurityImportPathTraversal(t *testing.T) {
+	outside := t.TempDir()
+	secretFile := filepath.Join(outside, "secret.go")
+	if err := os.WriteFile(secretFile, []byte("package secret\nconst Token = \"leaked\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := NewAnalyzer()
+	defer a.Close()
+
+	// Traversal via PkgImportPath must be blocked in ResolveExternalFile.
+	if _, data, ok := a.ResolveExternalFile(context.Background(), ExternalFileRequest{
+		PkgImportPath: "../../../../../../../../" + strings.TrimPrefix(filepath.ToSlash(outside), "/"),
+		PkgFile:       "secret.go",
+	}); ok {
+		t.Fatalf("expected traversal ResolveExternalFile to fail, got %q", string(data))
+	}
+
+	// Malicious replace/require in go.mod escaping GOMODCACHE must be blocked.
+	fakeCache := filepath.Join(t.TempDir(), "modcache")
+	_ = os.MkdirAll(fakeCache, 0755)
+	rel, err := filepath.Rel(fakeCache, outside)
+	if err == nil {
+		if dir, ok := resolveModCacheReplaceDir(replaceTarget{
+			path:    "a/" + filepath.ToSlash(rel),
+			version: "v1.0.0",
+		}, "", fakeCache); ok {
+			t.Fatalf("expected modcache replace traversal to fail, got %q", dir)
+		}
+	}
+	for _, bad := range []string{"", "../foo", "a/../b", "/abs/path", ".hidden", "foo\\bar", "foo\x00bar"} {
+		if isSafeImportPath(bad) {
+			t.Errorf("isSafeImportPath(%q) = true, want false", bad)
+		}
+	}
+}

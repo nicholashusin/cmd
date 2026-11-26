@@ -636,3 +636,16 @@ func assertStrictXSSSafety(t *testing.T, htmlOut, origin string) {
 		}
 	}
 }
+
+func TestIsSafeURLBackslashProtocolRelative(t *testing.T) {
+	for _, u := range []string{`/\evil.com`, `\evil.com`, `\\evil.com`, `//evil.com`} {
+		if isSafeURL(u) {
+			t.Errorf("isSafeURL(%q) = true, want false", u)
+		}
+	}
+	for _, u := range []string{"/r/repo", "#thread-1", "https://go.dev/issue/1"} {
+		if !isSafeURL(u) {
+			t.Errorf("isSafeURL(%q) = false, want true", u)
+		}
+	}
+}

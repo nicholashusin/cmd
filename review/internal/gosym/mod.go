@@ -205,8 +205,28 @@ func (m *moduleInfo) matchReplaceTarget(importPath string) (target replaceTarget
 	return target, sub, true
 }
 
+func isSafeImportPath(p string) bool {
+	if p == "" || strings.HasPrefix(p, "/") || strings.HasPrefix(p, ".") || strings.ContainsAny(p, "\\\x00") {
+		return false
+	}
+	return path.Clean(p) == p
+}
+
+func isWithinDir(root, target string) bool {
+	if root == "" || target == "" {
+		return false
+	}
+	cleanRoot := filepath.Clean(root)
+	cleanTarget := filepath.Clean(target)
+	rel, err := filepath.Rel(cleanRoot, cleanTarget)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
 func (m *moduleInfo) resolveRequireDir(importPath, gomodcache string) (string, bool) {
-	if m == nil || gomodcache == "" || len(m.requires) == 0 {
+	if m == nil || gomodcache == "" || len(m.requires) == 0 || !isSafeImportPath(importPath) {
 		return "", false
 	}
 	var longestReq string
@@ -219,7 +239,7 @@ func (m *moduleInfo) resolveRequireDir(importPath, gomodcache string) (string, b
 			}
 		}
 	}
-	if longestReq == "" {
+	if longestReq == "" || !isSafeImportPath(longestReq) || strings.ContainsAny(longestVer, `/\`) || strings.Contains(longestVer, "..") {
 		return "", false
 	}
 	sub := strings.TrimPrefix(strings.TrimPrefix(importPath, longestReq), "/")
@@ -229,6 +249,9 @@ func (m *moduleInfo) resolveRequireDir(importPath, gomodcache string) (string, b
 	if sub != "" {
 		targetDir = filepath.Join(targetDir, filepath.FromSlash(sub))
 	}
+	if !isWithinDir(gomodcache, targetDir) {
+		return "", false
+	}
 	if dirHasGoFiles(targetDir) {
 		return targetDir, true
 	}
@@ -236,7 +259,13 @@ func (m *moduleInfo) resolveRequireDir(importPath, gomodcache string) (string, b
 }
 
 func resolveModCacheReplaceDir(rep replaceTarget, sub, gomodcache string) (string, bool) {
-	if rep.isLocal || rep.version == "" || gomodcache == "" {
+	if rep.isLocal || rep.version == "" || gomodcache == "" || !isSafeImportPath(rep.path) {
+		return "", false
+	}
+	if strings.ContainsAny(rep.version, `/\`) || strings.Contains(rep.version, "..") {
+		return "", false
+	}
+	if sub != "" && !isSafeImportPath(sub) {
 		return "", false
 	}
 	escMod := escapeModPath(rep.path)
@@ -246,6 +275,9 @@ func resolveModCacheReplaceDir(rep replaceTarget, sub, gomodcache string) (strin
 	if sub != "" {
 		targetDir = filepath.Join(modDir, filepath.FromSlash(sub))
 	}
+	if !isWithinDir(gomodcache, targetDir) {
+		return "", false
+	}
 	if dirHasGoFiles(targetDir) {
 		return targetDir, true
 	}
@@ -253,10 +285,16 @@ func resolveModCacheReplaceDir(rep replaceTarget, sub, gomodcache string) (strin
 }
 
 func findModuleInfo(repo vcs.Repo, rev, filePath string, rc *diskCache) *moduleInfo {
-	cleanFile := path.Clean(filepath.ToSlash(filePath))
-	dir := path.Dir(cleanFile)
-	if dir == "." {
-		dir = ""
+	cleanFile := path.Clean(filepath.ToSlash(strings.TrimPrefix(filePath, "/")))
+	if cleanFile == "." || strings.HasPrefix(cleanFile, "..") || strings.HasPrefix(cleanFile, "/") {
+		cleanFile = ""
+	}
+	dir := ""
+	if cleanFile != "" {
+		dir = path.Dir(cleanFile)
+		if dir == "." || strings.HasPrefix(dir, "..") {
+			dir = ""
+		}
 	}
 
 	if rc != nil {
@@ -319,9 +357,12 @@ func findModuleInfo(repo vcs.Repo, rev, filePath string, rc *diskCache) *moduleI
 	if err == nil && len(workData) > 0 {
 		useDirs := parseGoWork(workData)
 		for _, useDir := range useDirs {
-			cleanUse := path.Clean(useDir)
+			cleanUse := path.Clean(filepath.ToSlash(useDir))
 			if cleanUse == "." {
 				cleanUse = ""
+			}
+			if strings.HasPrefix(cleanUse, "..") || strings.HasPrefix(cleanUse, "/") {
+				continue
 			}
 			if cleanUse == m.modDir {
 				continue

@@ -2,7 +2,9 @@ package db
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -894,4 +896,36 @@ func FuzzDBDraftsAndDigest(f *testing.F) {
 		// Prune
 		_, _ = d.PruneChanges(repo.ID, map[string]bool{changeKey: true})
 	})
+}
+
+func TestOpenSpecialPathAndPermissions(t *testing.T) {
+	base := t.TempDir()
+	dirName := "dir?mode=ro#frag%20"
+	if runtime.GOOS == "windows" {
+		dirName = "dir#frag%20"
+	}
+	specialDir := filepath.Join(base, dirName)
+	dbPath := filepath.Join(specialDir, "review.db")
+	d, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open(%q) failed: %v", dbPath, err)
+	}
+	defer d.Close()
+
+	// Verify writes succeed (i.e. ?mode=ro in path was not parsed as SQLite URI param).
+	if err := d.SetPref("theme", "dark"); err != nil {
+		t.Fatalf("SetPref failed on special path DB: %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		if fi, err := os.Stat(specialDir); err == nil {
+			if perm := fi.Mode().Perm(); perm&0077 != 0 {
+				t.Errorf("expected db dir mode 0700, got %o", perm)
+			}
+		}
+		if fi, err := os.Stat(dbPath); err == nil {
+			if perm := fi.Mode().Perm(); perm&0077 != 0 {
+				t.Errorf("expected db file mode 0600, got %o", perm)
+			}
+		}
+	}
 }

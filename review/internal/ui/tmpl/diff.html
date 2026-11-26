@@ -13,10 +13,10 @@
 
 {{define "actions"}}
   {{if .PrevFile}}
-    <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}/f/{{TrimSlash .PrevFile}}?base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{.CtxParam}}" id="prevFileLink" class="btn btn-sm" title="Previous File ([)">&larr; [</a>
+    <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}/f/{{PathEscape .PrevFile}}?base={{urlquery .BaseParam}}&target={{urlquery .TargetParam}}&mode={{urlquery .DiffMode}}&ctx={{urlquery .CtxParam}}" id="prevFileLink" class="btn btn-sm" title="Previous File ([)">&larr; [</a>
   {{end}}
   {{if .NextFile}}
-    <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}/f/{{TrimSlash .NextFile}}?base={{.BaseParam}}&target={{.TargetParam}}&mode={{.DiffMode}}&ctx={{.CtxParam}}" id="nextFileLink" class="btn btn-sm" title="Next File (])">] &rarr;</a>
+    <a href="/r/{{.Record.Slug}}/c/{{.View.Change.Key}}/f/{{PathEscape .NextFile}}?base={{urlquery .BaseParam}}&target={{urlquery .TargetParam}}&mode={{urlquery .DiffMode}}&ctx={{urlquery .CtxParam}}" id="nextFileLink" class="btn btn-sm" title="Next File (])">] &rarr;</a>
   {{end}}
   {{if .InDiff}}
   <button id="toggleReviewedBtn" class="btn btn-sm {{if .FileReviewed}}btn-active{{end}}"

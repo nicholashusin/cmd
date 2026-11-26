@@ -158,9 +158,9 @@
         {{if .View.Files}}
           {{range $i, $f := .View.Files}}
             <div class="file-row"
-                 data-href="/r/{{$.Record.Slug}}/c/{{$.View.Change.Key}}/f/{{TrimSlash .Path}}?base={{$.BaseParam}}&target={{$.TargetParam}}&mode={{$.DiffMode}}&ctx={{$.CtxParam}}"
+                 data-href="/r/{{$.Record.Slug}}/c/{{$.View.Change.Key}}/f/{{PathEscape .Path}}?base={{urlquery $.BaseParam}}&target={{urlquery $.TargetParam}}&mode={{urlquery $.DiffMode}}&ctx={{urlquery $.CtxParam}}"
                  onclick="handleFileRowClick(event, this)">
-              <a href="/r/{{$.Record.Slug}}/c/{{$.View.Change.Key}}/f/{{TrimSlash .Path}}?base={{$.BaseParam}}&target={{$.TargetParam}}&mode={{$.DiffMode}}&ctx={{$.CtxParam}}" class="file-link">
+              <a href="/r/{{$.Record.Slug}}/c/{{$.View.Change.Key}}/f/{{PathEscape .Path}}?base={{urlquery $.BaseParam}}&target={{urlquery $.TargetParam}}&mode={{urlquery $.DiffMode}}&ctx={{urlquery $.CtxParam}}" class="file-link">
                 <span class="file-reviewed-icon" data-reviewed-icon="{{TrimSlash .Path}}" style="{{if not .Reviewed}}display: none;{{end}}">✓</span>
                 {{if .StatusCode}}<span class="file-status status-{{.StatusCode}}" title="{{.StatusTitle}}">{{.StatusCode}}</span>{{end}}
                 <span>{{if .OldPath}}<span class="file-old-path">{{.OldPath}} → </span>{{end}}{{.Path}}</span>
@@ -223,7 +223,7 @@
                           onclick="toggleFileReviewedInPlace(this, '{{$df.RepoSlug}}', '{{$df.ChangeKey}}', '{{$df.RightRev}}', '{{$df.FilePath}}', {{$i}})">
                     {{if $df.FileReviewed}}Reviewed ✓{{else}}Mark Reviewed{{end}}
                   </button>
-                  <a href="/r/{{$df.RepoSlug}}/c/{{$df.ChangeKey}}/f/{{TrimSlash $df.FilePath}}?base={{$.BaseParam}}&target={{$.TargetParam}}&mode={{$df.DiffMode}}&ctx={{$df.CtxParam}}" class="btn btn-sm">Single file &rarr;</a>
+                  <a href="/r/{{$df.RepoSlug}}/c/{{$df.ChangeKey}}/f/{{PathEscape $df.FilePath}}?base={{urlquery $.BaseParam}}&target={{urlquery $.TargetParam}}&mode={{urlquery $df.DiffMode}}&ctx={{urlquery $df.CtxParam}}" class="btn btn-sm">Single file &rarr;</a>
                 </div>
               </div>
               <div class="diff-file-body" id="file-body-{{$i}}" style="display: none;"
