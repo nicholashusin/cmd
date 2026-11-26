@@ -2,7 +2,6 @@ package ui
 
 import (
 	"context"
-	"fmt"
 	"html"
 	"net/http"
 	"strconv"
@@ -73,8 +72,7 @@ func (s *Server) resolveSearchRevs(repo vcs.Repo, repoID int64, changeKey, baseS
 			if targetSel != "" && targetSel != "live" {
 				isLiveTarget = false
 				if strings.HasPrefix(targetSel, "snap:") {
-					var num int
-					if _, err := fmt.Sscanf(targetSel, "snap:%d", &num); err == nil {
+					if num, err := strconv.Atoi(strings.TrimPrefix(targetSel, "snap:")); err == nil && num > 0 {
 						for _, sn := range snaps {
 							if sn.Num == num {
 								targetRev = sn.Rev
@@ -89,8 +87,7 @@ func (s *Server) resolveSearchRevs(repo vcs.Repo, repoID int64, changeKey, baseS
 			}
 
 			if strings.HasPrefix(baseSel, "snap:") {
-				var num int
-				if _, err := fmt.Sscanf(baseSel, "snap:%d", &num); err == nil {
+				if num, err := strconv.Atoi(strings.TrimPrefix(baseSel, "snap:")); err == nil && num > 0 {
 					for _, sn := range snaps {
 						if sn.Num == num {
 							baseRev = sn.Rev

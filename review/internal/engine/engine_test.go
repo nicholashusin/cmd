@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -2997,4 +2998,389 @@ func TestEngineBlankLineAnchorAndRelationBridging(t *testing.T) {
 	if len(rel[0].BottomEdges) == 0 || len(rel[1].TopLanes) == 0 {
 		t.Errorf("expected bridged parent edge from c3 across empty commit to c1, got rel[0]=%+v rel[1]=%+v", rel[0], rel[1])
 	}
+}
+
+func TestSearchQuerySyntaxAndConsistency(t *testing.T) {
+	// 1. Slash handling: bare paths and // comments are not swallowed as /regex/ delimiters,
+	// while valid /regex/ unescapes \/ and preserves \\.
+	qPath := ParseSearchQuery(`/api/search // TODO /foo\/bar\\baz/`)
+	if len(qPath.Terms) != 4 {
+		t.Fatalf("expected 4 terms, got %d: %+v", len(qPath.Terms), qPath.Terms)
+	}
+	if qPath.Terms[0].Raw != "/api/search" || qPath.Terms[1].Raw != "//" || qPath.Terms[2].Raw != "TODO" {
+		t.Errorf("unexpected bare path/comment terms: %+v", qPath.Terms[:3])
+	}
+	if !qPath.Terms[3].MatchString(`foo/bar\baz`) || qPath.Terms[3].MatchString(`foo/barbaz`) {
+		t.Errorf("expected /foo\\/bar\\\\baz/ to keep escaped backslash, raw=%q", qPath.Terms[3].Raw)
+	}
+
+	// 2. OR disjunction, trailing OR while typing, and standalone/quoted OR.
+	qOR := ParseSearchQuery(`alpha OR beta gamma f:a.go OR f:b.go`)
+	if len(qOR.Terms) != 2 {
+		t.Fatalf("expected 2 content terms for OR+AND, got %+v", qOR.Terms)
+	}
+	if !qOR.Terms[0].MatchString("alpha") || !qOR.Terms[0].MatchString("beta") || qOR.Terms[0].MatchString("delta") {
+		t.Errorf("OR term mismatch: %+v", qOR.Terms[0])
+	}
+	if len(qOR.FileFilters) != 1 || !qOR.FileFilters[0].MatchString("a.go") || !qOR.FileFilters[0].MatchString("b.go") || qOR.FileFilters[0].MatchString("c.go") {
+		t.Errorf("f: OR f: mismatch: %+v", qOR.FileFilters)
+	}
+	qTrail := ParseSearchQuery("alpha OR")
+	if len(qTrail.Terms) != 1 || qTrail.Terms[0].Raw != "alpha" {
+		t.Errorf("trailing OR should keep left term live, got %+v", qTrail.Terms)
+	}
+	qOnlyOR := ParseSearchQuery("OR")
+	if len(qOnlyOR.Terms) != 1 || qOnlyOR.Terms[0].Raw != "OR" {
+		t.Errorf("standalone OR should search literal OR, got %+v", qOnlyOR.Terms)
+	}
+
+	// 3. case:auto smart case ignores regex escapes like \S and \D.
+	if q := ParseSearchQuery(`case:auto servehttp \S+\D+`); q.CaseSensitive {
+		t.Errorf("case:auto with lowercase and regex escapes should be case-insensitive")
+	}
+	if q := ParseSearchQuery(`case:auto ServeHTTP`); !q.CaseSensitive {
+		t.Errorf("case:auto with uppercase letter should be case-sensitive")
+	}
+
+	// 4. Exact l: language matching (l:c must not match .css/.js/.ts/.cpp).
+	qLangC := ParseSearchQuery("l:c")
+	if !filePassesFilters(qLangC, "foo.c", false) || !filePassesFilters(qLangC, "foo.h", false) {
+		t.Errorf("l:c should match .c and .h")
+	}
+	for _, bad := range []string{"style.css", "app.js", "app.ts", "main.cpp"} {
+		if filePassesFilters(qLangC, bad, false) {
+			t.Errorf("l:c must not match %s", bad)
+		}
+	}
+	qLangTS := ParseSearchQuery("l:ts")
+	if !filePassesFilters(qLangTS, "app.tsx", false) || filePassesFilters(qLangTS, "app.js", false) {
+		t.Errorf("l:ts should match .tsx and not .js")
+	}
+	qLangCpp := ParseSearchQuery("l:c++")
+	if !filePassesFilters(qLangCpp, "foo.cpp", false) || filePassesFilters(qLangCpp, "foo.c", false) {
+		t.Errorf("l:c++ should match .cpp and not .c")
+	}
+	qLangDocker := ParseSearchQuery("l:dockerfile")
+	if !filePassesFilters(qLangDocker, "build/Dockerfile.prod", false) {
+		t.Errorf("l:dockerfile should match Dockerfile.prod")
+	}
+	qLangOR := ParseSearchQuery("l:go OR l:ts")
+	if !filePassesFilters(qLangOR, "a.go", false) || !filePassesFilters(qLangOR, "b.ts", false) || filePassesFilters(qLangOR, "c.js", false) {
+		t.Errorf("l:go OR l:ts mismatch")
+	}
+
+	// 5. Additional symbol kind filters and c: content-only flag.
+	qKinds := ParseSearchQuery("struct:Srv interface:Hdl const:Max var:Global function:Run c:needle")
+	if len(qKinds.SymbolFilters) != 5 {
+		t.Fatalf("expected 5 symbol filters, got %+v", qKinds.SymbolFilters)
+	}
+	wantKinds := []string{"struct", "interface", "const", "var", "func"}
+	for i, wk := range wantKinds {
+		if qKinds.SymbolFilters[i].Kind != wk {
+			t.Errorf("SymbolFilters[%d].Kind = %q, want %q", i, qKinds.SymbolFilters[i].Kind, wk)
+		}
+	}
+	if !qKinds.HasContentFilter {
+		t.Errorf("expected HasContentFilter=true for c:needle")
+	}
+
+	// 6. f:path:line parses TargetLine.
+	qFileLine := ParseSearchQuery("f:server.go:120")
+	if qFileLine.TargetLine != 120 || len(qFileLine.FileFilters) != 1 || qFileLine.FileFilters[0].Raw != "server.go" {
+		t.Errorf("f:server.go:120 parsed as TargetLine=%d FileFilters=%+v", qFileLine.TargetLine, qFileLine.FileFilters)
+	}
+}
+
+func TestCodeSearchEdgeCasesAndFastHelpers(t *testing.T) {
+	// 1. stripGoFuncBodies must produce identical symbols to unstripped parsing across tricky Go constructs.
+	goSrc := []byte(`//line fake.go:999
+package demo
+
+const MaxItems = 10
+
+var GlobalFlag = true
+
+func asmStub(x int) int
+
+func GenericFn[T interface{ ~int | struct{ A int } }](x T) map[string]struct{ B int } {
+	_ = "brace { inside string"
+	_ = ` + "`raw { brace }`" + `
+	// comment {
+	/* block } comment */
+	return nil
+}
+
+type Srv struct {
+	Port int
+}
+
+type Hdl interface {
+	Handle(x int)
+}
+
+func (s *Srv) Start() struct{ OK bool } {
+	return struct{ OK bool }{OK: true}
+}
+`)
+	stripped, ok := stripGoFuncBodies(goSrc)
+	if !ok {
+		t.Fatalf("expected stripGoFuncBodies to strip function bodies")
+	}
+	if len(stripped) != len(goSrc) {
+		t.Fatalf("stripped length %d != original %d", len(stripped), len(goSrc))
+	}
+	if bytes.Count(stripped, []byte("\n")) != bytes.Count(goSrc, []byte("\n")) {
+		t.Fatalf("stripped newline count changed")
+	}
+	got := extractGoSymsFromBytes(goSrc)
+	if got.pkgName != "demo" {
+		t.Fatalf("pkgName = %q, want demo", got.pkgName)
+	}
+	if gotPkg := extractGoPackageName(goSrc); gotPkg != "demo" {
+		t.Fatalf("extractGoPackageName = %q, want demo", gotPkg)
+	}
+	symLines := make(map[string]int)
+	for _, s := range got.syms {
+		symLines[s.Kind+":"+s.Name] = s.Line
+	}
+	for _, want := range []string{"const:MaxItems", "var:GlobalFlag", "func:asmStub", "func:GenericFn", "struct:Srv", "field:Srv.Port", "interface:Hdl", "method:Hdl.Handle", "method:Srv.Start"} {
+		ln, exists := symLines[want]
+		if !exists {
+			t.Errorf("missing symbol %s in %+v", want, got.syms)
+		} else if ln >= 999 {
+			t.Errorf("symbol %s got //line-adjusted line %d, want physical line", want, ln)
+		}
+	}
+
+	// 2. Unicode k/s case-folding soundness for fast matcher and trigram bloom filter.
+	kelvin := []byte("value = \u212Aeyword") // Keyword folds to "keyword"
+	longS := []byte("value = \u017Ferve")    // ſerve folds to "serve"
+	tKey := compileSearchTerm("keyword", false, true, false)
+	tServe := compileSearchTerm("serve", false, true, false)
+	if !tKey.matchBytes(kelvin) || !tKey.MatchString(string(kelvin)) {
+		t.Errorf("case-insensitive 'keyword' must match Kelvin sign U+212A")
+	}
+	if !tServe.matchBytes(longS) || !tServe.MatchString(string(longS)) {
+		t.Errorf("case-insensitive 'serve' must match long-s U+017F")
+	}
+	bqKey := buildBloomQuery([]SearchTerm{tKey}, false)
+	if !bqKey.mightMatch(buildBlobBloom(kelvin)) {
+		t.Errorf("bloomQuery must not false-negative on Kelvin sign U+212A")
+	}
+	bqServe := buildBloomQuery([]SearchTerm{tServe}, false)
+	if !bqServe.mightMatch(buildBlobBloom(longS)) {
+		t.Errorf("bloomQuery must not false-negative on long-s U+017F")
+	}
+
+	// 3. Empty-matching regex (mid-typing "foo|") matches only lines with "foo", not empty lines.
+	qPipe := ParseSearchQuery("foo|")
+	if spans, ok := findMatchSpans(qPipe.Terms, "hello foo world"); !ok || len(spans) != 1 || spans[0].Start != 6 || spans[0].End != 9 {
+		t.Errorf("foo| on matching line = (%+v, %v), want [6,9]", spans, ok)
+	}
+	if _, ok := findMatchSpans(qPipe.Terms, "hello bar world"); ok {
+		t.Errorf("foo| must not match line without foo")
+	}
+
+	// 4. Comment snippet prefers line matching all positive terms, and highlights even when one term matched author.
+	qMulti := ParseSearchQuery("alice needle")
+	body := "first line has needle\nsecond line has nothing\nthird line mentions alice and needle together"
+	snip := buildCommentSearchSnippet(body, qMulti.Terms)
+	if !strings.Contains(snip, "third line") {
+		t.Errorf("expected snippet to prefer line matching both terms, got %q", snip)
+	}
+	spans := findHighlightSpans(qMulti.Terms, "only needle here")
+	if len(spans) != 1 || spans[0].Start != 5 || spans[0].End != 11 {
+		t.Errorf("findHighlightSpans should highlight needle even when alice matched author, got %+v", spans)
+	}
+
+	// 5. Windowing huge lines caps length while keeping spans accurate.
+	huge := strings.Repeat("a", 3000) + "NEEDLE" + strings.Repeat("b", 3000)
+	winText, winSpans := windowMatchedLine([]byte(huge), []SearchMatchSpan{{Start: 3000, End: 3006}})
+	if len(winText) > 1200 || len(winSpans) != 1 || winText[winSpans[0].Start:winSpans[0].End] != "NEEDLE" {
+		t.Errorf("windowMatchedLine failed: len=%d spans=%+v", len(winText), winSpans)
+	}
+
+	// 6. Repo-level end-to-end checks: -s:<module>, p:main, Quick Open file:line, c:, no false Truncated, struct:/interface:/const:/var:.
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s (%v)", args, string(out), err)
+		}
+	}
+	run("init", "-b", "main")
+	run("config", "user.name", "Tester")
+	run("config", "user.email", "t@example.com")
+	_ = os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/myrepo\n\ngo 1.24\n"), 0644)
+	_ = os.WriteFile(filepath.Join(dir, "style.css"), []byte(".main { color: red; }\n"), 0644)
+	_ = os.WriteFile(filepath.Join(dir, "app.go"), []byte("package main\n\nconst AppVer = 1\nvar AppMode = 2\ntype AppStruct struct{}\ntype AppIface interface{ Do() }\nfunc RunApp() {\n\t_ = \"exactFive\"\n\t_ = \"exactFive\"\n\t_ = \"exactFive\"\n\t_ = \"exactFive\"\n\t_ = \"exactFive\"\n\t_ = \"other\"\n}\n"), 0644)
+	_ = os.MkdirAll(filepath.Join(dir, "sub"), 0755)
+	_ = os.WriteFile(filepath.Join(dir, "sub", "helper.go"), []byte("package helperpkg\n\nfunc SubHelp() {}\n"), 0644)
+	run("add", ".")
+	run("commit", "-m", "init")
+
+	repo, err := vcs.Open(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := repo.Commit("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSearch := func(q string) *CodeSearchResult {
+		t.Helper()
+		res, err := CodeSearch(context.Background(), CodeSearchOptions{
+			Repo:      repo,
+			TargetRev: head.Rev,
+			Query:     q,
+		})
+		if err != nil {
+			t.Fatalf("CodeSearch(%q): %v", q, err)
+		}
+		return res
+	}
+
+	// Negated non-qualified -s:myrepo must NOT wipe out symbols via module path.
+	if res := runSearch("-s:myrepo s:RunApp"); len(res.Symbols) != 1 || res.Symbols[0].Name != "RunApp" {
+		t.Errorf("-s:myrepo wiped out RunApp: %+v", res.Symbols)
+	}
+	// p:main must match app.go (package main in root dir) and exclude style.css.
+	if res := runSearch("p:main exactFive"); len(res.Code) != 1 || res.Code[0].Path != "app.go" {
+		t.Errorf("p:main code search failed: %+v", res.Code)
+	}
+	if res := runSearch("p:main"); len(res.Files) != 1 || res.Files[0].Path != "app.go" {
+		t.Errorf("p:main Quick Open failed: %+v", res.Files)
+	}
+	// Quick Open with p:<pkgName> and bare file path containing '/' must still collect pkgName.
+	if res := runSearch("p:helperpkg sub/helper.go"); len(res.Files) != 1 || res.Files[0].Path != "sub/helper.go" {
+		t.Errorf("p:helperpkg sub/helper.go Quick Open failed: %+v", res.Files)
+	}
+	// Quick Open app.go:7 sets Line=7.
+	if res := runSearch("app.go:7"); len(res.Files) != 1 || res.Files[0].Path != "app.go" || res.Files[0].Line != 7 {
+		t.Errorf("Quick Open app.go:7 = %+v, want Line=7", res.Files)
+	}
+	// c: suppresses Quick Open files and symbols.
+	if res := runSearch("c:RunApp"); len(res.Files) != 0 || len(res.Symbols) != 0 || len(res.Code) != 1 {
+		t.Errorf("c:RunApp should only return code, got files=%d syms=%d code=%d", len(res.Files), len(res.Symbols), len(res.Code))
+	}
+	// Exactly 5 matches in a file with trailing non-matching lines must NOT set Truncated=true.
+	if res := runSearch("exactFive"); res.Truncated || res.TotalCode != 5 {
+		t.Errorf("exactFive got TotalCode=%d Truncated=%v, want 5, false", res.TotalCode, res.Truncated)
+	}
+	// Symbol kind filters struct:/interface:/const:/var:.
+	if res := runSearch("struct:AppStruct"); len(res.Symbols) != 1 || res.Symbols[0].Kind != "struct" {
+		t.Errorf("struct:AppStruct = %+v", res.Symbols)
+	}
+	if res := runSearch("interface:AppIface"); len(res.Symbols) != 1 || res.Symbols[0].Kind != "interface" {
+		t.Errorf("interface:AppIface = %+v", res.Symbols)
+	}
+	if res := runSearch("const:AppVer"); len(res.Symbols) != 1 || res.Symbols[0].Kind != "const" {
+		t.Errorf("const:AppVer = %+v", res.Symbols)
+	}
+	if res := runSearch("var:AppMode"); len(res.Symbols) != 1 || res.Symbols[0].Kind != "var" {
+		t.Errorf("var:AppMode = %+v", res.Symbols)
+	}
+
+	// 7. Inline (?i) under case:yes must match uppercase/lowercase/Unicode fold in matcher & bloom.
+	if res := runSearch("case:yes (?i)runapp"); len(res.Code) != 1 || res.Code[0].Path != "app.go" {
+		t.Errorf("case:yes (?i)runapp missed app.go: %+v", res.Code)
+	}
+	tInlineI := compileSearchTerm("(?i)serve", false, false, true)
+	if !tInlineI.matchBlobPrecheck(longS) || !tInlineI.matchBytes(longS) {
+		t.Errorf("case:yes (?i)serve must match Unicode long-s U+017F")
+	}
+	if !buildBloomQuery([]SearchTerm{tInlineI}, true).mightMatch(buildBlobBloom(longS)) {
+		t.Errorf("bloomQuery for case:yes (?i)serve must not false-negative on U+017F")
+	}
+
+	// 8. Inline (?-m)^func must not false-negative on non-first lines via multiRe precheck.
+	if res := runSearch(`(?-m)^func\s+RunApp`); len(res.Code) != 1 || res.Code[0].Path != "app.go" {
+		t.Errorf("(?-m)^func RunApp missed app.go: %+v", res.Code)
+	}
+
+	// 9. Anchored/negated mid-typing pipes (^foo|, \bfoo|, -foo|, (?-i)Foo|) and (?:^foo)? must preserve flags & anchors.
+	qCasePipe := ParseSearchQuery("case:no (?-i)Foo|")
+	if _, ok := findMatchSpans(qCasePipe.Terms, "foo"); ok {
+		t.Errorf("case:no (?-i)Foo| must remain case-sensitive and not match lowercase foo")
+	}
+	if _, ok := findMatchSpans(qCasePipe.Terms, "Foo"); !ok {
+		t.Errorf("case:no (?-i)Foo| must match Foo")
+	}
+	qStartPipe := ParseSearchQuery("^foo|")
+	if _, ok := findMatchSpans(qStartPipe.Terms, "bar foo"); ok {
+		t.Errorf("^foo| must not match mid-line foo")
+	}
+	if _, ok := findMatchSpans(qStartPipe.Terms, "foo bar"); !ok {
+		t.Errorf("^foo| must match start-of-line foo")
+	}
+	qWordPipe := ParseSearchQuery(`\bfoo|`)
+	if _, ok := findMatchSpans(qWordPipe.Terms, "barfoo"); ok {
+		t.Errorf(`\bfoo| must not match barfoo`)
+	}
+	qNegPipe := ParseSearchQuery("exactFive -other|")
+	if _, ok := findMatchSpans(qNegPipe.Terms, "exactFive other"); ok {
+		t.Errorf("-other| should exclude lines containing other")
+	}
+	if _, ok := findMatchSpans(qNegPipe.Terms, "exactFive clean"); !ok {
+		t.Errorf("-other| should keep lines without other")
+	}
+	qOptAnchor := ParseSearchQuery("(?:^foo)?")
+	if _, ok := findMatchSpans(qOptAnchor.Terms, "bar foo"); ok {
+		t.Errorf("(?:^foo)? must not match mid-line foo")
+	}
+	if spans, ok := findMatchSpans(qOptAnchor.Terms, "foo bar"); !ok || len(spans) != 1 || spans[0].Start != 0 || spans[0].End != 3 {
+		t.Errorf("(?:^foo)? on start-of-line = (%+v, %v), want [0,3]", spans, ok)
+	}
+
+	// 10. Consecutive bare OR tokens collapse cleanly.
+	qDupOR := ParseSearchQuery("alpha OR OR")
+	if len(qDupOR.Terms) != 1 || qDupOR.Terms[0].Raw != "alpha" {
+		t.Errorf("alpha OR OR = %+v, want single alpha term", qDupOR.Terms)
+	}
+	qDupOR2 := ParseSearchQuery("alpha OR OR beta")
+	if len(qDupOR2.Terms) != 1 || !qDupOR2.Terms[0].MatchString("alpha") || !qDupOR2.Terms[0].MatchString("beta") {
+		t.Errorf("alpha OR OR beta = %+v, want disjunction", qDupOR2.Terms)
+	}
+
+	// 11. Negated package-qualified symbol filter -s:main.RunApp excludes RunApp while -s:.*Other keeps it.
+	if res := runSearch("-s:main.RunApp s:RunApp"); len(res.Symbols) != 0 {
+		t.Errorf("-s:main.RunApp should exclude RunApp, got %+v", res.Symbols)
+	}
+	if res := runSearch("-s:.*Other s:RunApp"); len(res.Symbols) != 1 || res.Symbols[0].Name != "RunApp" {
+		t.Errorf("-s:.*Other should keep RunApp, got %+v", res.Symbols)
+	}
+
+	// 12. StreamBlobs failure must NOT poison blobBloomCache with skip:true.
+	poisonOID := "deadbeef-poison-test-oid-0001"
+	blobBloomCache.mu.Lock()
+	delete(blobBloomCache.data, poisonOID)
+	blobBloomCache.mu.Unlock()
+	failRepo := &stubAllBlobRepo{failOnce: true, data: []byte("package main\nfunc UniqueBloomNeedle() {}\n")}
+	searchCodeLines(context.Background(), CodeSearchOptions{MaxCodeLines: 10}, "HEAD", "", failRepo,
+		[]vcs.GoFileBlob{{Path: "x.go", OID: poisonOID}}, nil, ParseSearchQuery("UniqueBloomNeedle"))
+	groups, _, _ := searchCodeLines(context.Background(), CodeSearchOptions{MaxCodeLines: 10}, "HEAD", "", failRepo,
+		[]vcs.GoFileBlob{{Path: "x.go", OID: poisonOID}}, nil, ParseSearchQuery("UniqueBloomNeedle"))
+	if len(groups) != 1 || groups[0].Path != "x.go" {
+		t.Errorf("blobBloomCache was poisoned after StreamBlobs error: got groups=%+v", groups)
+	}
+}
+
+type stubAllBlobRepo struct {
+	failOnce bool
+	failed   bool
+	data     []byte
+}
+
+func (s *stubAllBlobRepo) ListAllFileBlobs(rev string) ([]vcs.GoFileBlob, error) { return nil, nil }
+func (s *stubAllBlobRepo) StreamBlobs(oids []string, fn func(i int, oid string, data []byte)) error {
+	if s.failOnce && !s.failed {
+		s.failed = true
+		return os.ErrClosed
+	}
+	for i, oid := range oids {
+		fn(i, oid, s.data)
+	}
+	return nil
 }
